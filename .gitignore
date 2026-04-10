@@ -1,0 +1,11 @@
+.idea/
+.vscode/
+
+bin/
+.env
+
+*.DS_Store
+
+.claude/
+.ralphex/progress
+
