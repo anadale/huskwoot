@@ -1,0 +1,41 @@
+# relay.toml.example — huskwoot-push-relay configuration for deployment.
+# Copy to relay.toml and fill in the values.
+
+[server]
+listen_addr = "0.0.0.0:8080"
+hmac_skew   = "5m"
+log_level   = "info"
+log_format  = "json"
+
+[db]
+path = "/var/lib/huskwoot-relay/relay.db"
+
+# APNs — push notifications for iOS and macOS.
+# Get a .p8 key: Apple Developer → Certificates, Identifiers & Profiles → Keys → + → Apple Push Notifications service (APNs).
+# Save the file to secrets/apns-key.p8 next to docker-compose.yml.
+[apns]
+key_file  = "/run/secrets/apns-key.p8"
+key_id    = "ABCDEF1234"      # 10-character Key ID from Apple Developer
+team_id   = "TEAM123456"      # 10-character Team ID from Apple Developer
+bundle_id = "com.example.app" # App bundle ID (= APNs topic)
+# production = true           # uncomment for production APNs; sandbox is used by default
+
+# FCM — push notifications for Android.
+# Firebase Console → Project Settings → Service Accounts → Generate new private key → JSON.
+# Save the file to secrets/fcm-sa.json next to docker-compose.yml.
+[fcm]
+service_account_file = "/run/secrets/fcm-sa.json"
+
+# Allowlist of huskwoot instances permitted to send push through this relay.
+# The secret is read from an environment variable at startup (via ${VAR}).
+# To add a new instance: append a section and send SIGHUP (docker compose kill -s HUP push-relay).
+
+[[instances]]
+id            = "bob"
+owner_contact = "bob@example.com"
+secret        = "${HUSKWOOT_RELAY_SECRET_BOB}"
+
+# [[instances]]
+# id            = "alice"
+# owner_contact = "alice@example.com"
+# secret        = "${HUSKWOOT_RELAY_SECRET_ALICE}"

@@ -1,0 +1,6 @@
+{{if .ReplyTo}}Сообщение, на которое отвечает пользователь:
+"{{.ReplyTo.Text}}" (от {{.ReplyTo.AuthorName}})
+
+{{end}}Текст для анализа:
+{{if .Reaction}}Реакция {{.Reaction.Emoji}}{{else}}{{if .Subject}}Тема: {{.Subject}}
+{{end}}{{.Text}}{{end}}

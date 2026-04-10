@@ -1,0 +1,6 @@
+{{if .ReplyTo}}Message the user is replying to:
+"{{.ReplyTo.Text}}" (from {{.ReplyTo.AuthorName}})
+
+{{end}}Text for analysis:
+{{if .Reaction}}Reaction {{.Reaction.Emoji}}{{else}}{{if .Subject}}Subject: {{.Subject}}
+{{end}}{{.Text}}{{end}}

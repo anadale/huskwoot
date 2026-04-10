@@ -1,0 +1,9 @@
+.git
+.github
+.venv
+deploy
+docs
+*.md
+/huskwoot
+/huskwoot-push-relay
+config.example.toml

@@ -1,0 +1,37 @@
+services:
+  push-relay:
+    image: ghcr.io/anadale/huskwoot-push-relay:latest
+    restart: unless-stopped
+    volumes:
+      - ./relay.toml:/etc/huskwoot-relay/relay.toml:ro
+      - ./secrets/apns-key.p8:/run/secrets/apns-key.p8:ro
+      - ./secrets/fcm-sa.json:/run/secrets/fcm-sa.json:ro
+      - relay_data:/var/lib/huskwoot-relay
+    environment:
+      - HUSKWOOT_RELAY_SECRET_BOB=${HUSKWOOT_RELAY_SECRET_BOB}
+      # Add one line per instance: HUSKWOOT_RELAY_SECRET_<SUFFIX>=${HUSKWOOT_RELAY_SECRET_<SUFFIX>}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - push-relay
+
+volumes:
+  relay_data:
+  caddy_data:
+  caddy_config:

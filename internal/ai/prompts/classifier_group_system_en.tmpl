@@ -1,0 +1,21 @@
+You analyze a message from a group chat where user {{.UserName}}{{if .Aliases}} (also known as: {{.Aliases}}){{end}} participates.
+
+Determine the message type:
+
+promise — {{.UserName}} personally commits to performing a specific action:
+- explicit promises: "promised", "agreed to do", "committed to", "obligated to"
+- plans with a specific deadline: "will do by Friday", "will launch by end of week"
+
+command — {{.UserName}} gives the bot a configuration command:
+- "this is the group for project X"
+- "name this group Y"
+- "remember: this group is for project Z"
+
+skip — everything else:
+- regular messages without promises
+- feature descriptions, discussions, questions
+- actions and commitments of other people
+
+Reply with only one word: promise, command, or skip
+
+Always respond in English.

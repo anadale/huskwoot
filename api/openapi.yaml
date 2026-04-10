@@ -1,0 +1,1080 @@
+openapi: 3.1.0
+info:
+  title: Huskwoot Backend API
+  version: 0.2.0
+  description: |
+    REST+SSE API for Huskwoot mobile and desktop clients. The contract version
+    is reflected in info.version and returned in GET /v1/me.
+    Authentication uses device bearer tokens issued by the CLI via `huskwoot devices create`
+    (in later phases — via Telegram pairing).
+servers:
+  - url: https://huskwoot.example/
+    description: Example production instance; the actual address is set in config.toml.
+  - url: http://127.0.0.1:8080/
+    description: Local development.
+tags:
+  - name: me
+    description: Current device identification and instance metadata.
+  - name: projects
+    description: Project CRUD.
+  - name: tasks
+    description: Task CRUD, including complete/reopen/move and lookup by ref.
+  - name: devices
+    description: Owner device management.
+  - name: pairing
+    description: Pairing flow — connecting a new client device via Telegram magic-link.
+  - name: chat
+    description: Synchronous chat with the agent and client chat history.
+  - name: events
+    description: Real-time domain event stream via SSE.
+  - name: sync
+    description: Cold re-sync snapshot for clients that have fallen behind the retention window.
+  - name: meta
+    description: Service resources (OpenAPI specification).
+security:
+  - bearerAuth: []
+paths:
+  /v1/openapi.yaml:
+    get:
+      tags: [meta]
+      summary: Get OpenAPI specification
+      description: Returns the embedded YAML specification document. Available without a bearer token.
+      security: []
+      responses:
+        "200":
+          description: YAML specification.
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /v1/me:
+    get:
+      tags: [me]
+      summary: Current device and instance identification
+      responses:
+        "200":
+          description: Snapshot of the owner, current device, and API version.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Me"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/projects:
+    get:
+      tags: [projects]
+      summary: List projects
+      responses:
+        "200":
+          description: Array of projects.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [projects]
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [projects]
+      summary: Create a project
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProjectRequest"
+      responses:
+        "201":
+          description: Project created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /v1/projects/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectID"
+    get:
+      tags: [projects]
+      summary: Get project by ID
+      responses:
+        "200":
+          description: Project snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [projects]
+      summary: Update a project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateProjectRequest"
+      responses:
+        "200":
+          description: Updated project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /v1/tasks:
+    get:
+      tags: [tasks]
+      summary: List tasks
+      parameters:
+        - in: query
+          name: project_id
+          schema:
+            type: string
+          description: Filter by project UUID.
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [open, done, cancelled]
+          description: Filter by status.
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date-time
+          description: Return tasks updated no earlier than this time (RFC3339).
+        - in: query
+          name: cursor
+          schema:
+            type: string
+          description: Opaque pagination cursor from the next_cursor of the previous response.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+          description: Maximum records per page. Default 50.
+      responses:
+        "200":
+          description: Page of tasks and an optional next_cursor.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TasksPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [tasks]
+      summary: Create a task
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTaskRequest"
+      responses:
+        "201":
+          description: Task created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /v1/tasks/by-ref/{ref}:
+    parameters:
+      - in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+        description: Human-readable ref of the form <slug>-<number>, e.g. "inbox-42".
+    get:
+      tags: [tasks]
+      summary: Find a task by human-readable ref
+      responses:
+        "200":
+          description: Task found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/tasks/{id}:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    get:
+      tags: [tasks]
+      summary: Get task by ID
+      responses:
+        "200":
+          description: Task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [tasks]
+      summary: Update task fields
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTaskRequest"
+      responses:
+        "200":
+          description: Updated task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+    delete:
+      tags: [tasks]
+      summary: Soft-delete a task (status = "cancelled")
+      responses:
+        "200":
+          description: Updated task with status cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/tasks/{id}/complete:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      tags: [tasks]
+      summary: Mark a task as completed
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Task with status=done.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/tasks/{id}/reopen:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      tags: [tasks]
+      summary: Reopen a task (status = open)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Task with status=open.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/tasks/{id}/move:
+    parameters:
+      - $ref: "#/components/parameters/TaskID"
+    post:
+      tags: [tasks]
+      summary: Move a task to another project
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MoveTaskRequest"
+      responses:
+        "200":
+          description: Task with a new project_id and number recalculated for the target project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /v1/devices:
+    get:
+      tags: [devices]
+      summary: List owner devices
+      responses:
+        "200":
+          description: All devices, including revoked ones (with revoked_at set).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [devices]
+                properties:
+                  devices:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Device"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/devices/me:
+    patch:
+      tags: [devices]
+      summary: Update push tokens for the current device
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateDeviceMeRequest"
+      responses:
+        "200":
+          description: Updated device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /v1/devices/{id}:
+    parameters:
+      - $ref: "#/components/parameters/DeviceID"
+    delete:
+      tags: [devices]
+      summary: Revoke a device
+      responses:
+        "204":
+          description: Device revoked; subsequent requests with this bearer token will return 401.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/chat:
+    post:
+      tags: [chat]
+      summary: Synchronous request to the agent
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Agent reply and list of affected entities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatReply"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "408":
+          description: Client disconnected before the agent responded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "504":
+          description: Agent did not respond within the configured chat_timeout.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/chat/history:
+    get:
+      tags: [chat]
+      summary: Chat history for the current device
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+          description: Maximum records. Default 50.
+      responses:
+        "200":
+          description: History feed, isolated from Telegram DMs.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ChatHistoryEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/events:
+    get:
+      tags: [events]
+      summary: SSE domain event stream
+      description: |
+        text/event-stream connection. The server first replays events with
+        seq > Last-Event-ID (if provided), then streams live events and sends
+        periodic keepalive comments. If the client has fallen behind the retention
+        window, the server sends a `reset` event with the current last_seq and
+        closes the channel — the client must perform a cold re-sync via /v1/sync/snapshot.
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          schema:
+            type: string
+          description: Monotonic seq of the last successfully received event.
+      responses:
+        "200":
+          description: text/event-stream event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/pair/request:
+    post:
+      tags: [pairing]
+      summary: Request pairing for a new device
+      description: |
+        Initiates the device connection process. The instance saves a record
+        in pairing_requests and sends the owner a Telegram DM with a magic-link.
+        Available without a bearer token; protected by rate-limiting (5 requests/hour per IP).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PairingRequestBody"
+      responses:
+        "202":
+          description: Request accepted; magic-link sent to the owner.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PendingPairingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          description: Rate limit exceeded (5 requests/hour per IP).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: Telegram delivery failed; pairing record created, client may retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /v1/pair/status/{id}:
+    get:
+      tags: [pairing]
+      summary: Wait for pairing result (long-poll)
+      description: |
+        Blocks until a confirmation result is received or the timeout expires
+        (up to 60 seconds by default). The client must supply the `nonce` to
+        prove ownership of the request.
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Pairing request UUID received from POST /v1/pair/request.
+        - in: query
+          name: nonce
+          required: true
+          schema:
+            type: string
+          description: The plain clientNonce provided when creating the request.
+      responses:
+        "200":
+          description: Pairing result (confirmed or pending after timeout).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PairingStatusResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Nonce mismatch.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          description: Pairing request has expired or a token has already been issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /pair/confirm/{id}:
+    get:
+      tags: [pairing]
+      summary: Device confirmation page (HTML)
+      description: |
+        Renders an HTML page with device information and a confirmation form.
+        Sets the CSRF cookie `__Host-csrf`. Available without a bearer token.
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Pairing request UUID from the magic-link.
+      responses:
+        "200":
+          description: HTML confirmation form page with CSRF cookie.
+          content:
+            text/html:
+              schema:
+                type: string
+        "404":
+          description: Pairing request not found.
+          content:
+            text/html:
+              schema:
+                type: string
+        "410":
+          description: Pairing request has expired.
+          content:
+            text/html:
+              schema:
+                type: string
+    post:
+      tags: [pairing]
+      summary: Confirm device connection (HTML form)
+      description: |
+        Accepts the confirmation form. Validates the CSRF cookie and form field,
+        creates the device record, and publishes the bearer token to the long-poll channel.
+        Available without a bearer token.
+      security: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Pairing request UUID.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [csrf]
+              properties:
+                csrf:
+                  type: string
+                  description: CSRF token from the hidden form field.
+      responses:
+        "200":
+          description: HTML "Device connected" page.
+          content:
+            text/html:
+              schema:
+                type: string
+        "403":
+          description: CSRF validation failed or token has expired.
+          content:
+            text/html:
+              schema:
+                type: string
+        "410":
+          description: Pairing request has expired or already confirmed.
+          content:
+            text/html:
+              schema:
+                type: string
+  /v1/sync/snapshot:
+    get:
+      tags: [sync]
+      summary: Cold re-sync state snapshot
+      responses:
+        "200":
+          description: All projects, open tasks, and the current last_seq to resume SSE.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      schema:
+        type: string
+      description: |
+        Client key for write-operation deduplication. The first request is executed;
+        subsequent requests with the same key within the TTL receive the cached response.
+    ProjectID:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Project UUID.
+    TaskID:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Task UUID.
+    DeviceID:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: Device UUID.
+  responses:
+    Unauthorized:
+      description: Bearer token is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Input parsing error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: Uniqueness conflict (name/slug already taken, etc.).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unprocessable:
+      description: Body is syntactically valid but violates business rules (e.g. empty summary).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable string error code.
+              enum:
+                - bad_request
+                - unauthorized
+                - forbidden
+                - not_found
+                - method_not_allowed
+                - conflict
+                - unprocessable_entity
+                - rate_limited
+                - internal
+                - unavailable
+                - timeout
+            message:
+              type: string
+              description: Human-readable error message.
+    Me:
+      type: object
+      required: [deviceId, ownerName, version]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        ownerName:
+          type: string
+        telegramUserId:
+          type: integer
+          format: int64
+        version:
+          type: string
+          description: API version (see info.version).
+    Project:
+      type: object
+      required: [id, slug, name, description, taskCounter, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        taskCounter:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+    CreateProjectRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+          description: Optional slug; auto-generated if omitted.
+        description:
+          type: string
+    UpdateProjectRequest:
+      type: object
+      description: Absent field — no change; empty string — clear the value.
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+    Task:
+      type: object
+      required: [id, number, ref, projectId, projectSlug, summary, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        number:
+          type: integer
+          description: Monotonic number within the project.
+        ref:
+          type: string
+          description: Human-readable ref of the form <slug>-<number>.
+        projectId:
+          type: string
+          format: uuid
+        projectSlug:
+          type: string
+        summary:
+          type: string
+        details:
+          type: string
+        topic:
+          type: string
+        status:
+          type: string
+          enum: [open, done, cancelled]
+        deadline:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        closedAt:
+          type: string
+          format: date-time
+          nullable: true
+    TasksPage:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+        nextCursor:
+          type: string
+          description: Pass as the cursor query parameter to fetch the next page.
+    CreateTaskRequest:
+      type: object
+      required: [summary]
+      properties:
+        projectId:
+          type: string
+          format: uuid
+          description: If omitted, the task is created in Inbox.
+        summary:
+          type: string
+        details:
+          type: string
+        topic:
+          type: string
+        deadline:
+          type: string
+          format: date-time
+          nullable: true
+    UpdateTaskRequest:
+      type: object
+      description: |
+        Supported fields: details, status, deadline. deadline=null clears the due date;
+        an absent field leaves the value unchanged.
+      properties:
+        details:
+          type: string
+        status:
+          type: string
+          enum: [open, done, cancelled]
+        deadline:
+          type: string
+          format: date-time
+          nullable: true
+    MoveTaskRequest:
+      type: object
+      required: [projectId]
+      properties:
+        projectId:
+          type: string
+          format: uuid
+    Device:
+      type: object
+      required: [id, name, platform, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        platform:
+          type: string
+          enum: [ios, android, macos, windows, linux]
+        apnsToken:
+          type: string
+          nullable: true
+        fcmToken:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+          nullable: true
+        revokedAt:
+          type: string
+          format: date-time
+          nullable: true
+    UpdateDeviceMeRequest:
+      type: object
+      description: |
+        Pass apnsToken and/or fcmToken. Absent field — no change;
+        null — clear; string — set new value.
+      properties:
+        apnsToken:
+          type: string
+          nullable: true
+        fcmToken:
+          type: string
+          nullable: true
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+    ChatReply:
+      type: object
+      required: [reply]
+      properties:
+        reply:
+          type: string
+        tasksTouched:
+          type: array
+          items:
+            type: string
+            format: uuid
+        projectsTouched:
+          type: array
+          items:
+            type: string
+            format: uuid
+    ChatHistoryEntry:
+      type: object
+      required: [authorName, text, timestamp]
+      properties:
+        authorName:
+          type: string
+        text:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+    PairingRequestBody:
+      type: object
+      required: [deviceName, platform, clientNonce]
+      properties:
+        deviceName:
+          type: string
+          description: Human-readable device name (e.g. "Alice's iPhone").
+        platform:
+          type: string
+          enum: [ios, android, macos, windows, linux]
+          description: Device platform.
+        clientNonce:
+          type: string
+          description: Random string (base64url, minimum 16 bytes) used to bind the long-poll to the request.
+        apnsToken:
+          type: string
+          nullable: true
+          description: APNs push token (iOS/macOS).
+        fcmToken:
+          type: string
+          nullable: true
+          description: FCM push token (Android).
+    PendingPairingResponse:
+      type: object
+      required: [pairId, pollUrl, expiresAt]
+      properties:
+        pairId:
+          type: string
+          format: uuid
+          description: Pairing request UUID; used in /v1/pair/status/{id}.
+        pollUrl:
+          type: string
+          description: Relative URL for long-poll waiting.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Pairing request expiry time (UTC).
+    PairingStatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [pending, confirmed, expired]
+          description: Current status of the pairing request.
+        deviceId:
+          type: string
+          format: uuid
+          nullable: true
+          description: UUID of the created device (only when status=confirmed).
+        bearerToken:
+          type: string
+          nullable: true
+          description: Bearer token for authorization (only when status=confirmed; shown once).
+    SyncSnapshot:
+      type: object
+      required: [projects, openTasks, lastSeq]
+      properties:
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        openTasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Task"
+        lastSeq:
+          type: integer
+          format: int64
+          description: Current max event seq; pass as Last-Event-ID when connecting to /v1/events.

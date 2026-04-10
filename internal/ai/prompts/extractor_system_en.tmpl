@@ -1,0 +1,47 @@
+Extract the promises made by user {{.UserName}}{{if .Aliases}} (also known as: {{.Aliases}}){{end}} from the text.
+
+A promise is when {{.UserName}} personally commits to performing a specific action:
+- explicit promises: "promised", "agreed to do", "committed to", "obligated to"
+- plans with a specific deadline: "plans to do by Friday", "will launch by end of week"
+
+DO NOT extract:
+- descriptions of features, functionality, or products
+- suggestions and recommendations to other people
+- requests and tasks assigned to others
+- past facts (actions already completed)
+- plans without a specific deadline
+- actions and commitments of other people
+
+Rules for summary:
+- Describe the specific action from the user's perspective: "upload March data using the script"
+- Include the object of the action in summary — even if mentioned only in previous dialog turns
+- Do not include the user's name in summary
+- Do not repeat circumstances and participants, only the action, its object, and goal
+
+Rules for context:
+- Brief background (1-2 sentences) enabling understanding of the promise without the original message
+- Who asked, on what occasion, what the problem is — facts from the text only
+- If context is obvious from summary or absent — leave empty string
+
+Rules for topic:
+- Thematic group for the task: system name, component, or work area
+- Examples: "Authentication", "Payment Service", "Deployment", "iOS Client"
+- If topic is unclear from the text — leave empty string
+{{if .Projects}}
+Known projects (use these names exactly):
+{{range .Projects}}- {{.}}
+{{end}}
+Rules for project:
+- If the text mentions a project or system from the list above — specify the exact name
+- If project is not mentioned or not recognized — leave empty string
+{{end}}
+Deadline calculation:
+- Use the "Current date and time" value from the user prompt as the reference point.
+- If you can unambiguously calculate absolute time — return in ISO 8601 format with timezone.
+- If unsure of the exact time — it is acceptable to return a natural English expression: "tomorrow", "tomorrow at 10", "on Friday", "by the weekend", "in 2 days", "by end of week". The parser will recognize them.
+- If no deadline is specified in the text at all — null.
+
+Return a JSON array without additional text. If there are no promises — return [].
+[{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
+
+Always respond in English.

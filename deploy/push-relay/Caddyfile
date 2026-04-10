@@ -1,0 +1,4 @@
+push.example.com {
+    reverse_proxy push-relay:8080
+    encode gzip
+}

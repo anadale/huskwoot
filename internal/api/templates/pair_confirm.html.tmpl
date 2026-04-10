@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><title>Подтверждение устройства · Huskwoot</title>
+<style>body{font-family:-apple-system,sans-serif;max-width:480px;margin:48px auto;padding:0 16px;color:#222}
+button{font-size:16px;padding:12px 24px;background:#2c7;color:#fff;border:0;border-radius:6px;cursor:pointer}
+button:hover{background:#0a5}
+.card{background:#f6f6f6;padding:16px;border-radius:6px;margin:16px 0}
+</style></head><body>
+<h1>Подключить устройство?</h1>
+<div class="card">
+  <p><b>Имя:</b> {{.DeviceName}}</p>
+  <p><b>Платформа:</b> {{.Platform}}</p>
+  <p><b>Запрошено:</b> {{.CreatedAt}}</p>
+</div>
+<form method="post">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <button type="submit">Подключить</button>
+</form>
+</body></html>

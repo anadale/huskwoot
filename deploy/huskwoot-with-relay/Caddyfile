@@ -1,0 +1,9 @@
+server.example.org {
+    reverse_proxy huskwoot:8080
+    encode gzip
+}
+
+relay.example.org {
+    reverse_proxy push-relay:8080
+    encode gzip
+}

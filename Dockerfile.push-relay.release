@@ -1,0 +1,12 @@
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates tzdata
+
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/huskwoot-push-relay /usr/local/bin/huskwoot-push-relay
+
+VOLUME ["/var/lib/huskwoot-relay"]
+
+ENTRYPOINT ["huskwoot-push-relay"]
+
+CMD ["--config-file", "/etc/huskwoot-relay/relay.toml"]

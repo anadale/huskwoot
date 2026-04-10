@@ -1,0 +1,150 @@
+# Huskwoot configuration — personal promise tracker
+
+# User settings: name for AI prompts and Telegram identification
+[user]
+# Display name (used in AI prompts and API responses)
+user_name = "First Last"
+# Aliases by which others may mention the user in transcripts
+aliases = ["Alice", "Al"]
+# Numeric Telegram user ID — for DM notifications, summaries, and pairing.
+# Required when channels.telegram is present.
+# Supports environment variables: telegram_user_id = "${TELEGRAM_OWNER_ID}"
+telegram_user_id = 123456789
+# UI language: "ru" or "en" (default: "ru")
+# language = "en"
+
+# AI model settings
+[ai]
+
+# Fast model: message filtering (cheaper, faster)
+[ai.fast]
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"     # can be set via environment variable
+model = "gpt-4o-mini"
+# max_completion_tokens = 1024    # default
+
+# Smart model: task extraction (more accurate, slower)
+[ai.smart]
+base_url = "https://api.openai.com/v1"
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-4o"
+# max_completion_tokens = 4096   # default
+
+# Message sources
+
+# Telegram: a single bot account for group monitoring.
+[channels.telegram]
+# Bot display name, e.g. "@myhuskwootbot". Used in pairing messages.
+# name = "@myhuskwootbot"
+# Bot token from @BotFather
+token = "${TELEGRAM_BOT_TOKEN}"
+# Startup behavior: "monitor" (new only) or "backfill" (request history)
+on_join = "monitor"
+# reaction_enabled = true             # add ✍️ reaction to message when a promise is detected
+# confirm_timeout = "1m"              # confirmation timeout when bot is added to a group (0 — guard disabled)
+# welcome_message = "Hi! Reply to this message or add a reaction to confirm."
+
+# IMAP: mailbox monitoring (multiple [[channels.imap]] sections are supported)
+[[channels.imap]]
+host = "imap.gmail.com"
+port = 993
+username = "user@example.com"
+password = "${IMAP_PASSWORD}"
+folders = ["INBOX"]
+# To also monitor sent mail — add the Sent folder:
+# folders = ["INBOX", "[Gmail]/Sent Mail"]
+# Human-readable account label (used in notifications).
+# If not set, each individual folder name is used.
+label = "Work mail"
+# Sender filter: process only messages from these addresses
+senders = ["boss@company.com", "team@company.com"]
+# Behavior on first connect: "monitor" or "backfill"
+on_first_connect = "monitor"
+# Mailbox poll interval as a Go duration string (e.g. "2m30s"); default: 1m
+# poll_interval = "1m"
+
+# Message history (context for AI)
+[history]
+# Maximum number of messages per channel
+max_messages = 200
+# Message TTL in history (Go duration format: "24h", "30m", etc.)
+ttl = "24h"
+
+# Date and time parsing settings
+[datetime]
+# timezone = "Europe/Moscow"                      # optional: IANA timezone identifier (defaults to local)
+# weekdays = ["mon", "tue", "wed", "thu", "fri"]  # optional: working days (default mon–fri); others are treated as weekends
+
+# Hours for various parts of the day (defaults: 11, 12, 14, 20)
+[datetime.time_of_day]
+morning = 11    # "in the morning", "by morning"
+lunch = 12      # "at lunch", "by lunch"
+afternoon = 14  # "in the afternoon", "after lunch"
+evening = 20    # "in the evening", "by evening"
+
+# Channel state, metadata, and history are stored in an SQLite database huskwoot.db,
+# created automatically next to config.toml.
+
+# HTTP API server (optional).
+# Required for pairing with mobile apps, SSE event stream, and REST API access.
+#
+# [api]
+# enabled = true
+# # Listen address; required when enabled = true
+# listen_addr = "127.0.0.1:8080"
+# # External base URL for generating absolute links (e.g. pairing magic-links)
+# external_base_url = "https://huskwoot.example.com"
+# # Timeout for regular REST requests (default: 30s)
+# request_timeout = "30s"
+# # Timeout for /v1/chat long generations (default: 60s)
+# chat_timeout = "60s"
+# # Event retention window — events older than this are purged (default: 168h = 7 days)
+# events_retention = "168h"
+# # CORS origins; empty list disables CORS
+# cors_allowed_origins = []
+# # Pairing magic-link TTL (default: 5m)
+# pairing_link_ttl = "5m"
+# # Long-poll timeout for /v1/pair/status (default: 60s)
+# pairing_status_long_poll = "60s"
+# # POST /v1/pair/request budget per IP per hour (default: 5)
+# rate_limit_pair_per_hour = 5
+
+# Push notifications via an external relay service (optional).
+# To enable, all three fields must be set: relay_url, instance_id, instance_secret.
+# Without this section or with empty fields the dispatcher does not start (SSE keeps working).
+#
+# [push]
+# # Base URL of the push relay
+# relay_url = "https://push.huskwoot.app"
+# # Your instance identifier in the relay (issued by the operator)
+# instance_id = "your-instance-id"
+# # HMAC signing secret (generate with: openssl rand -hex 32)
+# instance_secret = "${HUSKWOOT_PUSH_SECRET}"
+# # HTTP request timeout to the relay (default: 10s)
+# timeout = "10s"
+# # Dispatcher tick interval (default: 2s)
+# dispatcher_interval = "2s"
+# # Batch size per iteration (default: 32)
+# batch_size = 32
+# # Maximum delivery attempts before dropping (default: 4)
+# retry_max_attempts = 4
+
+# Regular summaries of open tasks (optional).
+# Uncomment the [reminders.schedule] section to enable this feature.
+# Without it the bot will not send summaries on its own.
+#
+# [reminders]
+# # Planning horizon — how far ahead to show tasks in the "Plans" section.
+# # Use time.Duration format: "168h" = 7 days (the "d" suffix is not supported).
+# plans_horizon = "168h"
+# # How many undated tasks to show in the summary (0 = hide all).
+# undated_limit = 5
+# # Send an empty summary: "always" | "never" | "morning" (default).
+# send_when_empty = "morning"
+#
+# [reminders.schedule]
+# # Morning slot — required when this section is present (format "HH:MM", 24-hour).
+# morning   = "09:00"
+# # Afternoon and evening slots — optional; empty string disables the slot.
+# afternoon = "14:00"
+# evening   = "20:00"

@@ -1,0 +1,208 @@
+# GoReleaser configuration for Huskwoot
+# Documentation: https://goreleaser.com
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: huskwoot
+    main: ./cmd/huskwoot
+    binary: huskwoot
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+  - id: huskwoot-push-relay
+    main: ./cmd/huskwoot-push-relay
+    binary: huskwoot-push-relay
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+dockers_v2:
+  - id: huskwoot
+    ids: [huskwoot]
+    dockerfile: Dockerfile.huskwoot.release
+    images:
+      - "ghcr.io/anadale/huskwoot"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+    labels:
+      "org.opencontainers.image.source": "https://github.com/anadale/huskwoot"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+
+  - id: huskwoot-push-relay
+    ids: [huskwoot-push-relay]
+    dockerfile: Dockerfile.push-relay.release
+    images:
+      - "ghcr.io/anadale/huskwoot-push-relay"
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+    labels:
+      "org.opencontainers.image.source": "https://github.com/anadale/huskwoot"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+
+archives:
+  - id: huskwoot-archive
+    ids: [huskwoot]
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+  - id: push-relay-archive
+    ids: [huskwoot-push-relay]
+    formats:
+      - tar.gz
+    name_template: >-
+      huskwoot-push-relay_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids:
+        - huskwoot
+        - huskwoot-push-relay
+      sign:
+        certificate: "{{.Env.MACOS_SIGN_P12}}"
+        password: "{{.Env.MACOS_SIGN_PASSWORD}}"
+      notarize:
+        issuer_id: "{{.Env.MACOS_NOTARY_ISSUER_ID}}"
+        key_id: "{{.Env.MACOS_NOTARY_KEY_ID}}"
+        key: "{{.Env.MACOS_NOTARY_KEY}}"
+        wait: true
+        timeout: 20m
+
+homebrew_casks:
+  - name: huskwoot
+    ids: [huskwoot-archive]
+    repository:
+      owner: anadale
+      name: homebrew-huskwoot
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/anadale/huskwoot"
+    description: "Personal promise and task tracker with Messengers/IMAP integration"
+    license: "MIT"
+    binaries:
+      - huskwoot
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Cask update for {{ .ProjectName }} version {{ .Tag }}"
+    skip_upload: auto
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'typo'
+      - 'Merge pull request'
+      - 'Merge branch'
+  groups:
+    - title: Features
+      regexp: '^feat.*:.*$'
+      order: 0
+    - title: Bug Fixes
+      regexp: '^fix.*:.*$'
+      order: 1
+    - title: Enhancements
+      regexp: '^(refactor|perf|enhance).*:.*$'
+      order: 2
+    - title: Others
+      order: 999
+
+release:
+  github:
+    owner: anadale
+    name: huskwoot
+  draft: true
+  prerelease: auto
+  name_template: "Huskwoot {{.Version}}"
+  header: |
+    ## Huskwoot {{.Version}}
+
+    ### Installation
+
+    Download the binary for your platform below or use Homebrew (macOS, Linux):
+    ```bash
+    brew install anadale/huskwoot/huskwoot
+    ```
+
+    Docker images:
+    ```bash
+    docker pull ghcr.io/anadale/huskwoot:{{.Version}}
+    docker pull ghcr.io/anadale/huskwoot-push-relay:{{.Version}}
+    ```
+
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/anadale/huskwoot/compare/{{.PreviousTag}}...{{.Tag}}
+
+    ### Signature Verification
+
+    To verify downloaded files, use checksums:
+    ```bash
+    sha256sum -c checksums.txt
+    ```

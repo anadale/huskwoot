@@ -1,0 +1,73 @@
+# config.toml.example — huskwoot configuration for deployment.
+# Copy to config/config.toml and fill in the values.
+
+[user]
+user_name        = "Your Name"
+# aliases        = ["Nick"]       # other names people use to mention you in chats
+telegram_user_id = "${TELEGRAM_OWNER_ID}"  # your numeric Telegram user ID
+
+[ai.fast]
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+model    = "gpt-4o-mini"
+
+[ai.smart]
+base_url = "https://api.openai.com/v1"
+api_key  = "${OPENAI_API_KEY}"
+model    = "gpt-4o"
+
+[channels.telegram]
+token    = "${TELEGRAM_BOT_TOKEN}"
+# name   = "@myhuskwootbot"  # optional display name shown in pairing messages
+on_join  = "monitor"    # "monitor" (new messages only) or "backfill" (fetch history on startup)
+# reaction_enabled = true   # react ✍️ on detection, 👍 after saving (default: false)
+# confirm_timeout  = "1m"   # bot guard: wait this long for owner confirmation when added to a group (0 = disabled)
+# welcome_message  = "Hello! Reply to this message or react to confirm."
+
+[history]
+max_messages = 200
+ttl          = "24h"
+
+[datetime]
+timezone = "Europe/Moscow"
+weekdays = ["mon", "tue", "wed", "thu", "fri"]
+
+[datetime.time_of_day]
+morning   = 11
+lunch     = 12
+afternoon = 14
+evening   = 20
+
+# HTTP API — required for the mobile app.
+[api]
+enabled              = true
+listen_addr          = "0.0.0.0:8080"
+external_base_url    = "https://server.example.org"
+request_timeout      = "30s"
+chat_timeout         = "60s"
+events_retention     = "168h"
+cors_allowed_origins = []
+pairing_link_ttl            = "5m"
+pairing_status_long_poll    = "60s"
+rate_limit_pair_per_hour    = 5
+
+# Push notifications via external relay (optional).
+# Uncomment and fill in after setting up push-relay.
+#
+# [push]
+# relay_url       = "https://relay.example.org"
+# instance_id     = "your-instance-id"
+# instance_secret = "${HUSKWOOT_PUSH_SECRET}"
+
+# Scheduled summaries (optional).
+# Uncomment [reminders.schedule] to enable.
+#
+# [reminders]
+# plans_horizon   = "168h"     # show tasks with deadline within this window in "Upcoming"
+# undated_limit   = 5          # max tasks without a deadline to show (0 = hide all)
+# send_when_empty = "morning"  # "always" | "never" | "morning"
+#
+# [reminders.schedule]
+# morning   = "09:00"   # required when section is present (24-hour format "HH:MM")
+# afternoon = "14:00"   # leave empty ("") to disable this slot
+# evening   = "20:00"

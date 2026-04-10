@@ -1,0 +1,12 @@
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates tzdata
+
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/huskwoot /usr/local/bin/huskwoot
+
+VOLUME ["/app/config"]
+
+ENTRYPOINT ["huskwoot"]
+
+CMD ["--config-dir", "/app/config"]

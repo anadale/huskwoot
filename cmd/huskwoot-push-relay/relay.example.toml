@@ -1,0 +1,39 @@
+# relay.example.toml — пример конфигурации huskwoot-push-relay.
+# Скопируйте в relay.toml и заполните значения.
+
+[server]
+listen_addr = "0.0.0.0:8080"
+hmac_skew   = "5m"           # допустимое отклонение времени (±); значение по умолчанию
+log_level   = "info"          # debug, info, warn, error
+log_format  = "json"          # json или text
+
+[db]
+path = "/var/lib/huskwoot-relay/relay.db"
+
+# APNs — уведомления для iOS и macOS.
+# Получить .p8 ключ: Apple Developer → Certificates, Identifiers & Profiles → Keys → + Key → Apple Push Notifications service (APNs).
+[apns]
+key_file   = "/run/secrets/apns-key.p8"
+key_id     = "ABCDEF1234"           # 10-значный KeyID из Apple Developer
+team_id    = "TEAM123456"           # 10-значный Team ID из Apple Developer
+bundle_id  = "com.example.app"      # Bundle ID приложения (используется как topic)
+# production = true                 # раскомментировать для production APNs; по умолчанию sandbox
+
+# FCM — уведомления для Android.
+# Получить service account: Firebase Console → Project Settings → Service Accounts → Generate new private key.
+[fcm]
+service_account_file = "/run/secrets/fcm-sa.json"
+
+# Белый список инстансов huskwoot, которым разрешено отправлять push через этот релей.
+# Значение secret читается из переменной окружения при запуске.
+# При добавлении нового инстанса: дополните список и пошлите SIGHUP (docker kill -s HUP <container>).
+
+[[instances]]
+id            = "bob"
+owner_contact = "@bob"
+secret        = "${HUSKWOOT_RELAY_SECRET_BOB}"
+
+# [[instances]]
+# id            = "alice"
+# owner_contact = "alice@example.com"
+# secret        = "${HUSKWOOT_RELAY_SECRET_ALICE}"

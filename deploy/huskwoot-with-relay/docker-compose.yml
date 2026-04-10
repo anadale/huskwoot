@@ -1,0 +1,58 @@
+services:
+  huskwoot:
+    image: ghcr.io/anadale/huskwoot:latest
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID}
+      - HUSKWOOT_PUSH_SECRET=${HUSKWOOT_PUSH_SECRET}
+      # - IMAP_PASSWORD=${IMAP_PASSWORD}
+    expose:
+      - "8080"
+    depends_on:
+      - push-relay
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  push-relay:
+    image: ghcr.io/anadale/huskwoot-push-relay:latest
+    restart: unless-stopped
+    volumes:
+      - ./relay.toml:/etc/huskwoot-relay/relay.toml:ro
+      - ./secrets/apns-key.p8:/run/secrets/apns-key.p8:ro
+      - ./secrets/fcm-sa.json:/run/secrets/fcm-sa.json:ro
+      - relay_data:/var/lib/huskwoot-relay
+    environment:
+      - HUSKWOOT_RELAY_SECRET_MAIN=${HUSKWOOT_PUSH_SECRET}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - huskwoot
+      - push-relay
+
+volumes:
+  relay_data:
+  caddy_data:
+  caddy_config:

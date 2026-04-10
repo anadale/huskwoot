@@ -1,0 +1,36 @@
+services:
+  huskwoot:
+    image: ghcr.io/anadale/huskwoot:latest
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_OWNER_ID=${TELEGRAM_OWNER_ID}
+      # - IMAP_PASSWORD=${IMAP_PASSWORD}
+      # - HUSKWOOT_PUSH_SECRET=${HUSKWOOT_PUSH_SECRET}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - huskwoot
+
+volumes:
+  caddy_data:
+  caddy_config:

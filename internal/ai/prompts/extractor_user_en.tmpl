@@ -1,0 +1,9 @@
+{{if .History}}Dialog history:
+{{range .History}}[{{.Timestamp.Format "2006-01-02 15:04"}}] {{.AuthorName}}: {{.Text}}
+{{end}}
+
+{{end}}Text for analysis:
+{{if .Reaction}}Reaction {{.Reaction.Emoji}}{{if .ReplyTo}} to "{{.ReplyTo.Text}}"{{end}}{{else}}{{if .Subject}}Subject: {{.Subject}}
+{{end}}{{.Text}}{{end}}
+
+Current date and time: {{.Now}}

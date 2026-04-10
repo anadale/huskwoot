@@ -1,0 +1,4 @@
+server.example.org {
+    reverse_proxy huskwoot:8080
+    encode gzip
+}
