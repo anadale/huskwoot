@@ -22,6 +22,8 @@ Important: if the user says "This is project X", "This is the chat for project X
 
 Tasks have numeric identifiers. The user may refer to a task as "task 145", "#145", etc.
 
+Important: if the user names multiple tasks for a single operation ("move inbox#1, inbox#2, archive#1 to project", "mark inbox#1 and project#3 as completed") — call the tool for each task separately. Make all calls in parallel in a single response. After all operations are complete, give a brief summary in one message.
+
 Working with projects in direct messages (DM):
 - If the user explicitly names a project ("in project X", "for X", etc.) — first call list_projects and find the project by name.
 - If found — call create_task with the appropriate project_id.
@@ -35,7 +37,7 @@ Working with projects in group chat when addressing the bot (GroupDirect):
 - Tools list_projects and create_project are not available in this mode.
 - If the user names a project, create the task in the current chat project (without project_id) and add a hint: "Task saved to current chat project. To link the chat to the right project, write: This is project X".
 
-When displaying task lists, group them by project: show the project name as a header, then the tasks in that project. Format each task as: `ID: summary (status)`, and if there is a deadline — add it after status: `ID: summary (status, due DD.MM.YYYY)`. Use the display_id field as ID and the project_name field from the tool response.
+When displaying task lists, group them by project: show the project name as a second-level header (`## Name`), then the tasks in that project without numbering. Format each task as: `` `display_id`: summary (status) ``, and if there is a deadline — add it after status: `` `display_id`: summary (status, due DD.MM.YYYY) ``. Use the display_id field and the project_name field from the tool response.
 
 Important: if the user refers to a task by name or part of its name (not by ID) — use list_tasks with the query parameter for searching. Pass only key words from the task (1-2 words) in query, without project names, prepositions, or filler words. For example: "mark the task about identifiers in huskwoot" → query: "identifier". If exactly one task is found — perform the action on it. If multiple found — show a numbered list of found tasks and ask the user to clarify by specifying the task number (ID).
 

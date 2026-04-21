@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 
@@ -32,10 +33,10 @@ func (t *moveTaskTool) Parameters() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"task_id":    map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_move_task_param_task_id", nil)},
-			"task_ref":   map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_move_task_param_task_ref", nil)},
 			"project_id": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_move_task_param_project_id", nil)},
 			"project":    map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_move_task_param_project", nil)},
 		},
+		"required": []string{"task_id"},
 	}
 }
 func (t *moveTaskTool) DMOnly() bool { return false }
@@ -43,7 +44,6 @@ func (t *moveTaskTool) DMOnly() bool { return false }
 func (t *moveTaskTool) Execute(ctx context.Context, args string) (string, error) {
 	var params struct {
 		TaskID    string `json:"task_id"`
-		TaskRef   string `json:"task_ref"`
 		ProjectID string `json:"project_id"`
 		Project   string `json:"project"`
 	}
@@ -52,22 +52,22 @@ func (t *moveTaskTool) Execute(ctx context.Context, args string) (string, error)
 	}
 
 	taskID := params.TaskID
-	if taskID == "" && params.TaskRef != "" {
-		slug, number, ok := parseTaskRef(params.TaskRef)
+	if taskID == "" {
+		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
+	}
+	if strings.Contains(taskID, "#") {
+		slug, number, ok := parseTaskRef(taskID)
 		if !ok {
-			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_invalid_ref_format", map[string]any{"Ref": params.TaskRef}))
+			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_invalid_ref_format", map[string]any{"Ref": taskID}))
 		}
 		task, err := t.tasks.GetTaskByRef(ctx, slug, number)
 		if err != nil {
 			return "", fmt.Errorf("looking up task by ref: %w", err)
 		}
 		if task == nil {
-			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_not_found", map[string]any{"Ref": params.TaskRef}))
+			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_not_found", map[string]any{"Ref": taskID}))
 		}
 		taskID = task.ID
-	}
-	if taskID == "" {
-		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
 	}
 
 	projectID := params.ProjectID

@@ -20,7 +20,7 @@ func TestMoveTaskTool_Execute_ByRef(t *testing.T) {
 	}
 	tool := agent.NewMoveTaskTool(tasks, projects, newTestLocalizer("ru"))
 
-	out, err := tool.Execute(context.Background(), `{"task_ref":"inbox#5","project":"Работа"}`)
+	out, err := tool.Execute(context.Background(), `{"task_id":"inbox#5","project":"Работа"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestMoveTaskTool_Execute_ProjectNotFound(t *testing.T) {
 func TestMoveTaskTool_Execute_InvalidRef(t *testing.T) {
 	tool := agent.NewMoveTaskTool(&mockTaskService{}, &mockProjectService{}, newTestLocalizer("ru"))
 
-	_, err := tool.Execute(context.Background(), `{"task_ref":"not-a-ref","project_id":"proj-1"}`)
+	_, err := tool.Execute(context.Background(), `{"task_id":"not-a-ref#0","project_id":"proj-1"}`)
 	if err == nil {
 		t.Fatal("Execute() must return an error for invalid ref format")
 	}
@@ -138,7 +138,7 @@ func TestMoveTaskTool_Execute_TaskRefNotFound(t *testing.T) {
 	}
 	tool := agent.NewMoveTaskTool(tasks, projects, newTestLocalizer("ru"))
 
-	_, err := tool.Execute(context.Background(), `{"task_ref":"inbox#99","project":"Работа"}`)
+	_, err := tool.Execute(context.Background(), `{"task_id":"inbox#99","project":"Работа"}`)
 	if err == nil {
 		t.Fatal("Execute() must return an error when task is not found by ref")
 	}
@@ -151,7 +151,7 @@ func TestMoveTaskTool_Execute_GetTaskByRefError(t *testing.T) {
 	}
 	tool := agent.NewMoveTaskTool(tasks, projects, newTestLocalizer("ru"))
 
-	_, err := tool.Execute(context.Background(), `{"task_ref":"inbox#5","project":"Работа"}`)
+	_, err := tool.Execute(context.Background(), `{"task_id":"inbox#5","project":"Работа"}`)
 	if err == nil {
 		t.Fatal("Execute() must return an error when GetTaskByRef fails")
 	}
@@ -167,7 +167,7 @@ func TestMoveTaskTool_Execute_MoveTaskError(t *testing.T) {
 	}
 	tool := agent.NewMoveTaskTool(tasks, projects, newTestLocalizer("ru"))
 
-	_, err := tool.Execute(context.Background(), `{"task_ref":"inbox#5","project":"Работа"}`)
+	_, err := tool.Execute(context.Background(), `{"task_id":"inbox#5","project":"Работа"}`)
 	if err == nil {
 		t.Fatal("Execute() must return an error when MoveTask fails")
 	}

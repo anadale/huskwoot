@@ -880,7 +880,7 @@ func TestCompleteTaskTool_Execute_ByRef(t *testing.T) {
 	}
 	tool := agent.NewCompleteTaskTool(tasks, newTestLocalizer("ru"))
 
-	result, err := tool.Execute(context.Background(), `{"task_ref":"inbox#5"}`)
+	result, err := tool.Execute(context.Background(), `{"task_id":"inbox#5"}`)
 	if err != nil {
 		t.Fatalf("Execute() returned error: %v", err)
 	}
@@ -910,7 +910,7 @@ func TestCompleteTaskTool_Execute_ErrorOnNotFound(t *testing.T) {
 func TestCompleteTaskTool_Execute_InvalidRef(t *testing.T) {
 	tool := agent.NewCompleteTaskTool(&mockTaskService{}, newTestLocalizer("ru"))
 
-	_, err := tool.Execute(context.Background(), `{"task_ref":"not-a-ref"}`)
+	_, err := tool.Execute(context.Background(), `{"task_id":"not-a-ref#0"}`)
 	if err == nil {
 		t.Fatal("Execute() must return an error for invalid ref format")
 	}
@@ -1068,7 +1068,7 @@ func TestMoveTaskTool_Execute_LocalizedResponse_English(t *testing.T) {
 	}
 	tool := agent.NewMoveTaskTool(tasks, projects, newTestLocalizer("en"))
 
-	out, err := tool.Execute(context.Background(), `{"task_ref":"inbox#5","project":"Work"}`)
+	out, err := tool.Execute(context.Background(), `{"task_id":"inbox#5","project":"Work"}`)
 	if err != nil {
 		t.Fatal(err)
 	}

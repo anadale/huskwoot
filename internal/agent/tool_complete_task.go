@@ -32,32 +32,31 @@ func (t *completeTaskTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"task_id":  map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_complete_task_param_task_id", nil)},
-			"task_ref": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_complete_task_param_task_ref", nil)},
+			"task_id": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_complete_task_param_task_id", nil)},
 		},
+		"required": []string{"task_id"},
 	}
 }
 func (t *completeTaskTool) DMOnly() bool { return false }
 
 func (t *completeTaskTool) Execute(ctx context.Context, args string) (string, error) {
 	var params struct {
-		TaskID  string `json:"task_id"`
-		TaskRef string `json:"task_ref"`
+		TaskID string `json:"task_id"`
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		return "", fmt.Errorf("parsing complete_task args: %w", err)
 	}
 
 	id := params.TaskID
-	if id == "" && params.TaskRef != "" {
-		task, err := t.resolveRef(ctx, params.TaskRef)
+	if id == "" {
+		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
+	}
+	if strings.Contains(id, "#") {
+		task, err := t.resolveRef(ctx, id)
 		if err != nil {
 			return "", err
 		}
 		id = task.ID
-	}
-	if id == "" {
-		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
 	}
 
 	task, err := t.tasks.CompleteTask(ctx, id)
