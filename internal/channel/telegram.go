@@ -452,7 +452,8 @@ func (w *TelegramChannel) convertMessage(m *tgbotapi.Message) (model.Message, bo
 	}
 	sourceID := strconv.FormatInt(chatID, 10)
 	msg.ReplyFn = func(ctx context.Context, text string) error {
-		reply := tgbotapi.NewMessage(chatID, text)
+		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
+		reply.ParseMode = tgbotapi.ModeMarkdownV2
 		sent, err := w.bot.Send(reply)
 		if err != nil {
 			return err
@@ -508,7 +509,8 @@ func (w *TelegramChannel) convertDMMessage(m *tgbotapi.Message) (model.Message, 
 		}
 	}
 	msg.ReplyFn = func(ctx context.Context, text string) error {
-		reply := tgbotapi.NewMessage(chatID, text)
+		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
+		reply.ParseMode = tgbotapi.ModeMarkdownV2
 		sent, err := w.bot.Send(reply)
 		if err != nil {
 			return err
