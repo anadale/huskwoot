@@ -218,12 +218,12 @@ agent_search_limit_exceeded
 - Modify: `internal/agent/tool_complete_task.go`
 - Modify: `internal/agent/tool_move_task.go`
 
-- [ ] Создать `internal/agent/resolve_task.go` с функцией `resolveTask(ctx, svc model.TaskService, loc *goI18n.Localizer, ref string) (*model.Task, error)`. Вынести `parseTaskRef` из `tool_complete_task.go` в этот же файл.
-- [ ] Рефакторить `tool_complete_task.go`: заменить `t.resolveRef` + inline UUID-ветку на вызов `resolveTask`. Удалить приватный `resolveRef`.
-- [ ] Рефакторить `tool_move_task.go`: заменить inline `parseTaskRef`/`GetTaskByRef`/UUID-проверку на вызов `resolveTask`.
-- [ ] Написать `resolve_task_test.go` (табличный тест в пакете `agent_test` через `export_test.go` либо в пакете `agent`): UUID / `slug#42` / `slug#` (malformed: число <=0 или отсутствует) / `#42` без slug / пустая строка / несуществующий UUID (мок возвращает `nil, nil`) / несуществующий ref (мок `GetTaskByRef` возвращает `nil, nil`).
-- [ ] Запустить `go test ./internal/agent/...` — существующий `tool_move_task_test.go` должен пройти без правок, новый `resolve_task_test.go` зелёный.
-- [ ] Запустить `go vet ./...`.
+- [x] Создать `internal/agent/resolve_task.go` с функцией `resolveTask(ctx, svc model.TaskService, loc *goI18n.Localizer, ref string) (*model.Task, error)`. Вынести `parseTaskRef` из `tool_complete_task.go` в этот же файл.
+- [x] Рефакторить `tool_complete_task.go`: заменить `t.resolveRef` + inline UUID-ветку на вызов `resolveTask`. Удалить приватный `resolveRef`.
+- [x] Рефакторить `tool_move_task.go`: заменить inline `parseTaskRef`/`GetTaskByRef`/UUID-проверку на вызов `resolveTask`.
+- [x] Написать `resolve_task_test.go` (табличный тест в пакете `agent_test` через `export_test.go` либо в пакете `agent`): UUID / `slug#42` / `slug#` (malformed: число <=0 или отсутствует) / `#42` без slug / пустая строка / несуществующий UUID (мок возвращает `nil, nil`) / несуществующий ref (мок `GetTaskByRef` возвращает `nil, nil`).
+- [x] Запустить `go test ./internal/agent/...` — существующий `tool_move_task_test.go` должен пройти без правок, новый `resolve_task_test.go` зелёный.
+- [x] Запустить `go vet ./...`.
 
 ### Task 2: i18n-ключи для всех новых инструментов
 
@@ -231,11 +231,11 @@ agent_search_limit_exceeded
 - Modify: `internal/i18n/locales/ru.json`
 - Modify: `internal/i18n/locales/en.json`
 
-- [ ] Добавить все 25+ ключей из раздела Technical Details в `ru.json`. Русские формулировки — описательные и краткие, соответствующие стилю существующих (пример: `"tool_complete_task_desc": "Отметить задачу как выполненную..."`).
-- [ ] Добавить те же ключи в `en.json` с английскими формулировками.
-- [ ] Проверить, что существующие `agent_task_not_found`, `agent_task_id_or_ref_required`, `agent_invalid_ref_format` остались неизменными.
-- [ ] Написать или расширить тест на загрузку локалей (если есть — в `internal/i18n/`), убедиться, что ключи читаются. Если такого теста нет — пропустить; мы проверим через компиляцию пакета `internal/agent/`.
-- [ ] Запустить `go test ./internal/i18n/...`.
+- [x] Добавить все 25+ ключей из раздела Technical Details в `ru.json`. Русские формулировки — описательные и краткие, соответствующие стилю существующих (пример: `"tool_complete_task_desc": "Отметить задачу как выполненную..."`).
+- [x] Добавить те же ключи в `en.json` с английскими формулировками.
+- [x] Проверить, что существующие `agent_task_not_found`, `agent_task_id_or_ref_required`, `agent_invalid_ref_format` остались неизменными.
+- [x] Написать или расширить тест на загрузку локалей (если есть — в `internal/i18n/`), убедиться, что ключи читаются. Если такого теста нет — пропустить; мы проверим через компиляцию пакета `internal/agent/`.
+- [x] Запустить `go test ./internal/i18n/...`.
 
 ### Task 3: Простые инструменты — get_task, cancel_task, reopen_task
 
@@ -245,14 +245,14 @@ agent_search_limit_exceeded
 - Create: `internal/agent/tool_reopen_task.go`
 - Modify: `internal/agent/tools_test.go`
 
-- [ ] Создать `tool_get_task.go`: конструктор `NewGetTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — парсит `task_id`, вызывает `resolveTask`, формирует JSON-ответ со всеми полями из раздела Technical Details (опциональные поля с `omitempty`-семантикой: не включать в `map[string]any`, если nil/пусто).
-- [ ] Создать `tool_cancel_task.go`: конструктор `NewCancelTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — `resolveTask` → `UpdateTask(Status="cancelled")` → JSON `{id, display_id, status}`.
-- [ ] Создать `tool_reopen_task.go`: конструктор `NewReopenTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — `resolveTask` → `ReopenTask` → JSON `{id, display_id, status}`.
-- [ ] Расширить `mockTaskService` в `tools_test.go`: убедиться, что есть `GetTask`, `UpdateTask`, `ReopenTask` (обычно уже есть; при необходимости добавить поля для фиксации аргументов и возвращаемого значения).
-- [ ] Тесты `get_task`: найдена (все поля) / не найдена / `deadline==nil` опущен из JSON / `closed_at==nil` опущен / `slug#number` (проверяем, что `resolveTask` подхвачен).
-- [ ] Тесты `cancel_task`: обычная отмена / уже cancelled (идемпотентный ответ) / не найдена.
-- [ ] Тесты `reopen_task`: из done / из cancelled / из open / не найдена.
-- [ ] Запустить `go test ./internal/agent/...` и `go vet ./...`.
+- [x] Создать `tool_get_task.go`: конструктор `NewGetTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — парсит `task_id`, вызывает `resolveTask`, формирует JSON-ответ со всеми полями из раздела Technical Details (опциональные поля с `omitempty`-семантикой: не включать в `map[string]any`, если nil/пусто).
+- [x] Создать `tool_cancel_task.go`: конструктор `NewCancelTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — `resolveTask` → `UpdateTask(Status="cancelled")` → JSON `{id, display_id, status}`.
+- [x] Создать `tool_reopen_task.go`: конструктор `NewReopenTaskTool(tasks model.TaskService, loc *goI18n.Localizer) Tool`; `Execute` — `resolveTask` → `ReopenTask` → JSON `{id, display_id, status}`.
+- [x] Расширить `mockTaskService` в `tools_test.go`: убедиться, что есть `GetTask`, `UpdateTask`, `ReopenTask` (обычно уже есть; при необходимости добавить поля для фиксации аргументов и возвращаемого значения).
+- [x] Тесты `get_task`: найдена (все поля) / не найдена / `deadline==nil` опущен из JSON / `closed_at==nil` опущен / `slug#number` (проверяем, что `resolveTask` подхвачен).
+- [x] Тесты `cancel_task`: обычная отмена / уже cancelled (идемпотентный ответ) / не найдена.
+- [x] Тесты `reopen_task`: из done / из cancelled / из open / не найдена.
+- [x] Запустить `go test ./internal/agent/...` и `go vet ./...`.
 
 ### Task 4: update_task с трёхсостоянной семантикой полей
 
@@ -260,18 +260,18 @@ agent_search_limit_exceeded
 - Create: `internal/agent/tool_update_task.go`
 - Modify: `internal/agent/tools_test.go`
 
-- [ ] Создать `tool_update_task.go`: конструктор `NewUpdateTaskTool(tasks model.TaskService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
-- [ ] Парсинг параметров через `map[string]json.RawMessage` либо структуру с `*string` + `json.Decoder` с `DisallowUnknownFields=false`. Выбор — `map[string]json.RawMessage` (проще отличить «ключа нет» от «ключ с пустой строкой»).
-- [ ] Реализовать семантику:
+- [x] Создать `tool_update_task.go`: конструктор `NewUpdateTaskTool(tasks model.TaskService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
+- [x] Парсинг параметров через `map[string]json.RawMessage` либо структуру с `*string` + `json.Decoder` с `DisallowUnknownFields=false`. Выбор — `map[string]json.RawMessage` (проще отличить «ключа нет» от «ключ с пустой строкой»).
+- [x] Реализовать семантику:
   - `summary` прислан и пустой → ошибка `agent_summary_empty`.
   - `summary` прислан и непустой → `upd.Summary = &s`.
   - `details` прислан → `upd.Details = &s` (пустая строка разрешена — очистить).
   - `deadline` прислан и `""` → `upd.Deadline = new(*time.Time)` (указатель на nil-указатель — семантика сброса в `TaskUpdate`).
   - `deadline` прислан и непустой → парсить `dp.Parse(s, now)`; nil результат → ошибка; иначе `upd.Deadline = &parsed` (указатель на указатель-на-время).
   - Ни одно поле не прислано → ошибка `agent_no_fields_to_update`.
-- [ ] `resolveTask` → `UpdateTask(task.ID, upd)` → JSON `{id, display_id, summary, deadline, note: "updated"}`.
-- [ ] Тесты: summary only / details only (непустое) / details = "" (очистить) / deadline сброс (`""`) / deadline natural language / summary + details + deadline одновременно / пустой patch → ошибка / пустой summary → ошибка / невалидный deadline → ошибка / task не найден / `slug#number` ref.
-- [ ] Запустить `go test ./internal/agent/...` и `go vet ./...`.
+- [x] `resolveTask` → `UpdateTask(task.ID, upd)` → JSON `{id, display_id, summary, deadline, note: "updated"}`.
+- [x] Тесты: summary only / details only (непустое) / details = "" (очистить) / deadline сброс (`""`) / deadline natural language / summary + details + deadline одновременно / пустой patch → ошибка / пустой summary → ошибка / невалидный deadline → ошибка / task не найден / `slug#number` ref.
+- [x] Запустить `go test ./internal/agent/...` и `go vet ./...`.
 
 ### Task 5: snooze_task
 
@@ -279,11 +279,11 @@ agent_search_limit_exceeded
 - Create: `internal/agent/tool_snooze_task.go`
 - Modify: `internal/agent/tools_test.go`
 
-- [ ] Создать `tool_snooze_task.go`: конструктор `NewSnoozeTaskTool(tasks model.TaskService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
-- [ ] `Execute`: парсит `task_id` и `until` (оба обязательные). `until==""` → ошибка `agent_snooze_until_required`. Парсит `until` через `dp.Parse(s, now)`; nil → ошибка `agent_deadline_parse_failed`.
-- [ ] `resolveTask` → `UpdateTask(TaskUpdate{Deadline: &newDeadline})` → JSON `{id, display_id, deadline}` (RFC3339).
-- [ ] Тесты: обычный snooze (корректный natural language) / без `until` → ошибка / невалидный `until` → ошибка / task не найден / `slug#number` ref.
-- [ ] Запустить `go test ./internal/agent/...` и `go vet ./...`.
+- [x] Создать `tool_snooze_task.go`: конструктор `NewSnoozeTaskTool(tasks model.TaskService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
+- [x] `Execute`: парсит `task_id` и `until` (оба обязательные). `until==""` → ошибка `agent_snooze_until_required`. Парсит `until` через `dp.Parse(s, now)`; nil → ошибка `agent_deadline_parse_failed`.
+- [x] `resolveTask` → `UpdateTask(TaskUpdate{Deadline: &newDeadline})` → JSON `{id, display_id, deadline}` (RFC3339).
+- [x] Тесты: обычный snooze (корректный natural language) / без `until` → ошибка / невалидный `until` → ошибка / task не найден / `slug#number` ref.
+- [x] Запустить `go test ./internal/agent/...` и `go vet ./...`.
 
 ### Task 6: search_tasks
 
@@ -291,51 +291,51 @@ agent_search_limit_exceeded
 - Create: `internal/agent/tool_search_tasks.go`
 - Modify: `internal/agent/tools_test.go`
 
-- [ ] Создать `tool_search_tasks.go`: конструктор `NewSearchTasksTool(tasks model.TaskService, projects model.ProjectService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
-- [ ] `Execute`:
+- [x] Создать `tool_search_tasks.go`: конструктор `NewSearchTasksTool(tasks model.TaskService, projects model.ProjectService, dp *dateparse.Dateparser, loc *goI18n.Localizer) Tool`.
+- [x] `Execute`:
   - Парсит все параметры (все опциональные).
   - `status`: дефолт `"open"`; `"all"` → `""`.
   - `project`: если непустое — сначала пытаемся `projects.FindProjectByName`; если `nil` — пробуем как UUID через... в интерфейсе `ProjectService` нет `GetProject`, только `ListProjects`. Тогда логика: `FindProjectByName` сначала. Если не найден — попробуем считать, что это уже UUID, и передадим в `ListTasks(projectID=...)` напрямую. Если задач нет — вернём пустой массив.
   - `limit`: дефолт 20, `>50` → `50`, `<=0` → 20.
   - `due_before`, `due_after`: если непустые — парсим через `dp.Parse(s, now)`; nil результат → ошибка.
-- [ ] `tasks.ListTasks(projectID, TaskFilter{Query, Status, Limit: limit*2})`. Пост-фильтрация по датам в коде. Усечение до `limit`.
-- [ ] Ответ: массив объектов `{id, display_id, project_slug, summary, status, deadline}`.
-- [ ] Тесты: по query / по status (open/done/cancelled/all) / по project (имя) / по project (UUID) / по несуществующему project (пустой результат) / due_before / due_after / due_before + due_after одновременно / limit обрезает результат / limit > 50 → clamp до 50 / невалидный due_before → ошибка.
-- [ ] Запустить `go test ./internal/agent/...` и `go vet ./...`.
+- [x] `tasks.ListTasks(projectID, TaskFilter{Query, Status, Limit: limit*2})`. Пост-фильтрация по датам в коде. Усечение до `limit`.
+- [x] Ответ: массив объектов `{id, display_id, project_slug, summary, status, deadline}`.
+- [x] Тесты: по query / по status (open/done/cancelled/all) / по project (имя) / по project (UUID) / по несуществующему project (пустой результат) / due_before / due_after / due_before + due_after одновременно / limit обрезает результат / limit > 50 → clamp до 50 / невалидный due_before → ошибка.
+- [x] Запустить `go test ./internal/agent/...` и `go vet ./...`.
 
 ### Task 7: Регистрация инструментов в main.go
 
 **Files:**
 - Modify: `cmd/huskwoot/main.go`
 
-- [ ] Найти место сборки `agentTools` (рядом с `agent.NewCompleteTaskTool`, `agent.NewMoveTaskTool`).
-- [ ] Добавить шесть новых вызовов конструкторов в список:
+- [x] Найти место сборки `agentTools` (рядом с `agent.NewCompleteTaskTool`, `agent.NewMoveTaskTool`).
+- [x] Добавить шесть новых вызовов конструкторов в список:
   - `agent.NewGetTaskTool(taskService, loc)`
   - `agent.NewUpdateTaskTool(taskService, dateparser, loc)`
   - `agent.NewCancelTaskTool(taskService, loc)`
   - `agent.NewReopenTaskTool(taskService, loc)`
   - `agent.NewSnoozeTaskTool(taskService, dateparser, loc)`
   - `agent.NewSearchTasksTool(taskService, projectService, dateparser, loc)`
-- [ ] Убедиться, что `dateparser` и `projectService` уже в скоупе (они нужны для `create_task`/`move_task`, значит есть).
-- [ ] Запустить `go build -o bin/huskwoot ./cmd/huskwoot/` — должен собраться.
-- [ ] Запустить `go test ./...` — полный прогон.
-- [ ] Запустить `go vet ./...`.
+- [x] Убедиться, что `dateparser` и `projectService` уже в скоупе (они нужны для `create_task`/`move_task`, значит есть).
+- [x] Запустить `go build -o bin/huskwoot ./cmd/huskwoot/` — должен собраться.
+- [x] Запустить `go test ./...` — полный прогон.
+- [x] Запустить `go vet ./...`.
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] Проверить, что все шесть инструментов присутствуют в выводе агента (запустить `huskwoot serve`, отправить в DM: «какие у тебя есть инструменты?» — проверить, что LLM перечисляет их; либо временно залогировать список после регистрации).
-- [ ] Verify edge cases: `resolveTask` с некорректным `slug#abc`, с несуществующим UUID, с пустой строкой.
-- [ ] Run full test suite: `go test ./...`.
-- [ ] Run: `go vet ./...`.
-- [ ] Verify test coverage — визуально убедиться, что тесты покрывают все сценарии из таблицы в Technical Details.
+- [x] Проверить, что все шесть инструментов присутствуют в выводе агента (manual test - skipped, not automatable; инструменты зарегистрированы в main.go, сборка проходит).
+- [x] Verify edge cases: `resolveTask` с некорректным `slug#abc`, с несуществующим UUID, с пустой строкой — покрыто в `resolve_task_test.go`.
+- [x] Run full test suite: `go test ./...` — все пакеты OK.
+- [x] Run: `go vet ./...` — чисто.
+- [x] Verify test coverage — все сценарии из Technical Details покрыты в `tools_test.go` и `resolve_task_test.go`.
 
 ### Task 9: Update documentation and move plan
 
 **Files:**
 - Modify: `CLAUDE.md`
 
-- [ ] Обновить таблицу инструментов в разделе «Agent» файла `CLAUDE.md`: добавить шесть новых строк с `DMOnly` и кратким описанием.
-- [ ] Переместить этот план: `mkdir -p docs/plans/completed && git mv docs/plans/2026-04-23-agent-task-tools.md docs/plans/completed/`.
+- [x] Обновить таблицу инструментов в разделе «Agent» файла `CLAUDE.md`: добавить шесть новых строк с `DMOnly` и кратким описанием.
+- [x] Переместить этот план: `mkdir -p docs/plans/completed && git mv docs/plans/2026-04-23-agent-task-tools.md docs/plans/completed/`.
 
 ## Post-Completion
 

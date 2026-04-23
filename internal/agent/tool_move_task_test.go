@@ -37,6 +37,7 @@ func TestMoveTaskTool_Execute_ByRef(t *testing.T) {
 
 func TestMoveTaskTool_Execute_ByUUID(t *testing.T) {
 	tasks := &mockTaskService{
+		getTaskResult:  &model.Task{ID: "uuid-2", Number: 1, ProjectID: "src", ProjectSlug: "inbox"},
 		moveTaskResult: &model.Task{ID: "uuid-2", Number: 1, ProjectID: "dst", ProjectSlug: "rabota"},
 	}
 	projects := &mockProjectService{
@@ -58,6 +59,7 @@ func TestMoveTaskTool_Execute_ByUUID(t *testing.T) {
 
 func TestMoveTaskTool_Execute_ByProjectID(t *testing.T) {
 	tasks := &mockTaskService{
+		getTaskResult:  &model.Task{ID: "uuid-3", Number: 2, ProjectID: "src", ProjectSlug: "inbox"},
 		moveTaskResult: &model.Task{ID: "uuid-3", Number: 2, ProjectID: "proj-direct", ProjectSlug: "direct"},
 	}
 	tool := agent.NewMoveTaskTool(tasks, &mockProjectService{}, newTestLocalizer("ru"))

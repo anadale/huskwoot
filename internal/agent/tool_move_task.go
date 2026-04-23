@@ -3,9 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"strings"
 
 	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 
@@ -51,23 +49,9 @@ func (t *moveTaskTool) Execute(ctx context.Context, args string) (string, error)
 		return "", fmt.Errorf("parsing move_task args: %w", err)
 	}
 
-	taskID := params.TaskID
-	if taskID == "" {
-		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
-	}
-	if strings.Contains(taskID, "#") {
-		slug, number, ok := parseTaskRef(taskID)
-		if !ok {
-			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_invalid_ref_format", map[string]any{"Ref": taskID}))
-		}
-		task, err := t.tasks.GetTaskByRef(ctx, slug, number)
-		if err != nil {
-			return "", fmt.Errorf("looking up task by ref: %w", err)
-		}
-		if task == nil {
-			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_not_found", map[string]any{"Ref": taskID}))
-		}
-		taskID = task.ID
+	resolved, err := resolveTask(ctx, t.tasks, t.loc, params.TaskID)
+	if err != nil {
+		return "", err
 	}
 
 	projectID := params.ProjectID
@@ -85,7 +69,7 @@ func (t *moveTaskTool) Execute(ctx context.Context, args string) (string, error)
 		return "", fmt.Errorf("project_id or project is required")
 	}
 
-	task, err := t.tasks.MoveTask(ctx, taskID, projectID)
+	task, err := t.tasks.MoveTask(ctx, resolved.ID, projectID)
 	if err != nil {
 		return "", fmt.Errorf("moving task: %w", err)
 	}

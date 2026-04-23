@@ -3,10 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 
@@ -47,19 +44,22 @@ func (t *completeTaskTool) Execute(ctx context.Context, args string) (string, er
 		return "", fmt.Errorf("parsing complete_task args: %w", err)
 	}
 
-	id := params.TaskID
-	if id == "" {
-		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_task_id_or_ref_required", nil))
-	}
-	if strings.Contains(id, "#") {
-		task, err := t.resolveRef(ctx, id)
-		if err != nil {
-			return "", err
-		}
-		id = task.ID
+	resolved, err := resolveTask(ctx, t.tasks, t.loc, params.TaskID)
+	if err != nil {
+		return "", err
 	}
 
-	task, err := t.tasks.CompleteTask(ctx, id)
+	// Idempotent: already done.
+	if resolved.Status == "done" {
+		result, _ := json.Marshal(map[string]any{
+			"id":         resolved.ID,
+			"display_id": resolved.DisplayID(),
+			"status":     "done",
+		})
+		return string(result), nil
+	}
+
+	task, err := t.tasks.CompleteTask(ctx, resolved.ID)
 	if err != nil {
 		return "", err
 	}
@@ -70,32 +70,4 @@ func (t *completeTaskTool) Execute(ctx context.Context, args string) (string, er
 		"status":     task.Status,
 	})
 	return string(result), nil
-}
-
-func (t *completeTaskTool) resolveRef(ctx context.Context, ref string) (*model.Task, error) {
-	slug, number, ok := parseTaskRef(ref)
-	if !ok {
-		return nil, errors.New(huskwootI18n.Translate(t.loc, "agent_invalid_ref_format", map[string]any{"Ref": ref}))
-	}
-	task, err := t.tasks.GetTaskByRef(ctx, slug, number)
-	if err != nil {
-		return nil, fmt.Errorf("looking up task by ref: %w", err)
-	}
-	if task == nil {
-		return nil, errors.New(huskwootI18n.Translate(t.loc, "agent_task_not_found", map[string]any{"Ref": ref}))
-	}
-	return task, nil
-}
-
-// parseTaskRef parses a string of the form "<slug>#<number>" into its components.
-func parseTaskRef(ref string) (slug string, number int, ok bool) {
-	idx := strings.LastIndex(ref, "#")
-	if idx < 0 {
-		return
-	}
-	n, err := strconv.Atoi(ref[idx+1:])
-	if err != nil || n <= 0 {
-		return
-	}
-	return ref[:idx], n, true
 }

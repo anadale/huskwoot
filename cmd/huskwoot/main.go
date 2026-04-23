@@ -221,6 +221,12 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		agent.NewListTasksTool(taskSvc, agentLoc),
 		agent.NewCompleteTaskTool(taskSvc, agentLoc),
 		agent.NewMoveTaskTool(taskSvc, projectSvc, agentLoc),
+		agent.NewGetTaskTool(taskSvc, agentLoc),
+		agent.NewUpdateTaskTool(taskSvc, dp, agentLoc),
+		agent.NewCancelTaskTool(taskSvc, agentLoc),
+		agent.NewReopenTaskTool(taskSvc, agentLoc),
+		agent.NewSnoozeTaskTool(taskSvc, dp, agentLoc),
+		agent.NewSearchTasksTool(taskSvc, projectSvc, dp, agentLoc),
 	}
 	ag, err := agent.New(aiComps.smartClient, agentTools, agent.Config{
 		SystemPrompt: promptOverrides.agentSystem,

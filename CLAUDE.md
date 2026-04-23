@@ -126,8 +126,18 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 | `complete_task` | no | Mark a task as completed |
 | `move_task` | no | Move a task (UUID or `<slug>#<number>`) |
 | `set_project` | no | Bind the current chat to a project |
+| `get_task` | no | Get full task details by UUID or `<slug>#<number>` |
+| `update_task` | no | Update summary, details, or deadline of a task |
+| `cancel_task` | no | Cancel (soft-delete) a task; reversible via `reopen_task` |
+| `reopen_task` | no | Reopen a completed or cancelled task |
+| `snooze_task` | no | Postpone a task by setting a new deadline (natural language) |
+| `search_tasks` | no | Search tasks by query, status, project, or date range |
 
 `MessageKindGroupDirect`: tools where `DMOnly() == true` are excluded.
+
+### Task resolution
+
+All tools that accept a task identifier use the shared helper `resolveTask` in `internal/agent/resolve_task.go`. It accepts a UUID or `<slug>#<number>` reference (e.g. `inbox#3`) and returns `*model.Task` or an i18n error. `parseTaskRef` also lives there. New tools must call `resolveTask` instead of inlining lookup logic.
 
 ## Testing
 
