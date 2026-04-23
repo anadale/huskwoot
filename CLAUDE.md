@@ -20,7 +20,6 @@ internal/pipeline/            — orchestration (Pipeline.Process)
 internal/agent/               — agent: tool-calling loop, tools
 internal/sink/                — TelegramNotifier, ReactionNotifier, TelegramSummaryDeliverer
 internal/channel/             — TelegramChannel, IMAPChannel
-internal/handler/             — CommandHandlers
 internal/usecase/             — use-case layer (TaskService, ProjectService, ChatService, PairingService)
 internal/dateparse/           — date and deadline parsing
 internal/i18n/                — i18n bundle, localizer, locale JSON files (ru/en)
@@ -44,7 +43,7 @@ api/openapi.yaml              — OpenAPI 3.1, source of truth for the REST API
 - **Errors**: `fmt.Errorf("operation description: %w", err)`.
 - **Concurrency**: `sync.Mutex`/`sync.RWMutex`; parallel notifiers use `sync.WaitGroup`.
 - **Artifacts**: `go build` output always goes to `bin/`.
-- **i18n**: components with user-facing text accept `*i18n.Localizer` via constructor (sink, handler, agent tools). Strings are stored in `internal/i18n/locales/ru.json` and `en.json`. Prompts are paired templates `*_ru.tmpl` / `*_en.tmpl`; `loadPrompt(fsys, lang, name)` falls back to `_ru` if the language file is not found.
+- **i18n**: components with user-facing text accept `*i18n.Localizer` via constructor (sink, agent tools). Strings are stored in `internal/i18n/locales/ru.json` and `en.json`. Prompts are paired templates `*_ru.tmpl` / `*_en.tmpl`; `loadPrompt(fsys, lang, name)` falls back to `_ru` if the language file is not found.
 
 ## Pipeline architecture
 
@@ -55,10 +54,11 @@ Channel.Watch() → Message{Kind, ReactFn, ReplyFn, HistoryFn}
     → Pipeline.Process(msg)
         DM / GroupDirect → ChatService.HandleMessage → msg.ReplyFn(reply.Text)
         Group / Batch →
-            Classifier.Classify → Skip | Promise | Command
+            Classifier.Classify → Skip | Promise
             Promise → Extractor.Extract → TaskService.CreateTasks → notifiers
-            Command → CommandExtractor.Extract → commandHandlers
 ```
+
+Configuration commands (e.g. binding a group chat to a project) are handled through the agent: mention the bot or reply to it (`MessageKindGroupDirect`) and the agent's `set_project` tool performs the binding.
 
 ### MessageKind
 
@@ -67,7 +67,7 @@ Channel.Watch() → Message{Kind, ReactFn, ReplyFn, HistoryFn}
 - `MessageKindGroup` — regular message in a Telegram group chat
 - `MessageKindGroupDirect` — mention (`@bot`) or reply to the bot; detected via `TelegramChannelConfig.BotID`
 
-Reactions (`msg.ReactFn`): ✍️ after Promise/Command classification, 👍 after successful processing. `nil` when `reaction_enabled: false`.
+Reactions (`msg.ReactFn`): ✍️ after Promise classification, 👍 after successful processing. `nil` when `reaction_enabled: false`.
 
 `HistoryFn` is set for Group/GroupDirect/DM (when `history != nil`); `nil` for IMAP. Pipeline calls it in `processPromise`.
 
@@ -83,8 +83,8 @@ Atomicity of "entity + event + push_queue" is guaranteed by a single transaction
 
 ### Classifiers
 
-- `SimpleClassifier` (DM/Batch) — `promise` or `skip`
-- `GroupClassifier` (Group) — `promise`, `command`, or `skip`
+- `SimpleClassifier` (Batch) — `promise` or `skip`
+- `GroupClassifier` (Group) — `promise` or `skip`
 
 ### MetaStore and project binding
 

@@ -12,7 +12,6 @@ import (
 type promptOverrides struct {
 	groupClassifierSystem  string
 	simpleClassifierSystem string
-	commandExtractorSystem string
 	extractorSystem        string
 	extractorUser          string
 	agentSystem            string
@@ -27,7 +26,6 @@ func loadPromptOverrides(configDir string) (promptOverrides, error) {
 	}{
 		{"group-classifier-system", &o.groupClassifierSystem},
 		{"simple-classifier-system", &o.simpleClassifierSystem},
-		{"command-extractor-system", &o.commandExtractorSystem},
 		{"extractor-system", &o.extractorSystem},
 		{"extractor-user", &o.extractorUser},
 		{"agent-system", &o.agentSystem},

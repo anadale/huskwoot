@@ -117,7 +117,6 @@ func TestClassification_String(t *testing.T) {
 	}{
 		{"skip", ClassSkip, "skip"},
 		{"promise", ClassPromise, "promise"},
-		{"command", ClassCommand, "command"},
 		{"unknown", Classification(99), "unknown"},
 	}
 	for _, tc := range tests {
@@ -190,21 +189,6 @@ func TestMessage_NilCallbacks(t *testing.T) {
 	}
 	if msg.ReplyFn != nil {
 		t.Error("ReplyFn must be nil for Batch messages")
-	}
-}
-
-func TestCommand_Fields(t *testing.T) {
-	src := Source{Kind: "telegram", ID: "-100123"}
-	cmd := Command{
-		Type:    "set_project_name",
-		Payload: map[string]string{"name": "Проект X"},
-		Source:  src,
-	}
-	if cmd.Type != "set_project_name" {
-		t.Errorf("Type = %q, want set_project_name", cmd.Type)
-	}
-	if cmd.Payload["name"] != "Проект X" {
-		t.Errorf("Payload[name] = %q, want %q", cmd.Payload["name"], "Проект X")
 	}
 }
 

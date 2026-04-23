@@ -20,27 +20,23 @@ type Config struct {
 	Projects model.ProjectService
 	Chat     model.ChatService
 
-	Classifiers      map[model.MessageKind]model.Classifier
-	Extractors       map[model.MessageKind]model.Extractor
-	CommandExtractor model.CommandExtractor
-	CommandHandlers  []model.CommandHandler
-	Notifiers        []model.Notifier
-	Logger           *slog.Logger
+	Classifiers map[model.MessageKind]model.Classifier
+	Extractors  map[model.MessageKind]model.Extractor
+	Notifiers   []model.Notifier
+	Logger      *slog.Logger
 }
 
 // Pipeline connects classifiers, extractors, and outputs.
 type Pipeline struct {
-	classifiers      map[model.MessageKind]model.Classifier
-	extractors       map[model.MessageKind]model.Extractor
-	commandExtractor model.CommandExtractor
-	commandHandlers  []model.CommandHandler
-	notifiers        []model.Notifier
-	tasks            model.TaskService
-	projects         model.ProjectService
-	chat             model.ChatService
-	ownerIDs         []string
-	aliases          []string
-	logger           *slog.Logger
+	classifiers map[model.MessageKind]model.Classifier
+	extractors  map[model.MessageKind]model.Extractor
+	notifiers   []model.Notifier
+	tasks       model.TaskService
+	projects    model.ProjectService
+	chat        model.ChatService
+	ownerIDs    []string
+	aliases     []string
+	logger      *slog.Logger
 }
 
 // New creates a new Pipeline with the given components and dependencies.
@@ -50,17 +46,15 @@ func New(cfg Config) *Pipeline {
 		logger = slog.Default()
 	}
 	return &Pipeline{
-		classifiers:      cfg.Classifiers,
-		extractors:       cfg.Extractors,
-		commandExtractor: cfg.CommandExtractor,
-		commandHandlers:  cfg.CommandHandlers,
-		notifiers:        cfg.Notifiers,
-		tasks:            cfg.Tasks,
-		projects:         cfg.Projects,
-		chat:             cfg.Chat,
-		ownerIDs:         cfg.OwnerIDs,
-		aliases:          cfg.Aliases,
-		logger:           logger,
+		classifiers: cfg.Classifiers,
+		extractors:  cfg.Extractors,
+		notifiers:   cfg.Notifiers,
+		tasks:       cfg.Tasks,
+		projects:    cfg.Projects,
+		chat:        cfg.Chat,
+		ownerIDs:    cfg.OwnerIDs,
+		aliases:     cfg.Aliases,
+		logger:      logger,
 	}
 }
 
@@ -116,20 +110,6 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 			return err
 		}
 		p.reactDone(ctx, msg)
-		return nil
-	case model.ClassCommand:
-		p.logger.InfoContext(ctx, "message classified as command",
-			"msg_id", msg.ID, "preview", textPreview(msg.Text, 80))
-		p.reactPending(ctx, msg)
-		handled, err := p.processCommand(ctx, msg)
-		if err != nil {
-			return err
-		}
-		if handled {
-			p.reactDone(ctx, msg)
-		} else {
-			p.reactClear(ctx, msg)
-		}
 		return nil
 	default:
 		p.logger.WarnContext(ctx, "unknown classification", "class", class, "msg_id", msg.ID)
@@ -246,56 +226,12 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) error 
 	return nil
 }
 
-// processCommand handles a configuration command.
-// Returns true if the command was handled by at least one handler.
-func (p *Pipeline) processCommand(ctx context.Context, msg model.Message) (bool, error) {
-	if p.commandExtractor == nil {
-		p.logger.WarnContext(ctx, "CommandExtractor not configured, command ignored",
-			"msg_id", msg.ID)
-		return false, nil
-	}
-
-	cmd, err := p.commandExtractor.Extract(ctx, msg)
-	if err != nil {
-		return false, fmt.Errorf("extracting command: %w", err)
-	}
-	p.logger.InfoContext(ctx, "command extracted", "type", cmd.Type, "payload", cmd.Payload)
-
-	handled := false
-	for _, h := range p.commandHandlers {
-		if h.Name() != cmd.Type {
-			continue
-		}
-		handled = true
-		if err := h.Handle(ctx, cmd); err != nil {
-			p.logger.ErrorContext(ctx, "error handling command",
-				"handler", h.Name(), "error", err)
-			return true, fmt.Errorf("handling command %q: %w", h.Name(), err)
-		}
-	}
-
-	if !handled {
-		p.logger.InfoContext(ctx, "command not handled: no matching handler",
-			"msg_id", msg.ID, "type", cmd.Type)
-	}
-	return handled, nil
-}
-
 func (p *Pipeline) reactPending(ctx context.Context, msg model.Message) {
 	if msg.ReactFn == nil {
 		return
 	}
 	if err := msg.ReactFn(ctx, "✍️"); err != nil {
 		p.logger.WarnContext(ctx, "error setting pending reaction", "msg_id", msg.ID, "error", err)
-	}
-}
-
-func (p *Pipeline) reactClear(ctx context.Context, msg model.Message) {
-	if msg.ReactFn == nil {
-		return
-	}
-	if err := msg.ReactFn(ctx, ""); err != nil {
-		p.logger.WarnContext(ctx, "error clearing reaction", "msg_id", msg.ID, "error", err)
 	}
 }
 

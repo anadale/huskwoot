@@ -24,12 +24,10 @@ const (
 type Classification int
 
 const (
-	// ClassSkip — the message contains no promise and is not a command.
+	// ClassSkip — the message does not contain a promise.
 	ClassSkip Classification = iota
 	// ClassPromise — the message contains a user promise.
 	ClassPromise
-	// ClassCommand — the message is a configuration command to the bot.
-	ClassCommand
 )
 
 // String returns the string representation of a classification.
@@ -39,23 +37,9 @@ func (c Classification) String() string {
 		return "skip"
 	case ClassPromise:
 		return "promise"
-	case ClassCommand:
-		return "command"
 	default:
 		return "unknown"
 	}
-}
-
-// Command describes a configuration command extracted from a message.
-type Command struct {
-	// Type is the command type (e.g. "set_project_name").
-	Type string
-	// Payload holds the command parameters.
-	Payload map[string]string
-	// Source is the channel the command came from.
-	Source Source
-	// SourceMessage is the original message containing the command.
-	SourceMessage Message
 }
 
 // Source describes the origin of a message (the channel).

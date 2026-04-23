@@ -34,30 +34,9 @@ type classifierData struct {
 	Reaction *model.Reaction
 }
 
-// ParseClassification parses the model response, expecting the first word to be "promise", "skip", or "command".
+// parseClassification parses the model response, expecting the first word to be "promise" or "skip".
 // Case-insensitive; suffixes like "promise." or "Skip" are accepted.
-func ParseClassification(response string) (model.Classification, error) {
-	trimmed := strings.TrimSpace(response)
-	fields := strings.FieldsFunc(trimmed, func(r rune) bool {
-		return r == ' ' || r == '.' || r == ',' || r == '!' || r == '?'
-	})
-	if len(fields) == 0 {
-		return model.ClassSkip, fmt.Errorf("empty model response")
-	}
-	switch strings.ToLower(fields[0]) {
-	case "promise":
-		return model.ClassPromise, nil
-	case "skip":
-		return model.ClassSkip, nil
-	case "command":
-		return model.ClassCommand, nil
-	default:
-		return model.ClassSkip, fmt.Errorf("unexpected model response format: %q", response)
-	}
-}
-
-// parseSimpleClassification parses a SimpleClassifier response — only promise or skip.
-func parseSimpleClassification(response string) (model.Classification, error) {
+func parseClassification(response string) (model.Classification, error) {
 	trimmed := strings.TrimSpace(response)
 	fields := strings.FieldsFunc(trimmed, func(r rune) bool {
 		return r == ' ' || r == '.' || r == ',' || r == '!' || r == '?'
@@ -143,10 +122,10 @@ func (c *SimpleClassifier) Classify(ctx context.Context, msg model.Message) (mod
 		return model.ClassSkip, fmt.Errorf("calling AI client: %w", err)
 	}
 
-	return parseSimpleClassification(resp)
+	return parseClassification(resp)
 }
 
-// GroupClassifier classifies group messages: Promise, Command, or Skip.
+// GroupClassifier classifies group messages: Promise or Skip.
 // Implements the model.Classifier interface.
 type GroupClassifier struct {
 	client     Completer
@@ -186,7 +165,7 @@ func NewGroupClassifier(client Completer, cfg ClassifierConfig) (*GroupClassifie
 	}, nil
 }
 
-// Classify classifies the message, returning ClassPromise, ClassCommand, or ClassSkip.
+// Classify classifies the message, returning ClassPromise or ClassSkip.
 func (g *GroupClassifier) Classify(ctx context.Context, msg model.Message) (model.Classification, error) {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
 	defer cancel()
@@ -214,5 +193,5 @@ func (g *GroupClassifier) Classify(ctx context.Context, msg model.Message) (mode
 		return model.ClassSkip, fmt.Errorf("calling AI client: %w", err)
 	}
 
-	return ParseClassification(resp)
+	return parseClassification(resp)
 }

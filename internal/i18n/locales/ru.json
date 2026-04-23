@@ -20,7 +20,6 @@
     "other": "{{.Count}} задач"
   },
   "summary_empty": "Всё чисто 👌 задач нет",
-  "project_bound_confirmation": "Чат привязан к проекту «{{.Name}}» ({{.Slug}})",
   "agent_task_already_exists": "задача уже существует",
   "agent_task_not_found": "задача не найдена: {{.Ref}}",
   "agent_task_moved": "Задача перенесена: {{.DisplayID}}",

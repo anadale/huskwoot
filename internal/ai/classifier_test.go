@@ -62,18 +62,6 @@ func TestSimpleClassifier_ReturnsSkip(t *testing.T) {
 	}
 }
 
-func TestSimpleClassifier_NeverReturnsCommand(t *testing.T) {
-	// SimpleClassifier must not return ClassCommand — that is only for GroupClassifier.
-	// If the model responded "command" — it is a parsing error.
-	mock := &mockCompleter{response: "command"}
-	c := newTestSimpleClassifier(t, mock)
-
-	_, err := c.Classify(context.Background(), ownerMsg("что-то"))
-	if err == nil {
-		t.Error("SimpleClassifier.Classify() must return an error for response 'command'")
-	}
-}
-
 func TestSimpleClassifier_PromiseVariants(t *testing.T) {
 	cases := []string{"promise", "Promise", "PROMISE", "promise."}
 	for _, resp := range cases {
@@ -208,19 +196,6 @@ func TestGroupClassifier_ReturnsSkip(t *testing.T) {
 	}
 }
 
-func TestGroupClassifier_ReturnsCommand(t *testing.T) {
-	mock := &mockCompleter{response: "command"}
-	c := newTestGroupClassifier(t, mock)
-
-	got, err := c.Classify(context.Background(), ownerMsg("это группа проекта X"))
-	if err != nil {
-		t.Fatalf("Classify() returned error: %v", err)
-	}
-	if got != model.ClassCommand {
-		t.Errorf("Classify() = %v, want ClassCommand", got)
-	}
-}
-
 func TestGroupClassifier_AllVariants(t *testing.T) {
 	cases := []struct {
 		response string
@@ -233,10 +208,6 @@ func TestGroupClassifier_AllVariants(t *testing.T) {
 		{"skip", model.ClassSkip},
 		{"Skip", model.ClassSkip},
 		{"skip.", model.ClassSkip},
-		{"command", model.ClassCommand},
-		{"Command", model.ClassCommand},
-		{"COMMAND", model.ClassCommand},
-		{"command.", model.ClassCommand},
 	}
 	for _, tc := range cases {
 		mock := &mockCompleter{response: tc.response}
@@ -285,11 +256,14 @@ func TestGroupClassifier_SystemPromptContents(t *testing.T) {
 
 	_, _ = c.Classify(context.Background(), ownerMsg("тест"))
 
-	checks := []string{"Григорий", "Гриша", "promise", "command", "skip"}
+	checks := []string{"Григорий", "Гриша", "promise", "skip"}
 	for _, s := range checks {
 		if !strings.Contains(cap.systemPrompt, s) {
 			t.Errorf("GroupClassifier system prompt does not contain %q", s)
 		}
+	}
+	if strings.Contains(cap.systemPrompt, "command") {
+		t.Error("GroupClassifier system prompt must not contain 'command'")
 	}
 }
 
@@ -322,45 +296,5 @@ func TestGroupClassifier_ContextTimeout(t *testing.T) {
 	_, err := c.Classify(ctx, ownerMsg("тест"))
 	if err == nil {
 		t.Error("Classify() must return an error for a cancelled context")
-	}
-}
-
-// --- parseClassification tests ---
-
-func TestParseClassification_AllValues(t *testing.T) {
-	cases := []struct {
-		input string
-		want  model.Classification
-		isErr bool
-	}{
-		{"promise", model.ClassPromise, false},
-		{"Promise", model.ClassPromise, false},
-		{"PROMISE", model.ClassPromise, false},
-		{"promise.", model.ClassPromise, false},
-		{"skip", model.ClassSkip, false},
-		{"Skip", model.ClassSkip, false},
-		{"skip,", model.ClassSkip, false},
-		{"command", model.ClassCommand, false},
-		{"COMMAND", model.ClassCommand, false},
-		{"command!", model.ClassCommand, false},
-		{"", model.ClassSkip, true},
-		{"yes", model.ClassSkip, true},
-		{"no", model.ClassSkip, true},
-		{"maybe", model.ClassSkip, true},
-	}
-	for _, tc := range cases {
-		got, err := ai.ParseClassification(tc.input)
-		if tc.isErr {
-			if err == nil {
-				t.Errorf("ParseClassification(%q) must return an error", tc.input)
-			}
-		} else {
-			if err != nil {
-				t.Errorf("ParseClassification(%q) returned error: %v", tc.input, err)
-			}
-			if got != tc.want {
-				t.Errorf("ParseClassification(%q) = %v, want %v", tc.input, got, tc.want)
-			}
-		}
 	}
 }

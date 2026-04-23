@@ -18,7 +18,6 @@
     "other": "{{.Count}} tasks"
   },
   "summary_empty": "All clear 👌 no tasks",
-  "project_bound_confirmation": "Chat linked to project \"{{.Name}}\" ({{.Slug}})",
   "agent_task_already_exists": "task already exists",
   "agent_task_not_found": "task not found: {{.Ref}}",
   "agent_task_moved": "Task moved: {{.DisplayID}}",

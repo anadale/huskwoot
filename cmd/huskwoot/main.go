@@ -24,7 +24,6 @@ import (
 	"github.com/anadale/huskwoot/internal/dateparse"
 	devicesstore "github.com/anadale/huskwoot/internal/devices"
 	"github.com/anadale/huskwoot/internal/events"
-	"github.com/anadale/huskwoot/internal/handler"
 	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/pairing"
@@ -214,8 +213,6 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	}
 	agentLoc := huskwootI18n.NewLocalizer(agentBundle, cfg.User.Language)
 
-	setProjectHandler := handler.NewSetProjectHandler(projectSvc, agentLoc)
-
 	agentTools := []agent.Tool{
 		agent.NewCreateProjectTool(projectSvc, agentLoc),
 		agent.NewListProjectsTool(projectSvc, agentLoc),
@@ -243,17 +240,15 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	})
 
 	pipe := pipeline.New(pipeline.Config{
-		OwnerIDs:         collectOwnerIDs(cfg),
-		Aliases:          cfg.User.Aliases,
-		Tasks:            taskSvc,
-		Projects:         projectSvc,
-		Chat:             chatSvc,
-		Classifiers:      buildClassifiers(aiComps),
-		Extractors:       buildExtractors(aiComps),
-		CommandExtractor: aiComps.commandExtractor,
-		CommandHandlers:  []model.CommandHandler{setProjectHandler},
-		Notifiers:        notifiers,
-		Logger:           logger,
+		OwnerIDs:    collectOwnerIDs(cfg),
+		Aliases:     cfg.User.Aliases,
+		Tasks:       taskSvc,
+		Projects:    projectSvc,
+		Chat:        chatSvc,
+		Classifiers: buildClassifiers(aiComps),
+		Extractors:  buildExtractors(aiComps),
+		Notifiers:   notifiers,
+		Logger:      logger,
 	})
 
 	msgCh := make(chan model.Message, 100)
@@ -463,7 +458,6 @@ type aiComponents struct {
 	simpleClassifier model.Classifier
 	groupClassifier  model.Classifier
 	extractor        model.Extractor
-	commandExtractor model.CommandExtractor
 	smartClient      *ai.Client
 }
 
@@ -533,19 +527,10 @@ func buildAIComponents(cfg *config.Config, overrides promptOverrides, userName s
 		return aiComponents{}, fmt.Errorf("initializing extractor: %w", err)
 	}
 
-	commandExtractor, err := ai.NewAICommandExtractor(fastClient, ai.CommandExtractorConfig{
-		SystemTemplate: overrides.commandExtractorSystem,
-		Language:       lang,
-	})
-	if err != nil {
-		return aiComponents{}, fmt.Errorf("initializing command extractor: %w", err)
-	}
-
 	return aiComponents{
 		simpleClassifier: simpleClassifier,
 		groupClassifier:  groupClassifier,
 		extractor:        extractor,
-		commandExtractor: commandExtractor,
 		smartClient:      smartClient,
 	}, nil
 }

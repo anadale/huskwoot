@@ -68,24 +68,10 @@ type StateStore interface {
 	SaveCursor(ctx context.Context, channelID string, cursor Cursor) error
 }
 
-// Classifier classifies a message as Skip, Promise, or Command.
+// Classifier classifies a message as Skip or Promise.
 type Classifier interface {
 	// Classify returns the classification of a message.
 	Classify(ctx context.Context, msg Message) (Classification, error)
-}
-
-// CommandExtractor extracts a structured command from a message.
-type CommandExtractor interface {
-	// Extract parses a message and returns the command.
-	Extract(ctx context.Context, msg Message) (Command, error)
-}
-
-// CommandHandler handles configuration commands from the user.
-type CommandHandler interface {
-	// Handle executes the command.
-	Handle(ctx context.Context, cmd Command) error
-	// Name returns the handler name for logging.
-	Name() string
 }
 
 // TaskStore stores user projects and tasks.

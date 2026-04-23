@@ -50,38 +50,6 @@ func (m *mockExtractor) Extract(_ context.Context, msg model.Message, history []
 	return result, m.err
 }
 
-type mockCommandExtractor struct {
-	cmd   model.Command
-	err   error
-	calls int
-	mu    sync.Mutex
-}
-
-func (m *mockCommandExtractor) Extract(_ context.Context, _ model.Message) (model.Command, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.calls++
-	return m.cmd, m.err
-}
-
-type mockCommandHandler struct {
-	err   error
-	calls int
-	cmds  []model.Command
-	name  string
-	mu    sync.Mutex
-}
-
-func (m *mockCommandHandler) Handle(_ context.Context, cmd model.Command) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.calls++
-	m.cmds = append(m.cmds, cmd)
-	return m.err
-}
-
-func (m *mockCommandHandler) Name() string { return m.name }
-
 type mockNotifier struct {
 	err   error
 	calls int
@@ -947,73 +915,6 @@ func TestProcess_MultipleOwnerIDs(t *testing.T) {
 	}
 }
 
-// --- Tests: Command classification ---
-
-func TestProcess_ClassCommand_HappyPath(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{cmd: model.Command{Type: "set_project_name"}}
-	handler := &mockCommandHandler{name: "set_project_name"}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	cfg.CommandHandlers = []model.CommandHandler{handler}
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	if err := p.Process(context.Background(), msg); err != nil {
-		t.Fatalf("Process returned error: %v", err)
-	}
-
-	if cmdExtractor.calls != 1 {
-		t.Errorf("commandExtractor.Extract called %d times, want 1", cmdExtractor.calls)
-	}
-	if handler.calls != 1 {
-		t.Errorf("commandHandler.Handle called %d times, want 1", handler.calls)
-	}
-	if len(handler.cmds) == 0 || handler.cmds[0].Type != "set_project_name" {
-		t.Error("handler received wrong command")
-	}
-}
-
-func TestProcess_ClassCommand_NoExtractor_NoError(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	if err := p.Process(context.Background(), msg); err != nil {
-		t.Fatalf("Process must not return error when CommandExtractor is absent: %v", err)
-	}
-}
-
-func TestProcess_ClassCommand_MultipleHandlers_OnlyMatchingCalled(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{cmd: model.Command{Type: "set_project_name"}}
-	handler1 := &mockCommandHandler{name: "set_project_name"}
-	handler2 := &mockCommandHandler{name: "other_command"}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	cfg.CommandHandlers = []model.CommandHandler{handler1, handler2}
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	if err := p.Process(context.Background(), msg); err != nil {
-		t.Fatalf("Process returned error: %v", err)
-	}
-
-	if handler1.calls != 1 {
-		t.Errorf("matching handler called %d times, want 1", handler1.calls)
-	}
-	if handler2.calls != 0 {
-		t.Errorf("non-matching handler called %d times, want 0", handler2.calls)
-	}
-}
-
 // --- Tests: classifier selection by Kind ---
 
 func TestProcess_ClassifierByKind_GroupUsesGroupClassifier(t *testing.T) {
@@ -1128,26 +1029,6 @@ func TestProcess_ExtractorError(t *testing.T) {
 	}
 	if !errors.Is(err, errExtract) {
 		t.Errorf("want extractor error, got: %v", err)
-	}
-}
-
-func TestProcess_CommandExtractorError(t *testing.T) {
-	errCmd := errors.New("ошибка commandExtractor")
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{err: errCmd}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	err := p.Process(context.Background(), msg)
-	if err == nil {
-		t.Fatal("Process must return error on commandExtractor failure")
-	}
-	if !errors.Is(err, errCmd) {
-		t.Errorf("want commandExtractor error, got: %v", err)
 	}
 }
 
@@ -1379,66 +1260,6 @@ func TestProcess_ClassPromise_ReactPendingThenDone(t *testing.T) {
 	}
 }
 
-func TestProcess_ClassCommand_ReactPendingThenDone(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{cmd: model.Command{Type: "set_project_name"}}
-	handler := &mockCommandHandler{name: "set_project_name"}
-	tracker := &reactTracker{}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	cfg.CommandHandlers = []model.CommandHandler{handler}
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	msg.ReactFn = tracker.fn
-
-	if err := p.Process(context.Background(), msg); err != nil {
-		t.Fatalf("Process returned error: %v", err)
-	}
-
-	if len(tracker.emojis) != 2 {
-		t.Fatalf("want 2 ReactFn calls, got %d: %v", len(tracker.emojis), tracker.emojis)
-	}
-	if tracker.emojis[0] != "✍️" {
-		t.Errorf("first reaction = %q, want %q", tracker.emojis[0], "✍️")
-	}
-	if tracker.emojis[1] != "👍" {
-		t.Errorf("second reaction = %q, want %q", tracker.emojis[1], "👍")
-	}
-}
-
-func TestProcess_ClassCommand_Unhandled_ReactClear(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{cmd: model.Command{Type: "unknown_command"}}
-	handler := &mockCommandHandler{name: "set_project_name"}
-	tracker := &reactTracker{}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	cfg.CommandHandlers = []model.CommandHandler{handler}
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	msg.ReactFn = tracker.fn
-
-	if err := p.Process(context.Background(), msg); err != nil {
-		t.Fatalf("Process returned error: %v", err)
-	}
-
-	if len(tracker.emojis) != 2 {
-		t.Fatalf("want 2 ReactFn calls (pending + clear), got %d: %v", len(tracker.emojis), tracker.emojis)
-	}
-	if tracker.emojis[0] != "✍️" {
-		t.Errorf("first reaction = %q, want %q", tracker.emojis[0], "✍️")
-	}
-	if tracker.emojis[1] != "" {
-		t.Errorf("second reaction = %q, want empty string (reaction removal)", tracker.emojis[1])
-	}
-}
-
 func TestProcess_ClassPromise_ExtractorError_ReactDoneNotCalled(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{err: errors.New("ошибка экстрактора")}
@@ -1523,27 +1344,6 @@ func TestProcess_GroupDirect_ReactPendingThenDone(t *testing.T) {
 	}
 	if tracker.emojis[1] != "👍" {
 		t.Errorf("second reaction = %q, want %q", tracker.emojis[1], "👍")
-	}
-}
-
-func TestProcess_ClassCommand_HandlerError_ReturnsError(t *testing.T) {
-	classifier := &mockClassifier{class: model.ClassCommand}
-	cmdExtractor := &mockCommandExtractor{cmd: model.Command{Type: "set_project_name"}}
-	handler := &mockCommandHandler{name: "set_project_name", err: errors.New("хранилище недоступно")}
-
-	cfg := testConfig()
-	cfg.Classifiers = groupClassifiers(classifier)
-	cfg.CommandExtractor = cmdExtractor
-	cfg.CommandHandlers = []model.CommandHandler{handler}
-	p := New(cfg)
-
-	msg := testGroupMsg("owner-123")
-	err := p.Process(context.Background(), msg)
-	if err == nil {
-		t.Fatal("Process must return error on handler failure")
-	}
-	if !errors.Is(err, handler.err) {
-		t.Errorf("error %v does not wrap original handler error", err)
 	}
 }
 
