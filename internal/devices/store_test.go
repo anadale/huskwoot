@@ -414,3 +414,161 @@ func TestDeviceStoreListEmpty(t *testing.T) {
 		t.Fatalf("List on empty DB = %v, wanted empty slice", all)
 	}
 }
+
+func TestDeviceStoreListInactive_UsesLastSeenWhenPresent(t *testing.T) {
+	db := openTestDB(t)
+	store := devices.NewSQLiteDeviceStore(db)
+	ctx := context.Background()
+
+	fresh := newDevice("Fresh", "ios", "fresh-hash")
+	stale := newDevice("Stale", "ios", "stale-hash")
+	mustCreate(t, db, store, fresh)
+	mustCreate(t, db, store, stale)
+
+	now := time.Now().UTC()
+	if err := store.UpdateLastSeen(ctx, fresh.ID, now); err != nil {
+		t.Fatalf("UpdateLastSeen fresh: %v", err)
+	}
+	if err := store.UpdateLastSeen(ctx, stale.ID, now.Add(-48*time.Hour)); err != nil {
+		t.Fatalf("UpdateLastSeen stale: %v", err)
+	}
+
+	got, err := store.ListInactive(ctx, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("ListInactive: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != stale.ID {
+		t.Fatalf("ListInactive = %+v, want only stale (%s)", got, stale.ID)
+	}
+}
+
+func TestDeviceStoreListInactive_FallsBackToCreatedAt(t *testing.T) {
+	db := openTestDB(t)
+	store := devices.NewSQLiteDeviceStore(db)
+	ctx := context.Background()
+
+	neverSeen := newDevice("Never", "ios", "never-seen")
+	mustCreate(t, db, store, neverSeen)
+
+	// created_at is "now" at creation; cutoff far in the future must include it.
+	future := time.Now().UTC().Add(24 * time.Hour)
+	got, err := store.ListInactive(ctx, future)
+	if err != nil {
+		t.Fatalf("ListInactive: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != neverSeen.ID {
+		t.Fatalf("ListInactive must include never-seen device, got %+v", got)
+	}
+
+	// cutoff far in the past must exclude it.
+	past := time.Now().UTC().Add(-24 * time.Hour)
+	got, err = store.ListInactive(ctx, past)
+	if err != nil {
+		t.Fatalf("ListInactive: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListInactive must be empty for past cutoff, got %+v", got)
+	}
+}
+
+func TestDeviceStoreListInactive_SkipsRevoked(t *testing.T) {
+	db := openTestDB(t)
+	store := devices.NewSQLiteDeviceStore(db)
+	ctx := context.Background()
+
+	d := newDevice("Already revoked", "ios", "already-revoked")
+	mustCreate(t, db, store, d)
+	if err := store.Revoke(ctx, d.ID); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	future := time.Now().UTC().Add(24 * time.Hour)
+	got, err := store.ListInactive(ctx, future)
+	if err != nil {
+		t.Fatalf("ListInactive: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListInactive must skip revoked devices, got %+v", got)
+	}
+}
+
+func TestDeviceStoreDeleteRevokedOlderThan(t *testing.T) {
+	db := openTestDB(t)
+	store := devices.NewSQLiteDeviceStore(db)
+	ctx := context.Background()
+
+	oldRevoked := newDevice("Old", "ios", "old-revoked")
+	recentRevoked := newDevice("Recent", "ios", "recent-revoked")
+	active := newDevice("Active", "ios", "active-stays")
+	mustCreate(t, db, store, oldRevoked)
+	mustCreate(t, db, store, recentRevoked)
+	mustCreate(t, db, store, active)
+
+	if err := store.Revoke(ctx, oldRevoked.ID); err != nil {
+		t.Fatalf("Revoke old: %v", err)
+	}
+	// Backdate the revoked_at of oldRevoked directly — the API does not allow it.
+	pastRevoke := time.Now().UTC().Add(-120 * 24 * time.Hour).Format(time.RFC3339)
+	if _, err := db.ExecContext(ctx,
+		`UPDATE devices SET revoked_at = ? WHERE id = ?`,
+		pastRevoke, oldRevoked.ID,
+	); err != nil {
+		t.Fatalf("UPDATE backdate: %v", err)
+	}
+	if err := store.Revoke(ctx, recentRevoked.ID); err != nil {
+		t.Fatalf("Revoke recent: %v", err)
+	}
+
+	cutoff := time.Now().UTC().Add(-90 * 24 * time.Hour)
+	n, err := store.DeleteRevokedOlderThan(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("DeleteRevokedOlderThan: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("DeleteRevokedOlderThan returned %d, want 1", n)
+	}
+
+	all, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	remaining := map[string]bool{}
+	for _, d := range all {
+		remaining[d.ID] = true
+	}
+	if remaining[oldRevoked.ID] {
+		t.Fatal("old revoked device must be gone")
+	}
+	if !remaining[recentRevoked.ID] {
+		t.Fatal("recent revoked device must still be present")
+	}
+	if !remaining[active.ID] {
+		t.Fatal("active device must not be touched")
+	}
+}
+
+func TestDeviceStoreDeleteRevokedOlderThan_IgnoresActive(t *testing.T) {
+	db := openTestDB(t)
+	store := devices.NewSQLiteDeviceStore(db)
+	ctx := context.Background()
+
+	active := newDevice("Active", "ios", "active-only")
+	mustCreate(t, db, store, active)
+
+	// cutoff far in the future — but DELETE must only affect revoked devices.
+	future := time.Now().UTC().Add(24 * time.Hour)
+	n, err := store.DeleteRevokedOlderThan(ctx, future)
+	if err != nil {
+		t.Fatalf("DeleteRevokedOlderThan: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("DeleteRevokedOlderThan deleted %d active devices", n)
+	}
+	all, err := store.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("active device was deleted: %d rows remain", len(all))
+	}
+}

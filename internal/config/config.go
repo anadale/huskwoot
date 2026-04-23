@@ -213,6 +213,20 @@ func (p PushConfig) Enabled() bool {
 	return p.RelayURL != "" && p.InstanceID != "" && p.InstanceSecret != ""
 }
 
+// DevicesConfig describes retention windows for client devices.
+type DevicesConfig struct {
+	// InactiveThresholdRaw is the idle period after which a device is auto-revoked.
+	// Go duration string (e.g. "720h" = 30 days). Default: 720h.
+	InactiveThresholdRaw string `toml:"inactive_threshold"`
+	// InactiveThreshold is the parsed value.
+	InactiveThreshold time.Duration `toml:"-"`
+	// RetentionPeriodRaw is the period after revocation before the device is
+	// physically deleted. Go duration string (e.g. "2160h" = 90 days). Default: 2160h.
+	RetentionPeriodRaw string `toml:"retention_period"`
+	// RetentionPeriod is the parsed value.
+	RetentionPeriod time.Duration `toml:"-"`
+}
+
 // Config is the root configuration structure for the application.
 type Config struct {
 	User      UserConfig       `toml:"user"`
@@ -223,6 +237,7 @@ type Config struct {
 	Reminders *RemindersConfig `toml:"reminders"`
 	API       APIConfig        `toml:"api"`
 	Push      PushConfig       `toml:"push"`
+	Devices   DevicesConfig    `toml:"devices"`
 }
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -369,6 +384,43 @@ func (c *Config) validate() error {
 
 	if err := c.validatePush(); err != nil {
 		return err
+	}
+
+	if err := c.validateDevices(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateDevices validates and normalizes the [devices] section.
+func (c *Config) validateDevices() error {
+	d := &c.Devices
+
+	if d.InactiveThresholdRaw == "" {
+		d.InactiveThreshold = 30 * 24 * time.Hour
+	} else {
+		v, err := time.ParseDuration(d.InactiveThresholdRaw)
+		if err != nil {
+			return fmt.Errorf("devices.inactive_threshold %q: %w", d.InactiveThresholdRaw, err)
+		}
+		if v <= 0 {
+			return fmt.Errorf("devices.inactive_threshold must be positive, got %v", v)
+		}
+		d.InactiveThreshold = v
+	}
+
+	if d.RetentionPeriodRaw == "" {
+		d.RetentionPeriod = 90 * 24 * time.Hour
+	} else {
+		v, err := time.ParseDuration(d.RetentionPeriodRaw)
+		if err != nil {
+			return fmt.Errorf("devices.retention_period %q: %w", d.RetentionPeriodRaw, err)
+		}
+		if v <= 0 {
+			return fmt.Errorf("devices.retention_period must be positive, got %v", v)
+		}
+		d.RetentionPeriod = v
 	}
 
 	return nil

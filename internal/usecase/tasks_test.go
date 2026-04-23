@@ -316,6 +316,12 @@ func (m *mockDeviceStore) UpdatePushTokens(_ context.Context, _ string, _, _ *st
 func (m *mockDeviceStore) Get(_ context.Context, _ string) (*model.Device, error) {
 	return nil, nil
 }
+func (m *mockDeviceStore) ListInactive(_ context.Context, _ time.Time) ([]model.Device, error) {
+	return nil, nil
+}
+func (m *mockDeviceStore) DeleteRevokedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
 
 // mockPushQueue is a mock of model.PushQueue.
 type mockPushQueue struct {

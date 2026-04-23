@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,7 +158,12 @@ func TestRetentionDeletesOldEventsAndPushQueue(t *testing.T) {
 	f.enqueueDelivered(t, oldSeq, now.Add(-48*time.Hour))
 	f.enqueueDelivered(t, freshSeq, now.Add(-time.Hour))
 
-	runner := events.NewRunner(f.events, f.queue, nil, retention, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         f.events,
+		Queue:          f.queue,
+		EventRetention: retention,
+		Logger:         silentLogger(),
+	})
 	if err := runner.Tick(context.Background(), now); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -200,7 +206,12 @@ func TestRetentionKeepsPendingPushQueue(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 
-	runner := events.NewRunner(f.events, f.queue, nil, retention, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         f.events,
+		Queue:          f.queue,
+		EventRetention: retention,
+		Logger:         silentLogger(),
+	})
 	if err := runner.Tick(ctx, now); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -247,11 +258,229 @@ func (s *stubPairingStore) DeleteExpired(_ context.Context, cutoff time.Time) (i
 	return 0, s.err
 }
 
+// stubDeviceStore implements model.DeviceStore for device-sweep tests.
+type stubDeviceStore struct {
+	model.DeviceStore
+	inactive        []model.Device
+	inactiveErr     error
+	inactiveCalls   atomic.Int32
+	inactiveLastCut time.Time
+	revokeCalls     atomic.Int32
+	revokedIDs      []string
+	revokeErr       error
+	deleteCalls     atomic.Int32
+	deleteLastCut   time.Time
+	deleteReturned  int64
+	deleteErr       error
+	mu              sync.Mutex
+}
+
+func (s *stubDeviceStore) ListInactive(_ context.Context, cutoff time.Time) ([]model.Device, error) {
+	s.inactiveCalls.Add(1)
+	s.inactiveLastCut = cutoff
+	return s.inactive, s.inactiveErr
+}
+
+func (s *stubDeviceStore) Revoke(_ context.Context, id string) error {
+	s.revokeCalls.Add(1)
+	if s.revokeErr != nil {
+		return s.revokeErr
+	}
+	s.mu.Lock()
+	s.revokedIDs = append(s.revokedIDs, id)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *stubDeviceStore) DeleteRevokedOlderThan(_ context.Context, cutoff time.Time) (int64, error) {
+	s.deleteCalls.Add(1)
+	s.deleteLastCut = cutoff
+	return s.deleteReturned, s.deleteErr
+}
+
+// stubRevoker captures DeleteRegistration calls.
+type stubRevoker struct {
+	calls atomic.Int32
+	ids   []string
+	err   error
+	mu    sync.Mutex
+}
+
+func (r *stubRevoker) DeleteRegistration(_ context.Context, id string) error {
+	r.calls.Add(1)
+	r.mu.Lock()
+	r.ids = append(r.ids, id)
+	r.mu.Unlock()
+	return r.err
+}
+
+func TestRetentionRunner_AutoRevokesInactiveDevices(t *testing.T) {
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+	created := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	seen := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)
+	devStub := &stubDeviceStore{
+		inactive: []model.Device{
+			{ID: "dev-1", Name: "Old iPhone", CreatedAt: created, LastSeenAt: &seen},
+			{ID: "dev-2", Name: "Fresh install", CreatedAt: created, LastSeenAt: nil},
+		},
+	}
+	revoker := &stubRevoker{}
+
+	now := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Devices:        devStub,
+		Revoker:        revoker,
+		EventRetention: time.Hour,
+		DeviceInactive: 30 * 24 * time.Hour,
+		Logger:         silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), now); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if devStub.inactiveCalls.Load() != 1 {
+		t.Fatalf("ListInactive called %d times, want 1", devStub.inactiveCalls.Load())
+	}
+	expectedCut := now.Add(-30 * 24 * time.Hour)
+	if !devStub.inactiveLastCut.Equal(expectedCut) {
+		t.Fatalf("inactive cutoff = %v, want %v", devStub.inactiveLastCut, expectedCut)
+	}
+	if devStub.revokeCalls.Load() != 2 {
+		t.Fatalf("Revoke called %d times, want 2", devStub.revokeCalls.Load())
+	}
+	if revoker.calls.Load() != 2 {
+		t.Fatalf("DeleteRegistration called %d times, want 2", revoker.calls.Load())
+	}
+}
+
+func TestRetentionRunner_RelayErrorDoesNotBlockNextDevice(t *testing.T) {
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+	devStub := &stubDeviceStore{
+		inactive: []model.Device{
+			{ID: "dev-1", Name: "A"},
+			{ID: "dev-2", Name: "B"},
+		},
+	}
+	revoker := &stubRevoker{err: errors.New("relay недоступен")}
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Devices:        devStub,
+		Revoker:        revoker,
+		EventRetention: time.Hour,
+		DeviceInactive: 30 * 24 * time.Hour,
+		Logger:         silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if devStub.revokeCalls.Load() != 2 {
+		t.Fatalf("both devices must be revoked locally despite relay errors, got %d", devStub.revokeCalls.Load())
+	}
+	if revoker.calls.Load() != 2 {
+		t.Fatalf("DeleteRegistration must be attempted for both, got %d", revoker.calls.Load())
+	}
+}
+
+func TestRetentionRunner_DeletesLongRevokedDevices(t *testing.T) {
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+	devStub := &stubDeviceStore{deleteReturned: 3}
+
+	now := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:          eventsStub,
+		Queue:           queueStub,
+		Devices:         devStub,
+		EventRetention:  time.Hour,
+		DeviceRetention: 90 * 24 * time.Hour,
+		Logger:          silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), now); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if devStub.deleteCalls.Load() != 1 {
+		t.Fatalf("DeleteRevokedOlderThan called %d times, want 1", devStub.deleteCalls.Load())
+	}
+	expectedCut := now.Add(-90 * 24 * time.Hour)
+	if !devStub.deleteLastCut.Equal(expectedCut) {
+		t.Fatalf("delete cutoff = %v, want %v", devStub.deleteLastCut, expectedCut)
+	}
+}
+
+func TestRetentionRunner_DeviceSweepsDisabledWhenZero(t *testing.T) {
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+	devStub := &stubDeviceStore{}
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Devices:        devStub,
+		EventRetention: time.Hour,
+		// DeviceInactive and DeviceRetention intentionally zero
+		Logger: silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if devStub.inactiveCalls.Load() != 0 {
+		t.Fatalf("ListInactive must not be called when DeviceInactive is zero")
+	}
+	if devStub.deleteCalls.Load() != 0 {
+		t.Fatalf("DeleteRevokedOlderThan must not be called when DeviceRetention is zero")
+	}
+}
+
+func TestRetentionRunner_ListInactiveErrorSkipsRevokes(t *testing.T) {
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+	devStub := &stubDeviceStore{inactiveErr: errors.New("db down")}
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Devices:        devStub,
+		EventRetention: time.Hour,
+		DeviceInactive: time.Hour,
+		Logger:         silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if devStub.revokeCalls.Load() != 0 {
+		t.Fatalf("Revoke must not be called when ListInactive fails")
+	}
+	// events/push_queue must still be cleaned even when devices listing fails
+	if eventsStub.calls.Load() != 1 {
+		t.Fatalf("events cleanup was skipped after device error")
+	}
+}
+
 func TestRetentionPushQueueErrorDoesNotBlockEvents(t *testing.T) {
 	eventsStub := &stubEventStore{}
 	queueStub := &stubPushQueue{err: errors.New("ошибка очистки")}
 
-	runner := events.NewRunner(eventsStub, queueStub, nil, time.Hour, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		EventRetention: time.Hour,
+		Logger:         silentLogger(),
+	})
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 	if err := runner.Tick(context.Background(), now); err != nil {
 		t.Fatalf("Tick: %v", err)
@@ -273,7 +502,12 @@ func TestRetentionRunStopsOnContextCancel(t *testing.T) {
 	eventsStub := &stubEventStore{}
 	queueStub := &stubPushQueue{}
 
-	runner := events.NewRunner(eventsStub, queueStub, nil, time.Hour, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		EventRetention: time.Hour,
+		Logger:         silentLogger(),
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
@@ -296,7 +530,13 @@ func TestRetentionRunner_DeletesExpiredPairings(t *testing.T) {
 	pairingStub := &stubPairingStore{}
 
 	now := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
-	runner := events.NewRunner(eventsStub, queueStub, pairingStub, time.Hour, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Pairing:        pairingStub,
+		EventRetention: time.Hour,
+		Logger:         silentLogger(),
+	})
 	if err := runner.Tick(context.Background(), now); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
@@ -317,7 +557,13 @@ func TestRetentionRunner_ContinuesIfPairingFails(t *testing.T) {
 	pairingStub := &stubPairingStore{err: errors.New("pairing: ошибка очистки")}
 
 	now := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
-	runner := events.NewRunner(eventsStub, queueStub, pairingStub, time.Hour, silentLogger())
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		Pairing:        pairingStub,
+		EventRetention: time.Hour,
+		Logger:         silentLogger(),
+	})
 	if err := runner.Tick(context.Background(), now); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}

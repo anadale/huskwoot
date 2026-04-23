@@ -284,9 +284,23 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		Logger:          logger,
 	})
 
-	retentionRunner := events.NewRunner(eventStore, pushQueue, pairingStore, cfg.API.EventsRetention, logger)
+	retentionRunner := events.NewRunner(events.RunnerConfig{
+		Events:          eventStore,
+		Queue:           pushQueue,
+		Pairing:         pairingStore,
+		Devices:         deviceStore,
+		Revoker:         relayClient,
+		EventRetention:  cfg.API.EventsRetention,
+		DeviceInactive:  cfg.Devices.InactiveThreshold,
+		DeviceRetention: cfg.Devices.RetentionPeriod,
+		Logger:          logger,
+	})
 	go retentionRunner.Run(ctx)
-	logger.Info("retention runner active", "retention", cfg.API.EventsRetention)
+	logger.Info("retention runner active",
+		"events_retention", cfg.API.EventsRetention,
+		"device_inactive", cfg.Devices.InactiveThreshold,
+		"device_retention", cfg.Devices.RetentionPeriod,
+	)
 
 	if cfg.Push.Enabled() {
 		dispatcher := push.NewDispatcher(push.DispatcherDeps{

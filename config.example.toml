@@ -129,6 +129,18 @@ evening = 20    # "in the evening", "by evening"
 # # Maximum delivery attempts before dropping (default: 4)
 # retry_max_attempts = 4
 
+# Retention windows for paired devices (optional).
+# An hourly sweep auto-revokes devices inactive for longer than inactive_threshold
+# (notifying the push relay), and physically deletes rows whose revoked_at is older
+# than retention_period. Setting either value to "0s" disables that sweep.
+#
+# [devices]
+# # Idle period after which a device is auto-revoked (default: 720h = 30 days).
+# # "Idle" means the device has not made an authenticated API request in this window.
+# inactive_threshold = "720h"
+# # Time after revoke before the row is DELETEd from the store (default: 2160h = 90 days).
+# retention_period = "2160h"
+
 # Regular summaries of open tasks (optional).
 # Uncomment the [reminders.schedule] section to enable this feature.
 # Without it the bot will not send summaries on its own.

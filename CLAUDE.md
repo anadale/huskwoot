@@ -100,7 +100,7 @@ Stores:
 - `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`.
 - `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated on `CreateProjectTx`). In `main.go`, `*SQLiteTaskStore` is always wrapped in `CachedTaskStore`.
 - `SQLiteHistory` — message history. Table `messages`.
-- `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found.
+- `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
 - `push.SQLitePushQueue` — push job queue. Table `push_queue`. `ON DELETE CASCADE` on `event_seq` (retention deletes pending jobs together with events).
 
@@ -206,6 +206,16 @@ retry_max_attempts  = 4
 
 `PushConfig.Enabled()` → `true` when `relay_url`, `instance_id`, `instance_secret` are all non-empty. Otherwise a `nilRelayClient` is used and the dispatcher does not start.
 
+### `[devices]`
+
+```toml
+[devices]
+inactive_threshold = "720h"   # 30 дней без активности → auto-revoke
+retention_period   = "2160h"  # 90 дней после revoke → физическое удаление
+```
+
+Retention runner каждый час (`events.Runner.Tick`) перебирает `DeviceStore.ListInactive(now - inactive_threshold)` и для каждой записи делает `Revoke` + `RelayClient.DeleteRegistration`. Ошибка relay логируется, но не прерывает локальный revoke. Отдельно вызывается `DeleteRevokedOlderThan(now - retention_period)` для физического удаления из таблицы `devices`. Значение `0` в любой из настроек отключает соответствующий sweep; в обычном режиме работы используются дефолты 30 / 90 дней.
+
 ## HTTP API
 
 Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be made in the yaml first**.
@@ -220,7 +230,7 @@ Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be
 
 **Cold-sync** (`/v1/sync/snapshot`): all projects + open tasks + `last_seq`. Use on first connection or after missing the retention window.
 
-**Retention**: runs hourly, `PushQueue.DeleteDelivered` → `EventStore.DeleteOlderThan(now - events_retention)`.
+**Retention**: runs hourly via `events.Runner.Tick`. Sequence: `PairingStore.DeleteExpired` → device sweep (`ListInactive` → `Revoke` + `RelayClient.DeleteRegistration` → `DeleteRevokedOlderThan`) → `PushQueue.DeleteDelivered` → `EventStore.DeleteOlderThan(now - events_retention)`. Errors in one subsystem do not skip the others.
 
 ### Pairing flow
 

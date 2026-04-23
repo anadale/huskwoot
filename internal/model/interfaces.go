@@ -171,6 +171,13 @@ type DeviceStore interface {
 	// Get returns a device by ID (including revoked).
 	// Returns nil, nil if the device is not found.
 	Get(ctx context.Context, id string) (*Device, error)
+	// ListInactive returns active (non-revoked) devices whose last activity
+	// (COALESCE(last_seen_at, created_at)) is strictly older than cutoff.
+	// Used by the retention runner to auto-revoke stale devices.
+	ListInactive(ctx context.Context, cutoff time.Time) ([]Device, error)
+	// DeleteRevokedOlderThan deletes devices that were revoked strictly before cutoff.
+	// Returns the number of deleted rows.
+	DeleteRevokedOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // EventStore stores domain events (task/project/chat/...) published by use cases.

@@ -166,6 +166,54 @@ func (s *SQLiteDeviceStore) Get(ctx context.Context, id string) (*model.Device, 
 	return d, nil
 }
 
+// ListInactive returns active devices whose effective last-activity timestamp
+// (COALESCE(last_seen_at, created_at)) is strictly before cutoff.
+func (s *SQLiteDeviceStore) ListInactive(ctx context.Context, cutoff time.Time) ([]model.Device, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, platform, token_hash, apns_token, fcm_token,
+		        created_at, last_seen_at, revoked_at
+		 FROM devices
+		 WHERE revoked_at IS NULL
+		   AND COALESCE(last_seen_at, created_at) < ?
+		 ORDER BY created_at ASC, id ASC`,
+		cutoff.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing inactive devices: %w", err)
+	}
+	defer rows.Close()
+
+	var devs []model.Device
+	for rows.Next() {
+		d, err := scanDevice(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning device row: %w", err)
+		}
+		devs = append(devs, *d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating inactive devices: %w", err)
+	}
+	return devs, nil
+}
+
+// DeleteRevokedOlderThan deletes devices revoked strictly before cutoff.
+// Returns the number of deleted rows.
+func (s *SQLiteDeviceStore) DeleteRevokedOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at < ?`,
+		cutoff.UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("deleting revoked devices: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("counting deleted devices: %w", err)
+	}
+	return n, nil
+}
+
 // UpdatePushTokens updates the APNs/FCM push tokens for a device. A nil value
 // clears the corresponding token.
 func (s *SQLiteDeviceStore) UpdatePushTokens(ctx context.Context, id string, apns, fcm *string) error {

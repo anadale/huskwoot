@@ -142,7 +142,7 @@ api_key  = "${OPENAI_API_KEY}"
 model    = "gpt-4o"
 ```
 
-- **fast** — classification (promise / command / skip). Optimize for cost and latency.
+- **fast** — classification (promise / skip). Optimize for cost and latency.
 - **smart** — task extraction and the DM agent. Optimize for accuracy.
 
 Both support any OpenAI-compatible API. For local models via Ollama, set `base_url = "http://localhost:11434/v1"`.
@@ -267,6 +267,27 @@ Without this section (or with any field empty), the push dispatcher does not sta
 
 ---
 
+### `[devices]`
+
+Retention windows for paired devices. The server runs an hourly sweep that auto-revokes stale devices and physically removes long-revoked records so bearer tokens from abandoned re-pairings do not accumulate in the database.
+
+```toml
+[devices]
+inactive_threshold = "720h"    # 30 days of inactivity → auto-revoke (default: 720h)
+retention_period   = "2160h"   # 90 days after revoke → DELETE from the store (default: 2160h)
+```
+
+**How it works:**
+
+- A device is considered inactive when `COALESCE(last_seen_at, created_at) < now - inactive_threshold`. `last_seen_at` is updated on every successful authenticated API request.
+- When a device is auto-revoked, the push relay is notified via `DeleteRegistration` so it stops delivering pushes to that token. Relay errors are logged but do not block the local revoke.
+- Rows where `revoked_at < now - retention_period` are physically deleted on the same hourly tick.
+- Setting either field to `0s` disables the corresponding sweep. Omitting the `[devices]` section uses the defaults above.
+
+Both values use Go duration format; the `"d"` suffix is not supported (use `"720h"`, not `"30d"`).
+
+---
+
 ## Customizing AI Prompts
 
 Huskwoot uses Go templates for AI prompts. Any prompt can be overridden without recompilation by placing files in a `prompts/` subdirectory of the config directory.
@@ -277,16 +298,14 @@ Huskwoot uses Go templates for AI prompts. Any prompt can be overridden without 
   prompts/
     group-classifier-system.gotmpl
     simple-classifier-system.gotmpl
-    command-extractor-system.gotmpl
     extractor-system.gotmpl
     extractor-user.gotmpl
 ```
 
 | File | Purpose |
 |------|---------|
-| `group-classifier-system.gotmpl` | System prompt for group chat classifier (promise / command / skip) |
+| `group-classifier-system.gotmpl` | System prompt for group chat classifier (promise / skip) |
 | `simple-classifier-system.gotmpl` | System prompt for IMAP classifier (promise / skip) |
-| `command-extractor-system.gotmpl` | System prompt for command extractor |
 | `extractor-system.gotmpl` | System prompt for task extractor |
 | `extractor-user.gotmpl` | User-turn prompt for task extractor (all routes) |
 

@@ -127,6 +127,12 @@ func (m *mockDeviceStore) Get(_ context.Context, id string) (*model.Device, erro
 	}
 	return d, nil
 }
+func (m *mockDeviceStore) ListInactive(_ context.Context, _ time.Time) ([]model.Device, error) {
+	return nil, nil
+}
+func (m *mockDeviceStore) DeleteRevokedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
 
 type mockRelayClient struct {
 	pushResponse pushproto.PushResponse

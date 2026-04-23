@@ -474,6 +474,14 @@ func (m *mockDeviceStoreForPairing) Get(_ context.Context, _ string) (*model.Dev
 	return nil, nil
 }
 
+func (m *mockDeviceStoreForPairing) ListInactive(_ context.Context, _ time.Time) ([]model.Device, error) {
+	return nil, nil
+}
+
+func (m *mockDeviceStoreForPairing) DeleteRevokedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 func newTestPairingSvcFull(
 	t *testing.T,
 	store *mockPairingStore,
