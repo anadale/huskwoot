@@ -48,7 +48,7 @@ func TestUpAppliesAll(t *testing.T) {
 
 	wantTables := []string{
 		"projects", "tasks", "cursors", "channel_projects", "messages",
-		"devices", "events", "push_queue", "pairing_requests",
+		"devices", "events", "push_queue", "pairing_requests", "project_aliases",
 	}
 	for _, name := range wantTables {
 		var got string
@@ -161,6 +161,122 @@ func TestUpAppliesPairingRequests(t *testing.T) {
 	var idxName string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_pairing_requests_expires'`).Scan(&idxName); err != nil {
 		t.Fatalf("index idx_pairing_requests_expires not found: %v", err)
+	}
+}
+
+func TestMigrationsCreatesProjectAliasesTable(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("foreign_keys: %v", err)
+	}
+
+	if err := migrations.Up(db); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	wantCols := map[string]bool{
+		"project_id": true,
+		"alias":      true,
+		"created_at": true,
+	}
+
+	rows, err := db.Query(`PRAGMA table_info(project_aliases)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue, pk interface{}
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[name] = true
+	}
+	for col := range wantCols {
+		if !got[col] {
+			t.Errorf("column %q missing from project_aliases", col)
+		}
+	}
+
+	var idxName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_project_aliases_project'`).Scan(&idxName); err != nil {
+		t.Fatalf("index idx_project_aliases_project not found: %v", err)
+	}
+
+	fkRows, err := db.Query(`PRAGMA foreign_key_list(project_aliases)`)
+	if err != nil {
+		t.Fatalf("PRAGMA foreign_key_list: %v", err)
+	}
+	defer fkRows.Close()
+
+	var foundFK bool
+	for fkRows.Next() {
+		var id, seq int
+		var table, from, to, onUpdate, onDelete, match string
+		if err := fkRows.Scan(&id, &seq, &table, &from, &to, &onUpdate, &onDelete, &match); err != nil {
+			t.Fatalf("scan fk: %v", err)
+		}
+		if table == "projects" && from == "project_id" && onDelete == "CASCADE" {
+			foundFK = true
+		}
+	}
+	if !foundFK {
+		t.Fatal("project_aliases must have FK project_id → projects ON DELETE CASCADE")
+	}
+}
+
+func TestProjectAliasesCascadeDelete(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		t.Fatalf("foreign_keys: %v", err)
+	}
+
+	if err := migrations.Up(db); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO projects(id, name, slug, description, task_counter, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"proj-1", "Test Project", "test-project", "", 0, now); err != nil {
+		t.Fatalf("inserting project: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO project_aliases(project_id, alias, created_at) VALUES (?, ?, ?)`,
+		"proj-1", "testAlias", now); err != nil {
+		t.Fatalf("inserting alias: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM project_aliases WHERE project_id = 'proj-1'`).Scan(&count); err != nil {
+		t.Fatalf("count aliases: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("want 1 alias, got %d", count)
+	}
+
+	if _, err := db.Exec(`DELETE FROM projects WHERE id = 'proj-1'`); err != nil {
+		t.Fatalf("deleting project: %v", err)
+	}
+
+	if err := db.QueryRow(`SELECT COUNT(*) FROM project_aliases WHERE project_id = 'proj-1'`).Scan(&count); err != nil {
+		t.Fatalf("count aliases after delete: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("aliases should be cascade-deleted, got %d remaining", count)
 	}
 }
 

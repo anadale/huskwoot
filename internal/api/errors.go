@@ -19,6 +19,12 @@ const (
 	ErrorCodeInternal         = "internal"
 	ErrorCodeUnavailable      = "unavailable"
 	ErrorCodeTimeout          = "timeout"
+
+	ErrorCodeAliasInvalid           = "alias_invalid"
+	ErrorCodeAliasTaken             = "alias_taken"
+	ErrorCodeAliasConflictsWithName = "alias_conflicts_with_name"
+	ErrorCodeAliasLimitReached      = "alias_limit_reached"
+	ErrorCodeAliasForbiddenForInbox = "alias_forbidden_for_inbox"
 )
 
 // ErrorResponse wraps the error body. The format `{"error": {"code": "...", "message": "..."}}`

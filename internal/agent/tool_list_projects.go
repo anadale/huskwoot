@@ -38,14 +38,19 @@ func (t *listProjectsTool) Execute(ctx context.Context, _ string) (string, error
 	}
 
 	type projectItem struct {
-		ID          string `json:"id"`
-		Slug        string `json:"slug"`
-		Name        string `json:"name"`
-		Description string `json:"description,omitempty"`
+		ID          string   `json:"id"`
+		Slug        string   `json:"slug"`
+		Name        string   `json:"name"`
+		Description string   `json:"description,omitempty"`
+		Aliases     []string `json:"aliases"`
 	}
 	items := make([]projectItem, len(projects))
 	for i, p := range projects {
-		items[i] = projectItem{ID: p.ID, Slug: p.Slug, Name: p.Name, Description: p.Description}
+		aliases := p.Aliases
+		if aliases == nil {
+			aliases = []string{}
+		}
+		items[i] = projectItem{ID: p.ID, Slug: p.Slug, Name: p.Name, Description: p.Description, Aliases: aliases}
 	}
 
 	result, _ := json.Marshal(items)

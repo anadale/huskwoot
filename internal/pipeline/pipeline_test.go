@@ -164,6 +164,15 @@ func (m *mockProjectService) FindProjectByName(_ context.Context, _ string) (*mo
 func (m *mockProjectService) EnsureChannelProject(_ context.Context, _, _ string) (*model.Project, error) {
 	return nil, nil
 }
+func (m *mockProjectService) AddProjectAlias(_ context.Context, _, _ string) (*model.Project, error) {
+	return nil, nil
+}
+func (m *mockProjectService) RemoveProjectAlias(_ context.Context, _, _ string) (*model.Project, error) {
+	return nil, nil
+}
+func (m *mockProjectService) ResolveProjectRef(_ context.Context, _ string) (*model.Project, error) {
+	return nil, nil
+}
 
 // mockChatService implements model.ChatService for tests.
 type mockChatService struct {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/anadale/huskwoot/internal/model"
@@ -19,6 +20,7 @@ type mockTaskStoreForProjects struct {
 	findErr      error
 	createErr    error
 	updateErr    error
+	addAliasErr  error
 	defaultPID   string
 	createCalled int
 	updateCalled int
@@ -101,6 +103,41 @@ func (m *mockTaskStoreForProjects) MoveTaskTx(_ context.Context, _ *sql.Tx, _, _
 	return nil
 }
 func (m *mockTaskStoreForProjects) DefaultProjectID() string { return m.defaultPID }
+func (m *mockTaskStoreForProjects) AddProjectAliasTx(_ context.Context, _ *sql.Tx, projectID, alias string) error {
+	if m.addAliasErr != nil {
+		return m.addAliasErr
+	}
+	for i := range m.projects {
+		if m.projects[i].ID == projectID {
+			m.projects[i].Aliases = append(m.projects[i].Aliases, alias)
+			return nil
+		}
+	}
+	return nil
+}
+func (m *mockTaskStoreForProjects) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, projectID, alias string) error {
+	for i := range m.projects {
+		if m.projects[i].ID != projectID {
+			continue
+		}
+		for j, a := range m.projects[i].Aliases {
+			if a == alias {
+				m.projects[i].Aliases = append(m.projects[i].Aliases[:j], m.projects[i].Aliases[j+1:]...)
+				return nil
+			}
+		}
+		return nil
+	}
+	return nil
+}
+func (m *mockTaskStoreForProjects) ListAliasesForProject(_ context.Context, projectID string) ([]string, error) {
+	for _, p := range m.projects {
+		if p.ID == projectID {
+			return p.Aliases, nil
+		}
+	}
+	return []string{}, nil
+}
 
 type mockMetaStoreForProjects struct {
 	data   map[string]string
@@ -428,5 +465,211 @@ func TestProjectServiceResolveChannelMetaGetError(t *testing.T) {
 	_, err := f.svc.ResolveProjectForChannel(context.Background(), "chat:1")
 	if err == nil {
 		t.Fatal("want error on meta.Get failure")
+	}
+}
+
+func TestProjectServiceAddAliasHappyPath(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{}},
+	}
+
+	p, err := f.svc.AddProjectAlias(context.Background(), "p1", "букинист")
+	if err != nil {
+		t.Fatalf("AddProjectAlias: %v", err)
+	}
+	if len(p.Aliases) != 1 || p.Aliases[0] != "букинист" {
+		t.Fatalf("Aliases=%v, want [букинист]", p.Aliases)
+	}
+
+	events := f.events.recorded()
+	if len(events) != 1 || events[0].Kind != model.EventProjectUpdated {
+		t.Fatalf("want 1 project_updated event, got %+v", events)
+	}
+
+	var payload struct {
+		ChangedFields []string `json:"changedFields"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if len(payload.ChangedFields) != 1 || payload.ChangedFields[0] != "aliases" {
+		t.Fatalf("changedFields=%v, want [aliases]", payload.ChangedFields)
+	}
+}
+
+func TestProjectServiceAddAliasInvalidAlias(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "p1", "invalid alias!")
+	if !errors.Is(err, usecase.ErrAliasInvalid) {
+		t.Fatalf("want ErrAliasInvalid, got %v", err)
+	}
+}
+
+func TestProjectServiceAddAliasForbiddenForInbox(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "inbox-id", Name: "Inbox", Slug: "inbox"},
+	}
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "inbox-id", "букинист")
+	if !errors.Is(err, usecase.ErrAliasForbiddenForInbox) {
+		t.Fatalf("want ErrAliasForbiddenForInbox, got %v", err)
+	}
+}
+
+func TestProjectServiceAddAliasConflictsWithName(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore"},
+		{ID: "p2", Name: "Work", Slug: "work"},
+	}
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "p1", "work")
+	if !errors.Is(err, usecase.ErrAliasConflictsWithName) {
+		t.Fatalf("want ErrAliasConflictsWithName, got %v", err)
+	}
+}
+
+func TestProjectServiceAddAliasLimitReached(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	tenAliases := []string{"aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh", "ii", "jj"}
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: tenAliases},
+	}
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "p1", "kk")
+	if !errors.Is(err, usecase.ErrAliasLimitReached) {
+		t.Fatalf("want ErrAliasLimitReached, got %v", err)
+	}
+}
+
+func TestProjectServiceAddAliasTaken(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{}},
+	}
+	f.tasks.addAliasErr = fmt.Errorf("UNIQUE constraint failed: project_aliases.alias")
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "p1", "букинист")
+	if !errors.Is(err, usecase.ErrAliasTaken) {
+		t.Fatalf("want ErrAliasTaken, got %v", err)
+	}
+}
+
+func TestProjectServiceAddAliasRollbackOnEventError(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{}},
+	}
+	f.events.insertErr = errors.New("events insert failed")
+
+	_, err := f.svc.AddProjectAlias(context.Background(), "p1", "букинист")
+	if err == nil {
+		t.Fatal("want error on event insert failure")
+	}
+
+	if n := len(f.broker.notifiedEvents()); n != 0 {
+		t.Fatalf("broker.Notify called %d times, want 0 (rollback)", n)
+	}
+}
+
+func TestProjectServiceRemoveAliasRollbackOnEventError(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{"букинист"}},
+	}
+	f.events.insertErr = errors.New("events insert failed")
+
+	_, err := f.svc.RemoveProjectAlias(context.Background(), "p1", "букинист")
+	if err == nil {
+		t.Fatal("want error on event insert failure")
+	}
+
+	if n := len(f.broker.notifiedEvents()); n != 0 {
+		t.Fatalf("broker.Notify called %d times, want 0 (rollback)", n)
+	}
+}
+
+func TestProjectServiceRemoveAliasHappyPath(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{"букинист"}},
+	}
+
+	p, err := f.svc.RemoveProjectAlias(context.Background(), "p1", "букинист")
+	if err != nil {
+		t.Fatalf("RemoveProjectAlias: %v", err)
+	}
+	if len(p.Aliases) != 0 {
+		t.Fatalf("Aliases=%v, want empty", p.Aliases)
+	}
+
+	events := f.events.recorded()
+	if len(events) != 1 || events[0].Kind != model.EventProjectUpdated {
+		t.Fatalf("want 1 project_updated event, got %+v", events)
+	}
+}
+
+func TestProjectServiceRemoveAliasNotFound(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.defaultPID = "inbox-id"
+	f.tasks.projects = []model.Project{
+		{ID: "p1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{}},
+	}
+
+	_, err := f.svc.RemoveProjectAlias(context.Background(), "p1", "noexist")
+	if !errors.Is(err, usecase.ErrAliasNotFound) {
+		t.Fatalf("want ErrAliasNotFound, got %v", err)
+	}
+}
+
+func TestProjectServiceResolveProjectRef(t *testing.T) {
+	f := newProjectFixture(t)
+	f.tasks.projects = []model.Project{
+		{ID: "uuid-1", Name: "Bookstore", Slug: "bookstore", Aliases: []string{"букинист"}},
+		{ID: "uuid-2", Name: "Work", Slug: "work", Aliases: []string{"job"}},
+	}
+
+	tests := []struct {
+		name    string
+		ref     string
+		wantID  string
+		wantErr error
+	}{
+		{name: "by UUID", ref: "uuid-1", wantID: "uuid-1"},
+		{name: "by slug", ref: "bookstore", wantID: "uuid-1"},
+		{name: "by alias", ref: "букинист", wantID: "uuid-1"},
+		{name: "by alias uppercase", ref: "Букинист", wantID: "uuid-1"},
+		{name: "by alias another project", ref: "job", wantID: "uuid-2"},
+		{name: "not found", ref: "nonexistent", wantErr: usecase.ErrProjectNotFound},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := f.svc.ResolveProjectRef(context.Background(), tc.ref)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("want %v, got %v", tc.wantErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if p.ID != tc.wantID {
+				t.Fatalf("ID=%q, want %q", p.ID, tc.wantID)
+			}
+		})
 	}
 }

@@ -232,6 +232,34 @@ func TestMessage_HistoryFn_Nil(t *testing.T) {
 	}
 }
 
+func TestProjectAliasesDefaultEmpty(t *testing.T) {
+	p := Project{}
+	if len(p.Aliases) != 0 {
+		t.Errorf("zero-value Project.Aliases must be empty, got len=%d", len(p.Aliases))
+	}
+
+	pWithAliases := Project{Aliases: []string{"test"}}
+	if len(pWithAliases.Aliases) != 1 {
+		t.Errorf("want 1 alias, got %d", len(pWithAliases.Aliases))
+	}
+}
+
+func TestProjectUpdateAliasesNilMeansNoChange(t *testing.T) {
+	upd := ProjectUpdate{}
+	if upd.Aliases != nil {
+		t.Error("zero-value ProjectUpdate.Aliases must be nil (no change)")
+	}
+
+	empty := []string{}
+	upd2 := ProjectUpdate{Aliases: &empty}
+	if upd2.Aliases == nil {
+		t.Error("non-nil Aliases pointer must be set")
+	}
+	if len(*upd2.Aliases) != 0 {
+		t.Error("pointer to empty slice must represent clear-all")
+	}
+}
+
 func TestCursor_Fields(t *testing.T) {
 	now := time.Now()
 	c := Cursor{

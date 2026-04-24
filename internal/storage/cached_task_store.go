@@ -71,5 +71,12 @@ func cloneProjects(src []model.Project) []model.Project {
 	}
 	out := make([]model.Project, len(src))
 	copy(out, src)
+	for i := range out {
+		if out[i].Aliases != nil {
+			cp := make([]string, len(out[i].Aliases))
+			copy(cp, out[i].Aliases)
+			out[i].Aliases = cp
+		}
+	}
 	return out
 }

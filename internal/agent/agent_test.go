@@ -633,3 +633,125 @@ func TestAgent_PutsNowInToolContext(t *testing.T) {
 		t.Errorf("now from context = %v, want %v", contextNow, fixedNow)
 	}
 }
+
+func TestAgentToolSetIncludesProjectManagement_DM(t *testing.T) {
+	captureClient := &captureToolsClient{response: textResponse("ок")}
+
+	tools := []agent.Tool{
+		&mockTool{name: "create_project", dmOnly: true},
+		&mockTool{name: "list_projects", dmOnly: true},
+		&mockTool{name: "get_project", dmOnly: true},
+		&mockTool{name: "update_project", dmOnly: true},
+		&mockTool{name: "add_project_alias", dmOnly: true},
+		&mockTool{name: "remove_project_alias", dmOnly: true},
+		&mockTool{name: "create_task", dmOnly: false},
+	}
+
+	a := newTestAgent(t, captureClient, tools, agent.Config{})
+	_, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindDM, Text: "тест"})
+	if err != nil {
+		t.Fatalf("Handle() returned error: %v", err)
+	}
+
+	wantTools := []string{"create_project", "list_projects", "get_project", "update_project", "add_project_alias", "remove_project_alias"}
+	for _, want := range wantTools {
+		found := false
+		for _, got := range captureClient.capturedToolNames {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("DM scope: expected project management tool %q not found in tool set: %v", want, captureClient.capturedToolNames)
+		}
+	}
+	if len(captureClient.capturedToolNames) != len(tools) {
+		t.Errorf("DM scope: want %d tools, got %d: %v", len(tools), len(captureClient.capturedToolNames), captureClient.capturedToolNames)
+	}
+}
+
+func TestAgentToolSetIncludesProjectManagement_GroupDirect(t *testing.T) {
+	captureClient := &captureToolsClient{response: textResponse("ок")}
+
+	dmOnlyNames := []string{"create_project", "list_projects", "get_project", "update_project", "add_project_alias", "remove_project_alias"}
+	tools := []agent.Tool{
+		&mockTool{name: "create_project", dmOnly: true},
+		&mockTool{name: "list_projects", dmOnly: true},
+		&mockTool{name: "get_project", dmOnly: true},
+		&mockTool{name: "update_project", dmOnly: true},
+		&mockTool{name: "add_project_alias", dmOnly: true},
+		&mockTool{name: "remove_project_alias", dmOnly: true},
+		&mockTool{name: "create_task", dmOnly: false},
+	}
+
+	a := newTestAgent(t, captureClient, tools, agent.Config{})
+	_, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindGroupDirect, Text: "тест"})
+	if err != nil {
+		t.Fatalf("Handle() returned error: %v", err)
+	}
+
+	for _, name := range dmOnlyNames {
+		for _, got := range captureClient.capturedToolNames {
+			if got == name {
+				t.Errorf("GroupDirect scope: DMOnly tool %q must not be in tool set", name)
+				break
+			}
+		}
+	}
+	if len(captureClient.capturedToolNames) != 1 || captureClient.capturedToolNames[0] != "create_task" {
+		t.Errorf("GroupDirect scope: want only [create_task], got: %v", captureClient.capturedToolNames)
+	}
+}
+
+func TestAgent_SystemPromptIncludesProjectAliases(t *testing.T) {
+	captureClient := &captureToolsClient{response: textResponse("ок")}
+
+	projects := []model.Project{
+		{ID: "uuid-1", Slug: "bukinist", Name: "Букинист", Aliases: []string{"букинист", "книги"}},
+		{ID: "uuid-2", Slug: "inbox", Name: "Inbox", Aliases: []string{}},
+	}
+	cfg := agent.Config{
+		ListProjects: func(_ context.Context) ([]model.Project, error) {
+			return projects, nil
+		},
+	}
+
+	a := newTestAgent(t, captureClient, nil, cfg)
+	_, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindDM, Text: "тест"})
+	if err != nil {
+		t.Fatalf("Handle() returned error: %v", err)
+	}
+
+	sys := captureClient.capturedSysContent
+	if !strings.Contains(sys, "«букинист»") {
+		t.Errorf("system prompt must contain alias in «...» format\nFull prompt: %q", sys)
+	}
+	if !strings.Contains(sys, "«книги»") {
+		t.Errorf("system prompt must contain second alias in «...» format\nFull prompt: %q", sys)
+	}
+}
+
+func TestAgent_SystemPromptNoAliasesTail_WhenEmpty(t *testing.T) {
+	captureClient := &captureToolsClient{response: textResponse("ок")}
+
+	projects := []model.Project{
+		{ID: "uuid-2", Slug: "inbox", Name: "Inbox", Aliases: []string{}},
+	}
+	cfg := agent.Config{
+		ListProjects: func(_ context.Context) ([]model.Project, error) {
+			return projects, nil
+		},
+	}
+
+	a := newTestAgent(t, captureClient, nil, cfg)
+	_, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindDM, Text: "тест"})
+	if err != nil {
+		t.Fatalf("Handle() returned error: %v", err)
+	}
+
+	sys := captureClient.capturedSysContent
+	if strings.Contains(sys, "aliases:") {
+		t.Errorf("system prompt must not contain 'aliases:' when project has no aliases\nFull prompt: %q", sys)
+	}
+}

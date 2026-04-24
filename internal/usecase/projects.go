@@ -4,10 +4,23 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/anadale/huskwoot/internal/model"
+)
+
+var (
+	ErrAliasInvalid           = errors.New("alias format is invalid")
+	ErrAliasTaken             = errors.New("alias already used by another project")
+	ErrAliasConflictsWithName = errors.New("alias conflicts with existing project name or slug")
+	ErrAliasLimitReached      = errors.New("alias limit reached for project")
+	ErrAliasNotFound          = errors.New("alias not found for project")
+	ErrAliasForbiddenForInbox = errors.New("aliases are not allowed for the Inbox project")
+	ErrProjectNotFound        = errors.New("project not found")
 )
 
 // ProjectServiceDeps collects the dependencies for ProjectService.
@@ -52,28 +65,98 @@ func NewProjectService(deps ProjectServiceDeps) model.ProjectService {
 	}
 }
 
-// projectSnapshot is the JSON schema for a project event payload.
+// projectSnapshot is the JSON schema for a project inside event payloads.
 type projectSnapshot struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
 	Slug        string    `json:"slug"`
 	Description string    `json:"description,omitempty"`
+	Aliases     []string  `json:"aliases"`
 	TaskCounter int       `json:"task_counter"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
 func makeProjectSnapshot(p *model.Project) projectSnapshot {
+	aliases := p.Aliases
+	if aliases == nil {
+		aliases = []string{}
+	}
 	return projectSnapshot{
 		ID:          p.ID,
 		Name:        p.Name,
 		Slug:        p.Slug,
 		Description: p.Description,
+		Aliases:     aliases,
 		TaskCounter: p.TaskCounter,
 		CreatedAt:   p.CreatedAt,
 	}
 }
 
+// projectUpdatedPayload is the JSON schema for project_updated event payloads.
+type projectUpdatedPayload struct {
+	Project       projectSnapshot `json:"project"`
+	ChangedFields []string        `json:"changedFields"`
+}
+
+// aliasConflictsWithNameSlug reports whether alias equals any other project's slug
+// or (case-folded) name. excludeID is the project being modified; it is skipped
+// to allow a project to hold an alias matching its own name or slug.
+func aliasConflictsWithNameSlug(alias string, projects []model.Project, excludeID string) bool {
+	for _, p := range projects {
+		if p.ID == excludeID {
+			continue
+		}
+		if p.Slug == alias || strings.ToLower(p.Name) == alias {
+			return true
+		}
+	}
+	return false
+}
+
+// setDiff returns elements in a that are not present in b.
+func setDiff(a, b []string) []string {
+	bSet := make(map[string]bool, len(b))
+	for _, v := range b {
+		bSet[v] = true
+	}
+	var result []string
+	for _, v := range a {
+		if !bSet[v] {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
 func (s *projectService) CreateProject(ctx context.Context, req model.CreateProjectRequest) (*model.Project, error) {
+	// Validate and normalize aliases upfront.
+	var normalizedAliases []string
+	if len(req.Aliases) > 0 {
+		seen := make(map[string]bool, len(req.Aliases))
+		for _, a := range req.Aliases {
+			n, err := validateAlias(a)
+			if err != nil {
+				return nil, ErrAliasInvalid
+			}
+			if !seen[n] {
+				seen[n] = true
+				normalizedAliases = append(normalizedAliases, n)
+			}
+		}
+		if len(normalizedAliases) > 10 {
+			return nil, ErrAliasLimitReached
+		}
+		projects, err := s.store.ListProjects(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing projects for conflict check: %w", err)
+		}
+		for _, a := range normalizedAliases {
+			if aliasConflictsWithNameSlug(a, projects, "") {
+				return nil, ErrAliasConflictsWithName
+			}
+		}
+	}
+
 	p := &model.Project{
 		Name:        req.Name,
 		Description: req.Description,
@@ -93,6 +176,16 @@ func (s *projectService) CreateProject(ctx context.Context, req model.CreateProj
 		if err := s.store.CreateProjectTx(ctx, tx, p); err != nil {
 			return fmt.Errorf("создание проекта: %w", err)
 		}
+		for _, a := range normalizedAliases {
+			if err := s.store.AddProjectAliasTx(ctx, tx, p.ID, a); err != nil {
+				if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+					return ErrAliasTaken
+				}
+				return fmt.Errorf("adding alias %q: %w", a, err)
+			}
+		}
+		sort.Strings(normalizedAliases)
+		p.Aliases = normalizedAliases
 		ev, err := s.recordEvent(ctx, tx, model.EventProjectCreated, p.ID, makeProjectSnapshot(p), activeIDs)
 		if err != nil {
 			return err
@@ -110,6 +203,40 @@ func (s *projectService) CreateProject(ctx context.Context, req model.CreateProj
 }
 
 func (s *projectService) UpdateProject(ctx context.Context, id string, upd model.ProjectUpdate) (*model.Project, error) {
+	// Validate and normalize aliases upfront if provided.
+	var normalizedNewAliases []string
+	if upd.Aliases != nil {
+		if id == s.store.DefaultProjectID() {
+			return nil, ErrAliasForbiddenForInbox
+		}
+		aliases := *upd.Aliases
+		seen := make(map[string]bool, len(aliases))
+		for _, a := range aliases {
+			n, err := validateAlias(a)
+			if err != nil {
+				return nil, ErrAliasInvalid
+			}
+			if !seen[n] {
+				seen[n] = true
+				normalizedNewAliases = append(normalizedNewAliases, n)
+			}
+		}
+		if len(normalizedNewAliases) > 10 {
+			return nil, ErrAliasLimitReached
+		}
+		if len(normalizedNewAliases) > 0 {
+			projects, err := s.store.ListProjects(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("listing projects for conflict check: %w", err)
+			}
+			for _, a := range normalizedNewAliases {
+				if aliasConflictsWithNameSlug(a, projects, id) {
+					return nil, ErrAliasConflictsWithName
+				}
+			}
+		}
+	}
+
 	activeIDs, err := s.listActiveDeviceIDs(ctx)
 	if err != nil {
 		return nil, err
@@ -121,6 +248,9 @@ func (s *projectService) UpdateProject(ctx context.Context, id string, upd model
 	)
 	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
 		if err := s.store.UpdateProjectTx(ctx, tx, id, upd); err != nil {
+			if p, _ := s.store.GetProjectTx(ctx, tx, id); p == nil {
+				return ErrProjectNotFound
+			}
 			return fmt.Errorf("обновление проекта: %w", err)
 		}
 		p, err := s.store.GetProjectTx(ctx, tx, id)
@@ -128,10 +258,59 @@ func (s *projectService) UpdateProject(ctx context.Context, id string, upd model
 			return fmt.Errorf("получение проекта после обновления: %w", err)
 		}
 		if p == nil {
-			return fmt.Errorf("проект %s не найден после обновления", id)
+			return ErrProjectNotFound
 		}
+
+		var changedFields []string
+		if upd.Name != nil {
+			changedFields = append(changedFields, "name")
+		}
+		if upd.Description != nil {
+			changedFields = append(changedFields, "description")
+		}
+		if upd.Slug != nil {
+			changedFields = append(changedFields, "slug")
+		}
+
+		if upd.Aliases != nil {
+			toAdd := setDiff(normalizedNewAliases, p.Aliases)
+			toRemove := setDiff(p.Aliases, normalizedNewAliases)
+			for _, a := range toAdd {
+				if err := s.store.AddProjectAliasTx(ctx, tx, id, a); err != nil {
+					if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+						return ErrAliasTaken
+					}
+					return fmt.Errorf("adding alias %q: %w", a, err)
+				}
+			}
+			for _, a := range toRemove {
+				if err := s.store.RemoveProjectAliasTx(ctx, tx, id, a); err != nil {
+					return fmt.Errorf("removing alias %q: %w", a, err)
+				}
+			}
+			if len(toAdd) > 0 || len(toRemove) > 0 {
+				changedFields = append(changedFields, "aliases")
+				p, err = s.store.GetProjectTx(ctx, tx, id)
+				if err != nil {
+					return fmt.Errorf("получение проекта после обновления алиасов: %w", err)
+				}
+				if p == nil {
+					return ErrProjectNotFound
+				}
+			}
+		}
+
 		updated = p
-		ev, err := s.recordEvent(ctx, tx, model.EventProjectUpdated, p.ID, makeProjectSnapshot(p), activeIDs)
+		if len(changedFields) == 0 {
+			return nil
+		}
+		ev, err := s.recordEvent(ctx, tx, model.EventProjectUpdated, p.ID,
+			projectUpdatedPayload{
+				Project:       makeProjectSnapshot(p),
+				ChangedFields: changedFields,
+			},
+			activeIDs,
+		)
 		if err != nil {
 			return err
 		}
@@ -141,8 +320,10 @@ func (s *projectService) UpdateProject(ctx context.Context, id string, upd model
 		return nil, err
 	}
 
-	s.invalidateProjectCache()
-	s.notify(pendingEvent)
+	if pendingEvent.Seq != 0 {
+		s.invalidateProjectCache()
+		s.notify(pendingEvent)
+	}
 	appendTouchedProjects(ctx, []model.Project{*updated})
 	return updated, nil
 }
@@ -281,6 +462,191 @@ func (s *projectService) invalidateProjectCache() {
 	if inv, ok := s.store.(interface{ Invalidate() }); ok {
 		inv.Invalidate()
 	}
+}
+
+func (s *projectService) AddProjectAlias(ctx context.Context, projectID, alias string) (*model.Project, error) {
+	normalized, err := validateAlias(alias)
+	if err != nil {
+		return nil, ErrAliasInvalid
+	}
+	if projectID == s.store.DefaultProjectID() {
+		return nil, ErrAliasForbiddenForInbox
+	}
+
+	// Check name/slug conflicts before opening the transaction (uses the cache).
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing projects for conflict check: %w", err)
+	}
+	if aliasConflictsWithNameSlug(normalized, projects, projectID) {
+		return nil, ErrAliasConflictsWithName
+	}
+
+	activeIDs, err := s.listActiveDeviceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		updated      *model.Project
+		pendingEvent model.Event
+	)
+	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
+		p, err := s.store.GetProjectTx(ctx, tx, projectID)
+		if err != nil {
+			return fmt.Errorf("getting project: %w", err)
+		}
+		if p == nil {
+			return ErrProjectNotFound
+		}
+		for _, a := range p.Aliases {
+			if a == normalized {
+				updated = p
+				return nil
+			}
+		}
+		if len(p.Aliases) >= 10 {
+			return ErrAliasLimitReached
+		}
+
+		if err := s.store.AddProjectAliasTx(ctx, tx, projectID, normalized); err != nil {
+			if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+				return ErrAliasTaken
+			}
+			return fmt.Errorf("adding alias: %w", err)
+		}
+
+		up, err := s.store.GetProjectTx(ctx, tx, projectID)
+		if err != nil {
+			return fmt.Errorf("reading updated project: %w", err)
+		}
+		updated = up
+
+		ev, err := s.recordEvent(ctx, tx, model.EventProjectUpdated, updated.ID,
+			projectUpdatedPayload{
+				Project:       makeProjectSnapshot(updated),
+				ChangedFields: []string{"aliases"},
+			},
+			activeIDs,
+		)
+		if err != nil {
+			return err
+		}
+		pendingEvent = ev
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	if pendingEvent.Seq != 0 {
+		s.invalidateProjectCache()
+		s.notify(pendingEvent)
+	}
+	appendTouchedProjects(ctx, []model.Project{*updated})
+	return updated, nil
+}
+
+func (s *projectService) RemoveProjectAlias(ctx context.Context, projectID, alias string) (*model.Project, error) {
+	normalized, err := validateAlias(alias)
+	if err != nil {
+		return nil, ErrAliasInvalid
+	}
+
+	activeIDs, err := s.listActiveDeviceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		updated      *model.Project
+		pendingEvent model.Event
+	)
+	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
+		p, err := s.store.GetProjectTx(ctx, tx, projectID)
+		if err != nil {
+			return fmt.Errorf("getting project: %w", err)
+		}
+		if p == nil {
+			return ErrProjectNotFound
+		}
+
+		found := false
+		for _, a := range p.Aliases {
+			if a == normalized {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrAliasNotFound
+		}
+
+		if err := s.store.RemoveProjectAliasTx(ctx, tx, projectID, normalized); err != nil {
+			return fmt.Errorf("removing alias: %w", err)
+		}
+
+		up, err := s.store.GetProjectTx(ctx, tx, projectID)
+		if err != nil {
+			return fmt.Errorf("reading updated project: %w", err)
+		}
+		updated = up
+
+		ev, err := s.recordEvent(ctx, tx, model.EventProjectUpdated, updated.ID,
+			projectUpdatedPayload{
+				Project:       makeProjectSnapshot(updated),
+				ChangedFields: []string{"aliases"},
+			},
+			activeIDs,
+		)
+		if err != nil {
+			return err
+		}
+		pendingEvent = ev
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	s.invalidateProjectCache()
+	s.notify(pendingEvent)
+	appendTouchedProjects(ctx, []model.Project{*updated})
+	return updated, nil
+}
+
+func (s *projectService) ResolveProjectRef(ctx context.Context, ref string) (*model.Project, error) {
+	// Try UUID lookup first.
+	p, err := s.store.GetProject(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("looking up project by id: %w", err)
+	}
+	if p != nil {
+		return p, nil
+	}
+
+	projects, err := s.store.ListProjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing projects: %w", err)
+	}
+
+	// Try slug.
+	for i := range projects {
+		if projects[i].Slug == ref {
+			return &projects[i], nil
+		}
+	}
+
+	// Try alias (normalize ref to lowercase first).
+	if normalized, err := validateAlias(ref); err == nil {
+		for i := range projects {
+			for _, a := range projects[i].Aliases {
+				if a == normalized {
+					return &projects[i], nil
+				}
+			}
+		}
+	}
+
+	return nil, ErrProjectNotFound
 }
 
 // runInTx opens a transaction, calls fn, and commits; rolls back on error.

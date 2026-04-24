@@ -97,8 +97,8 @@ All backed by a single `huskwoot.db`. `storage.OpenDB` enables WAL, foreign keys
 Stores:
 - `SQLiteStateStore` — read cursors. Table `cursors`.
 - `SQLiteMetaStore` — channel metadata. Table `channel_projects`. Single write method: `SetTx(ctx, tx, key, value)`.
-- `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`.
-- `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated on `CreateProjectTx`). In `main.go`, `*SQLiteTaskStore` is always wrapped in `CachedTaskStore`.
+- `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`. Project aliases are stored in `project_aliases` table (1:N with `ON DELETE CASCADE`); new tx-aware methods: `AddProjectAliasTx`, `RemoveProjectAliasTx`, `ListAliasesForProject`.
+- `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated via `projectService.invalidateProjectCache()` after any commit that changes the project set: `CreateProject`, `UpdateProject` when fields actually change, `AddProjectAlias`, `RemoveProjectAlias`). In `main.go`, `*SQLiteTaskStore` is always wrapped in `CachedTaskStore`.
 - `SQLiteHistory` — message history. Table `messages`.
 - `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
@@ -119,8 +119,12 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 
 | Tool | DMOnly | Description |
 |---|---|---|
-| `create_project` | yes | Create a project |
+| `create_project` | yes | Create a project (optional `aliases` parameter: list of short trigger words) |
 | `list_projects` | yes | List all projects |
+| `get_project` | yes | Get full project details by UUID, slug, or alias |
+| `update_project` | yes | Update project name, description, or slug (ref = UUID \| slug \| alias) |
+| `add_project_alias` | yes | Add an alias to a project (ref = UUID \| slug \| alias) |
+| `remove_project_alias` | yes | Remove an alias from a project |
 | `create_task` | no | Create a task (no project_id → Inbox) |
 | `list_tasks` | no | Tasks in a project filtered by status |
 | `complete_task` | no | Mark a task as completed |
@@ -138,6 +142,10 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 ### Task resolution
 
 All tools that accept a task identifier use the shared helper `resolveTask` in `internal/agent/resolve_task.go`. It accepts a UUID or `<slug>#<number>` reference (e.g. `inbox#3`) and returns `*model.Task` or an i18n error. `parseTaskRef` also lives there. New tools must call `resolveTask` instead of inlining lookup logic.
+
+### Project resolution
+
+All tools that accept a project identifier use the shared helper `resolveProjectRef` in `internal/agent/resolve_project.go`. It accepts a UUID, slug, or alias and returns `*model.Project` with an i18n-wrapped error on failure. New tools must call `resolveProjectRef` instead of inlining lookup logic.
 
 ## Testing
 
@@ -249,7 +257,9 @@ Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be
 - `GET /pair/confirm/{id}` — HTML form + CSRF cookie (`__Host-csrf` over HTTPS, `csrf` over HTTP).
 - `POST /pair/confirm/{id}` — CSRF validation, device creation, `Broadcaster.Notify`.
 
-Sentinel errors: `ErrPairingNotFound`, `ErrPairingExpired`, `ErrNonceMismatch`, `ErrCSRFMismatch`, `ErrAlreadyConfirmed`, `ErrSenderFailed`.
+Pairing sentinel errors: `ErrPairingNotFound`, `ErrPairingExpired`, `ErrNonceMismatch`, `ErrCSRFMismatch`, `ErrAlreadyConfirmed`, `ErrSenderFailed`.
+
+Project sentinel errors (`internal/usecase/projects.go`): `ErrProjectNotFound` → 404; `ErrAliasInvalid` → 400; `ErrAliasTaken` → 409; `ErrAliasConflictsWithName` → 409; `ErrAliasLimitReached` → 409; `ErrAliasForbiddenForInbox` → 403; `ErrAliasNotFound` → 404.
 
 ## Push relay
 
@@ -267,9 +277,14 @@ Details: `docs/push-relay/hmac.md`.
 
 // task_updated:
 {"task": {...taskSnapshot...}, "changedFields": ["summary", "deadline"]}
+
+// project_updated:
+{"project": {...projectSnapshot...}, "changedFields": ["name"?, "description"?, "slug"?, "aliases"?]}
 ```
 
-`changedFields` order: `summary`, `details`, `topic`, `deadline`, `status`. `Templates.Resolve` for `task_updated` without `summary`/`deadline` → `ok=false` (dropped).
+`changedFields` order for tasks: `summary`, `details`, `topic`, `deadline`, `status`. `Templates.Resolve` for `task_updated` without `summary`/`deadline` → `ok=false` (dropped).
+
+`changedFields` order for projects: `name`, `description`, `slug`, `aliases`. `Templates.Resolve` for `project_updated` → always `ok=false` (dropped; no push notification sent).
 
 ### Dispatcher backoff
 

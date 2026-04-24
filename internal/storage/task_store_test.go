@@ -1203,6 +1203,310 @@ func TestMoveTaskTxRollback(t *testing.T) {
 	}
 }
 
+// addAliasHelper wraps store.AddProjectAliasTx in a short transaction for test use.
+func addAliasHelper(t *testing.T, db *sql.DB, store *storage.SQLiteTaskStore, projectID, alias string) error {
+	t.Helper()
+	return withTx(t, db, func(tx *sql.Tx) error {
+		return store.AddProjectAliasTx(context.Background(), tx, projectID, alias)
+	})
+}
+
+// removeAliasHelper wraps store.RemoveProjectAliasTx in a short transaction for test use.
+func removeAliasHelper(t *testing.T, db *sql.DB, store *storage.SQLiteTaskStore, projectID, alias string) error {
+	t.Helper()
+	return withTx(t, db, func(tx *sql.Tx) error {
+		return store.RemoveProjectAliasTx(context.Background(), tx, projectID, alias)
+	})
+}
+
+// --- Alias tests ---
+
+func TestTaskStoreAddProjectAliasSuccess(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	if err := addAliasHelper(t, db, store, p.ID, "work"); err != nil {
+		t.Fatalf("AddProjectAliasTx: %v", err)
+	}
+
+	aliases, err := store.ListAliasesForProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	if len(aliases) != 1 || aliases[0] != "work" {
+		t.Errorf("want [work], got %v", aliases)
+	}
+}
+
+func TestTaskStoreAddProjectAliasDuplicatePrimaryKey(t *testing.T) {
+	store, db := newTaskStore(t)
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := addAliasHelper(t, db, store, p.ID, "work"); err != nil {
+		t.Fatalf("first AddProjectAliasTx: %v", err)
+	}
+
+	err := addAliasHelper(t, db, store, p.ID, "work")
+	if err == nil {
+		t.Fatal("expected error on duplicate alias, got nil")
+	}
+}
+
+func TestTaskStoreAddProjectAliasForeignKeyMissing(t *testing.T) {
+	store, db := newTaskStore(t)
+
+	err := addAliasHelper(t, db, store, "00000000-0000-0000-0000-000000000000", "ghost")
+	if err == nil {
+		t.Fatal("expected FK error for non-existent project, got nil")
+	}
+}
+
+func TestTaskStoreRemoveProjectAliasSuccess(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if err := addAliasHelper(t, db, store, p.ID, "work"); err != nil {
+		t.Fatalf("AddProjectAliasTx: %v", err)
+	}
+
+	if err := removeAliasHelper(t, db, store, p.ID, "work"); err != nil {
+		t.Fatalf("RemoveProjectAliasTx: %v", err)
+	}
+
+	aliases, err := store.ListAliasesForProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	if len(aliases) != 0 {
+		t.Errorf("want empty aliases after removal, got %v", aliases)
+	}
+}
+
+func TestTaskStoreRemoveProjectAliasNotFound(t *testing.T) {
+	store, db := newTaskStore(t)
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	// Callers pre-validate alias membership; the store returns nil when the row is absent.
+	if err := removeAliasHelper(t, db, store, p.ID, "nonexistent"); err != nil {
+		t.Fatalf("expected nil when removing non-existent alias, got: %v", err)
+	}
+}
+
+func TestTaskStoreListAliasesForProjectEmpty(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	aliases, err := store.ListAliasesForProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	if len(aliases) != 0 {
+		t.Errorf("want empty slice, got %v", aliases)
+	}
+}
+
+func TestTaskStoreListAliasesForProjectMultiple(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	for _, a := range []string{"beta", "alpha", "gamma"} {
+		if err := addAliasHelper(t, db, store, p.ID, a); err != nil {
+			t.Fatalf("AddProjectAliasTx(%q): %v", a, err)
+		}
+	}
+
+	aliases, err := store.ListAliasesForProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	if len(aliases) != 3 {
+		t.Fatalf("want 3 aliases, got %d: %v", len(aliases), aliases)
+	}
+}
+
+func TestTaskStoreListAliasesForProjectSorted(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	for _, a := range []string{"zebra", "apple", "mango"} {
+		if err := addAliasHelper(t, db, store, p.ID, a); err != nil {
+			t.Fatalf("AddProjectAliasTx(%q): %v", a, err)
+		}
+	}
+
+	aliases, err := store.ListAliasesForProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	want := []string{"apple", "mango", "zebra"}
+	for i, w := range want {
+		if aliases[i] != w {
+			t.Errorf("aliases[%d] = %q, want %q", i, aliases[i], w)
+		}
+	}
+}
+
+func TestSQLiteTaskStore_GetProject_IncludesAliases(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Букинист")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	for _, a := range []string{"books", "букинист"} {
+		if err := addAliasHelper(t, db, store, p.ID, a); err != nil {
+			t.Fatalf("AddProjectAliasTx(%q): %v", a, err)
+		}
+	}
+
+	got, err := store.GetProject(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetProject returned nil")
+	}
+	if len(got.Aliases) != 2 {
+		t.Fatalf("want 2 aliases, got %d: %v", len(got.Aliases), got.Aliases)
+	}
+	if got.Aliases[0] != "books" || got.Aliases[1] != "букинист" {
+		t.Errorf("want [books, букинист], got %v", got.Aliases)
+	}
+}
+
+func TestSQLiteTaskStore_GetProject_NoAliasesReturnsEmptySlice(t *testing.T) {
+	store, _ := newTaskStore(t)
+	ctx := context.Background()
+
+	got, err := store.GetProject(ctx, store.DefaultProjectID())
+	if err != nil {
+		t.Fatalf("GetProject: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetProject returned nil")
+	}
+	if got.Aliases == nil {
+		t.Error("Aliases must be empty slice, not nil")
+	}
+	if len(got.Aliases) != 0 {
+		t.Errorf("want empty aliases, got %v", got.Aliases)
+	}
+}
+
+func TestSQLiteTaskStore_GetProjectTx_IncludesAliases(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Тест")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+
+	// Add alias inside a transaction and verify GetProjectTx sees it within same tx.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+
+	if err := store.AddProjectAliasTx(ctx, tx, p.ID, "testalias"); err != nil {
+		t.Fatalf("AddProjectAliasTx: %v", err)
+	}
+
+	got, err := store.GetProjectTx(ctx, tx, p.ID)
+	if err != nil {
+		t.Fatalf("GetProjectTx: %v", err)
+	}
+	if len(got.Aliases) != 1 || got.Aliases[0] != "testalias" {
+		t.Errorf("GetProjectTx inside tx: want [testalias], got %v", got.Aliases)
+	}
+}
+
+func TestSQLiteTaskStore_ListProjects_IncludesAliases(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	p := newProject("Работа")
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	for _, a := range []string{"работа", "job"} {
+		if err := addAliasHelper(t, db, store, p.ID, a); err != nil {
+			t.Fatalf("AddProjectAliasTx(%q): %v", a, err)
+		}
+	}
+
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+
+	var found *model.Project
+	for i := range projects {
+		if projects[i].ID == p.ID {
+			found = &projects[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("project not found in ListProjects")
+	}
+	if len(found.Aliases) != 2 {
+		t.Fatalf("want 2 aliases, got %d: %v", len(found.Aliases), found.Aliases)
+	}
+	if found.Aliases[0] != "job" || found.Aliases[1] != "работа" {
+		t.Errorf("want [job, работа] (sorted), got %v", found.Aliases)
+	}
+}
+
+func TestSQLiteTaskStore_ListProjects_NoAliasesReturnsEmptySlice(t *testing.T) {
+	store, _ := newTaskStore(t)
+	ctx := context.Background()
+
+	projects, err := store.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if len(projects) == 0 {
+		t.Fatal("want at least Inbox in ListProjects")
+	}
+	for _, p := range projects {
+		if p.Aliases == nil {
+			t.Errorf("project %q: Aliases must be empty slice, not nil", p.Name)
+		}
+	}
+}
+
 // TestUpdateTaskTxRollback verifies that task status changes are rolled back.
 func TestUpdateTaskTxRollback(t *testing.T) {
 	store, db := newTaskStore(t)

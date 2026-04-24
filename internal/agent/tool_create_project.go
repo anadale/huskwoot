@@ -31,6 +31,11 @@ func (t *createProjectTool) Parameters() map[string]any {
 		"properties": map[string]any{
 			"name":        map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_create_project_param_name", nil)},
 			"description": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_create_project_param_description", nil)},
+			"aliases": map[string]any{
+				"type":        "array",
+				"items":       map[string]any{"type": "string"},
+				"description": huskwootI18n.Translate(t.loc, "tool_create_project_param_aliases", nil),
+			},
 		},
 		"required": []string{"name"},
 	}
@@ -38,8 +43,9 @@ func (t *createProjectTool) Parameters() map[string]any {
 func (t *createProjectTool) DMOnly() bool { return true }
 func (t *createProjectTool) Execute(ctx context.Context, args string) (string, error) {
 	var params struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Aliases     []string `json:"aliases"`
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		return "", fmt.Errorf("parsing create_project args: %w", err)
@@ -48,11 +54,16 @@ func (t *createProjectTool) Execute(ctx context.Context, args string) (string, e
 	p, err := t.projects.CreateProject(ctx, model.CreateProjectRequest{
 		Name:        params.Name,
 		Description: params.Description,
+		Aliases:     params.Aliases,
 	})
 	if err != nil {
-		return "", err
+		return "", mapAliasError(t.loc, err)
 	}
 
-	result, _ := json.Marshal(map[string]any{"id": p.ID, "slug": p.Slug, "name": p.Name})
+	aliases := p.Aliases
+	if aliases == nil {
+		aliases = []string{}
+	}
+	result, _ := json.Marshal(map[string]any{"id": p.ID, "slug": p.Slug, "name": p.Name, "aliases": aliases})
 	return string(result), nil
 }

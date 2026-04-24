@@ -319,5 +319,26 @@ func TestTemplates_Resolve_UnknownKind_ReturnsFalse(t *testing.T) {
 	}
 }
 
+func TestTemplatesResolveProjectUpdatedDropped(t *testing.T) {
+	tmpl := newTestTemplates()
+
+	ev := &model.Event{
+		Seq:     1,
+		Kind:    model.EventProjectUpdated,
+		Payload: json.RawMessage(`{"project":{"id":"p1"},"changedFields":["aliases"]}`),
+	}
+
+	req, ok, err := tmpl.Resolve(context.Background(), ev)
+	if err != nil {
+		t.Fatalf("Resolve returned error: %v", err)
+	}
+	if ok {
+		t.Error("expected ok=false for project_updated")
+	}
+	if req != nil {
+		t.Error("expected req=nil for project_updated")
+	}
+}
+
 // Verify that the result has the correct type pushproto.PushRequest.
 var _ *pushproto.PushRequest = (*pushproto.PushRequest)(nil)

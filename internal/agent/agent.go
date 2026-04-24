@@ -115,9 +115,10 @@ func (a *Agent) Handle(ctx context.Context, msg model.Message) (string, error) {
 	scopedTools := a.buildScopeTools(msg)
 
 	type projectEntry struct {
-		ID   string
-		Name string
-		Slug string
+		ID      string
+		Name    string
+		Slug    string
+		Aliases []string
 	}
 	var projectEntries []projectEntry
 	if a.listProjects != nil {
@@ -127,7 +128,7 @@ func (a *Agent) Handle(ctx context.Context, msg model.Message) (string, error) {
 		} else {
 			projectEntries = make([]projectEntry, 0, len(projects))
 			for _, p := range projects {
-				projectEntries = append(projectEntries, projectEntry{ID: p.ID, Name: p.Name, Slug: p.Slug})
+				projectEntries = append(projectEntries, projectEntry{ID: p.ID, Name: p.Name, Slug: p.Slug, Aliases: p.Aliases})
 			}
 		}
 	}

@@ -61,6 +61,15 @@ func (m *mockTaskStore) UpdateTaskTx(_ context.Context, _ *sql.Tx, _ string, _ m
 	return nil
 }
 func (m *mockTaskStore) MoveTaskTx(_ context.Context, _ *sql.Tx, _, _ string) error { return nil }
+func (m *mockTaskStore) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	return nil
+}
+func (m *mockTaskStore) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	return nil
+}
+func (m *mockTaskStore) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
+	return []string{}, nil
+}
 
 // --- helpers ---
 

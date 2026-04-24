@@ -145,6 +145,9 @@ type Project struct {
 	Slug string
 	// Description is the project description.
 	Description string
+	// Aliases is the list of keyword aliases for this project, sorted lexicographically.
+	// Always non-nil; empty slice if no aliases are defined.
+	Aliases []string
 	// TaskCounter is a monotonic task counter; not rolled back on move.
 	TaskCounter int
 	// CreatedAt is the time the project was created.
@@ -187,6 +190,8 @@ type ProjectUpdate struct {
 	Description *string
 	// Slug is the new project slug (nil means no change).
 	Slug *string
+	// Aliases is the replacement set of aliases (nil means no change; &[]string{} clears all aliases).
+	Aliases *[]string
 }
 
 // HistoryEntry describes a single message history record stored in the store.

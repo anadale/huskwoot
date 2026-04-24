@@ -209,6 +209,15 @@ func (m *mockTaskStoreForTasks) MoveTaskTx(_ context.Context, _ *sql.Tx, taskID,
 }
 
 func (m *mockTaskStoreForTasks) DefaultProjectID() string { return m.defaultPID }
+func (m *mockTaskStoreForTasks) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	return nil
+}
+func (m *mockTaskStoreForTasks) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	return nil
+}
+func (m *mockTaskStoreForTasks) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
+	return []string{}, nil
+}
 
 // mockEventStore is a mock of model.EventStore.
 type mockEventStore struct {

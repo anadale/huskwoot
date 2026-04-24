@@ -118,6 +118,16 @@ type TaskStore interface {
 	MoveTaskTx(ctx context.Context, tx *sql.Tx, taskID, newProjectID string) error
 	// DefaultProjectID returns the UUID of the "Inbox" project.
 	DefaultProjectID() string
+	// AddProjectAliasTx inserts an alias for the project within the given transaction.
+	// Returns an error if the alias PRIMARY KEY already exists (alias taken by any project)
+	// or if projectID does not reference an existing project (FK violation).
+	AddProjectAliasTx(ctx context.Context, tx *sql.Tx, projectID, alias string) error
+	// RemoveProjectAliasTx deletes an alias within the given transaction.
+	// Returns nil when the alias does not exist (callers pre-validate membership).
+	RemoveProjectAliasTx(ctx context.Context, tx *sql.Tx, projectID, alias string) error
+	// ListAliasesForProject returns the aliases for a project sorted lexicographically.
+	// Returns an empty slice when the project has no aliases.
+	ListAliasesForProject(ctx context.Context, projectID string) ([]string, error)
 }
 
 // SummaryDeliverer delivers a task digest to a single channel (Telegram, email, ...).

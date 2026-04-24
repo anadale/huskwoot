@@ -37,6 +37,8 @@ type CreateProjectRequest struct {
 	Slug string
 	// Description is the project description (optional).
 	Description string
+	// Aliases is the initial set of keyword aliases (optional; validated in the use-case layer).
+	Aliases []string
 }
 
 // ChatReply is the ChatService response to a message.
@@ -89,6 +91,13 @@ type ProjectService interface {
 	ResolveProjectForChannel(ctx context.Context, channelID string) (string, error)
 	// EnsureChannelProject idempotently creates a project and binds it to the channel.
 	EnsureChannelProject(ctx context.Context, channelID, name string) (*Project, error)
+	// AddProjectAlias adds an alias to the project and returns the updated project.
+	AddProjectAlias(ctx context.Context, projectID, alias string) (*Project, error)
+	// RemoveProjectAlias removes an alias from the project and returns the updated project.
+	RemoveProjectAlias(ctx context.Context, projectID, alias string) (*Project, error)
+	// ResolveProjectRef finds a project by UUID, slug, or alias.
+	// Returns ErrProjectNotFound if no match is found.
+	ResolveProjectRef(ctx context.Context, ref string) (*Project, error)
 }
 
 // ChatService is the use-case layer for processing incoming messages via the agent.

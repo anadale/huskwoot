@@ -201,9 +201,27 @@ type mockProjectService struct {
 	ensureResult *model.Project
 	ensureErr    error
 
+	resolveProjectRefResult *model.Project
+	resolveProjectRefErr    error
+
+	updateProjectResult    *model.Project
+	updateProjectErr       error
+	lastUpdateProjectID    string
+	lastUpdateProjectUpd   model.ProjectUpdate
+
 	lastEnsureChannelID string
 	lastEnsureName      string
 	lastCreateReq       model.CreateProjectRequest
+
+	addAliasResult     *model.Project
+	addAliasErr        error
+	lastAddProjectID   string
+	lastAddAlias       string
+
+	removeAliasResult  *model.Project
+	removeAliasErr     error
+	lastRemoveProjectID string
+	lastRemoveAlias    string
 }
 
 func (m *mockProjectService) CreateProject(_ context.Context, req model.CreateProjectRequest) (*model.Project, error) {
@@ -218,8 +236,10 @@ func (m *mockProjectService) CreateProject(_ context.Context, req model.CreatePr
 	return &model.Project{ID: "new-proj-uuid", Name: req.Name, Slug: slug, Description: req.Description}, nil
 }
 
-func (m *mockProjectService) UpdateProject(_ context.Context, _ string, _ model.ProjectUpdate) (*model.Project, error) {
-	return nil, nil
+func (m *mockProjectService) UpdateProject(_ context.Context, id string, upd model.ProjectUpdate) (*model.Project, error) {
+	m.lastUpdateProjectID = id
+	m.lastUpdateProjectUpd = upd
+	return m.updateProjectResult, m.updateProjectErr
 }
 
 func (m *mockProjectService) ListProjects(_ context.Context) ([]model.Project, error) {
@@ -251,6 +271,19 @@ func (m *mockProjectService) EnsureChannelProject(_ context.Context, channelID, 
 	}
 	slug := strings.ToLower(strings.ReplaceAll(name, " ", "-"))
 	return &model.Project{ID: "ensure-proj-uuid", Name: name, Slug: slug}, nil
+}
+func (m *mockProjectService) AddProjectAlias(_ context.Context, projectID, alias string) (*model.Project, error) {
+	m.lastAddProjectID = projectID
+	m.lastAddAlias = alias
+	return m.addAliasResult, m.addAliasErr
+}
+func (m *mockProjectService) RemoveProjectAlias(_ context.Context, projectID, alias string) (*model.Project, error) {
+	m.lastRemoveProjectID = projectID
+	m.lastRemoveAlias = alias
+	return m.removeAliasResult, m.removeAliasErr
+}
+func (m *mockProjectService) ResolveProjectRef(_ context.Context, _ string) (*model.Project, error) {
+	return m.resolveProjectRefResult, m.resolveProjectRefErr
 }
 
 // ────────────────────────────────────────────────────────────────────────────

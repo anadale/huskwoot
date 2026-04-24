@@ -98,11 +98,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/Project"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: |
+            Input parsing error. Alias-specific codes: `alias_invalid` (alias format is invalid).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            Forbidden. Alias-specific codes: `alias_forbidden_for_inbox` (aliases are not allowed for the Inbox project).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Uniqueness conflict. Alias-specific codes: `alias_taken` (alias already used by another project),
+            `alias_conflicts_with_name` (alias matches another project name or slug),
+            `alias_limit_reached` (project already has 10 aliases).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "422":
           $ref: "#/components/responses/Unprocessable"
   /v1/projects/{id}:
@@ -139,13 +158,32 @@ paths:
               schema:
                 $ref: "#/components/schemas/Project"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: |
+            Input parsing error. Alias-specific codes: `alias_invalid` (alias format is invalid).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            Forbidden. Alias-specific codes: `alias_forbidden_for_inbox` (aliases are not allowed for the Inbox project).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: |
+            Uniqueness conflict. Alias-specific codes: `alias_taken` (alias already used by another project),
+            `alias_conflicts_with_name` (alias matches another project name or slug),
+            `alias_limit_reached` (project already has 10 aliases).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "422":
           $ref: "#/components/responses/Unprocessable"
   /v1/tasks:
@@ -785,6 +823,11 @@ components:
                 - internal
                 - unavailable
                 - timeout
+                - alias_invalid
+                - alias_taken
+                - alias_conflicts_with_name
+                - alias_limit_reached
+                - alias_forbidden_for_inbox
             message:
               type: string
               description: Human-readable error message.
@@ -805,7 +848,7 @@ components:
           description: API version (see info.version).
     Project:
       type: object
-      required: [id, slug, name, description, taskCounter, createdAt]
+      required: [id, slug, name, description, aliases, taskCounter, createdAt]
       properties:
         id:
           type: string
@@ -816,6 +859,12 @@ components:
           type: string
         description:
           type: string
+        aliases:
+          type: array
+          items:
+            type: string
+          maxItems: 10
+          description: Project alias keywords (lowercase, sorted). Always present; empty array if no aliases.
         taskCounter:
           type: integer
         createdAt:
@@ -832,6 +881,12 @@ components:
           description: Optional slug; auto-generated if omitted.
         description:
           type: string
+        aliases:
+          type: array
+          items:
+            type: string
+          maxItems: 10
+          description: Optional alias keywords. Each is validated and normalized (lowercased, trimmed) by the server.
     UpdateProjectRequest:
       type: object
       description: Absent field — no change; empty string — clear the value.
@@ -842,6 +897,15 @@ components:
           type: string
         description:
           type: string
+        aliases:
+          type: array
+          items:
+            type: string
+          maxItems: 10
+          description: |
+            Replace-set of aliases. Absent — no change; empty array [] — clear all aliases;
+            non-empty array — replace the alias set with exactly these values.
+            Each alias is validated and normalized (lowercased, trimmed) by the server.
     Task:
       type: object
       required: [id, number, ref, projectId, projectSlug, summary, status, createdAt, updatedAt]

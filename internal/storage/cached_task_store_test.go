@@ -17,18 +17,25 @@ import (
 type mockTaskStore struct {
 	model.TaskStore
 
-	mu              sync.Mutex
-	projects        []model.Project
-	listCalls       int
-	listErr         error
-	createCalls     int
-	createErr       error
-	updateProjCalls int
-	updateProjErr   error
-	defaultID       string
-	defaultCalls    int
-	listTasksCalls  int
-	listTasksReturn []model.Task
+	mu                sync.Mutex
+	projects          []model.Project
+	listCalls         int
+	listErr           error
+	createCalls       int
+	createErr         error
+	updateProjCalls   int
+	updateProjErr     error
+	defaultID         string
+	defaultCalls      int
+	listTasksCalls    int
+	listTasksReturn   []model.Task
+	addAliasCalls     int
+	addAliasErr       error
+	removeAliasCalls  int
+	removeAliasErr    error
+	listAliasesCalls  int
+	listAliasesReturn []string
+	listAliasesErr    error
 }
 
 func (m *mockTaskStore) ListProjects(_ context.Context) ([]model.Project, error) {
@@ -74,6 +81,30 @@ func (m *mockTaskStore) ListTasks(_ context.Context, _ string, _ model.TaskFilte
 	defer m.mu.Unlock()
 	m.listTasksCalls++
 	return m.listTasksReturn, nil
+}
+
+func (m *mockTaskStore) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addAliasCalls++
+	return m.addAliasErr
+}
+
+func (m *mockTaskStore) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.removeAliasCalls++
+	return m.removeAliasErr
+}
+
+func (m *mockTaskStore) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listAliasesCalls++
+	if m.listAliasesErr != nil {
+		return nil, m.listAliasesErr
+	}
+	return m.listAliasesReturn, nil
 }
 
 func TestCachedTaskStore_ListProjects_CachesAfterFirstCall(t *testing.T) {
@@ -236,5 +267,52 @@ func TestCachedTaskStore_OtherMethodsDelegated(t *testing.T) {
 	}
 	if mock.listTasksCalls != 1 {
 		t.Errorf("delegate ListTasks called %d times, want 1", mock.listTasksCalls)
+	}
+}
+
+func TestCachedTaskStoreProxiesAliasMethods(t *testing.T) {
+	mock := &mockTaskStore{
+		projects:          []model.Project{{ID: "p1", Name: "Inbox"}},
+		listAliasesReturn: []string{"букинист", "test"},
+	}
+	cached := storage.NewCachedTaskStore(mock)
+	ctx := context.Background()
+
+	// Prime the ListProjects cache.
+	if _, err := cached.ListProjects(ctx); err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+
+	if err := cached.AddProjectAliasTx(ctx, nil, "p1", "букинист"); err != nil {
+		t.Fatalf("AddProjectAliasTx: %v", err)
+	}
+	if mock.addAliasCalls != 1 {
+		t.Errorf("AddProjectAliasTx: delegate called %d times, want 1", mock.addAliasCalls)
+	}
+
+	if err := cached.RemoveProjectAliasTx(ctx, nil, "p1", "букинист"); err != nil {
+		t.Fatalf("RemoveProjectAliasTx: %v", err)
+	}
+	if mock.removeAliasCalls != 1 {
+		t.Errorf("RemoveProjectAliasTx: delegate called %d times, want 1", mock.removeAliasCalls)
+	}
+
+	aliases, err := cached.ListAliasesForProject(ctx, "p1")
+	if err != nil {
+		t.Fatalf("ListAliasesForProject: %v", err)
+	}
+	if len(aliases) != 2 {
+		t.Errorf("ListAliasesForProject: got %d aliases, want 2", len(aliases))
+	}
+	if mock.listAliasesCalls != 1 {
+		t.Errorf("ListAliasesForProject: delegate called %d times, want 1", mock.listAliasesCalls)
+	}
+
+	// Alias methods must not invalidate the ListProjects cache.
+	if _, err := cached.ListProjects(ctx); err != nil {
+		t.Fatalf("ListProjects after alias ops: %v", err)
+	}
+	if mock.listCalls != 1 {
+		t.Errorf("alias methods must not invalidate ListProjects cache: want 1 call, got %d", mock.listCalls)
 	}
 }

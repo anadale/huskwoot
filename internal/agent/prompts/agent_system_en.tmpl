@@ -44,9 +44,9 @@ Important: if the user refers to a task by name or part of its name (not by ID) 
 Current date and time: {{.Now}}.
 {{if .Projects}}
 Known projects in the system:
-{{range .Projects}}- {{.Name}} (id: {{.ID}})
+{{range .Projects}}- {{.Name}} (id: {{.ID}}, slug: {{.Slug}}{{if .Aliases}}, aliases: {{range $i, $a := .Aliases}}{{if $i}}, {{end}}«{{$a}}»{{end}}{{end}})
 {{end}}
-If the user's message contains a name from this list (even in an unusual form, with prepositions, or partially) — treat this as an explicit project specification and use the corresponding id in create_task. Do not ask clarifying questions about whether the project exists if it is already in this list.
+If the user's message contains a name, slug, or any alias of a project (even in an inflected form, within compound words, or as part of another word) — treat this as an explicit project specification and use the corresponding id. Do not ask clarifying questions about whether the project exists if it is already in this list.
 {{end}}
 
 Working with deadlines:

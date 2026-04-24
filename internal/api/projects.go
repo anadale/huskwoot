@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/anadale/huskwoot/internal/model"
+	"github.com/anadale/huskwoot/internal/usecase"
 )
 
 // projectDTO is the public project snapshot in JSON responses. Fields and their names
@@ -22,16 +23,22 @@ type projectDTO struct {
 	Slug        string    `json:"slug"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
+	Aliases     []string  `json:"aliases"`
 	TaskCounter int       `json:"taskCounter"`
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
 func toProjectDTO(p *model.Project) projectDTO {
+	aliases := p.Aliases
+	if aliases == nil {
+		aliases = []string{}
+	}
 	return projectDTO{
 		ID:          p.ID,
 		Slug:        p.Slug,
 		Name:        p.Name,
 		Description: p.Description,
+		Aliases:     aliases,
 		TaskCounter: p.TaskCounter,
 		CreatedAt:   p.CreatedAt,
 	}
@@ -39,17 +46,20 @@ func toProjectDTO(p *model.Project) projectDTO {
 
 // createProjectRequest is the request body for POST /v1/projects.
 type createProjectRequest struct {
-	Name        string `json:"name"`
-	Slug        string `json:"slug,omitempty"`
-	Description string `json:"description,omitempty"`
+	Name        string   `json:"name"`
+	Slug        string   `json:"slug,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"`
 }
 
 // updateProjectRequest is the request body for PATCH /v1/projects/{id}. Omitted fields are
 // left unchanged; an empty string is treated as an explicit clear (for Description).
+// Aliases, when present, replaces the full alias set (replace-set semantics).
 type updateProjectRequest struct {
-	Name        *string `json:"name,omitempty"`
-	Slug        *string `json:"slug,omitempty"`
-	Description *string `json:"description,omitempty"`
+	Name        *string   `json:"name,omitempty"`
+	Slug        *string   `json:"slug,omitempty"`
+	Description *string   `json:"description,omitempty"`
+	Aliases     *[]string `json:"aliases,omitempty"`
 }
 
 type projectsHandler struct {
@@ -115,10 +125,15 @@ func (h *projectsHandler) create(w http.ResponseWriter, r *http.Request) {
 		Name:        req.Name,
 		Slug:        req.Slug,
 		Description: req.Description,
+		Aliases:     req.Aliases,
 	})
 	if err != nil {
 		if isUniqueConstraintErr(err) {
 			WriteError(w, http.StatusConflict, ErrorCodeConflict, "project with this name or slug already exists")
+			return
+		}
+		if code, status := aliasErrorCode(err); code != "" {
+			WriteError(w, status, code, err.Error())
 			return
 		}
 		h.logError(r.Context(), "create project", err)
@@ -135,20 +150,24 @@ func (h *projectsHandler) update(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.Slug == nil && req.Description == nil {
+	if req.Name == nil && req.Slug == nil && req.Description == nil && req.Aliases == nil {
 		WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, "no fields provided")
 		return
 	}
 
-	upd := model.ProjectUpdate{Name: req.Name, Slug: req.Slug, Description: req.Description}
+	upd := model.ProjectUpdate{Name: req.Name, Slug: req.Slug, Description: req.Description, Aliases: req.Aliases}
 	p, err := h.service.UpdateProject(r.Context(), id, upd)
 	if err != nil {
-		if isNotFoundErr(err) {
+		if errors.Is(err, usecase.ErrProjectNotFound) {
 			WriteError(w, http.StatusNotFound, ErrorCodeNotFound, "project not found")
 			return
 		}
 		if isUniqueConstraintErr(err) {
 			WriteError(w, http.StatusConflict, ErrorCodeConflict, "project with this name or slug already exists")
+			return
+		}
+		if code, status := aliasErrorCode(err); code != "" {
+			WriteError(w, status, code, err.Error())
 			return
 		}
 		h.logError(r.Context(), "update project", err)
@@ -201,4 +220,22 @@ func isNotFoundErr(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "not found")
+}
+
+// aliasErrorCode maps alias sentinel errors from the usecase layer to API error
+// codes and HTTP status codes. Returns ("", 0) when the error is not alias-related.
+func aliasErrorCode(err error) (code string, status int) {
+	switch {
+	case errors.Is(err, usecase.ErrAliasInvalid):
+		return ErrorCodeAliasInvalid, http.StatusBadRequest
+	case errors.Is(err, usecase.ErrAliasTaken):
+		return ErrorCodeAliasTaken, http.StatusConflict
+	case errors.Is(err, usecase.ErrAliasConflictsWithName):
+		return ErrorCodeAliasConflictsWithName, http.StatusConflict
+	case errors.Is(err, usecase.ErrAliasLimitReached):
+		return ErrorCodeAliasLimitReached, http.StatusConflict
+	case errors.Is(err, usecase.ErrAliasForbiddenForInbox):
+		return ErrorCodeAliasForbiddenForInbox, http.StatusForbidden
+	}
+	return "", 0
 }

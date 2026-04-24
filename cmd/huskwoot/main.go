@@ -216,6 +216,10 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	agentTools := []agent.Tool{
 		agent.NewCreateProjectTool(projectSvc, agentLoc),
 		agent.NewListProjectsTool(projectSvc, agentLoc),
+		agent.NewGetProjectTool(projectSvc, agentLoc),
+		agent.NewUpdateProjectTool(projectSvc, agentLoc),
+		agent.NewAddProjectAliasTool(projectSvc, agentLoc),
+		agent.NewRemoveProjectAliasTool(projectSvc, agentLoc),
 		agent.NewSetProjectTool(projectSvc, agentLoc),
 		agent.NewCreateTaskTool(taskSvc, projectSvc, dp, agentLoc),
 		agent.NewListTasksTool(taskSvc, agentLoc),

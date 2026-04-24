@@ -61,6 +61,8 @@ func (t *Templates) Resolve(_ context.Context, ev *model.Event) (*pushproto.Push
 		return t.resolveTaskUpdated(ev)
 	case model.EventReminderSummary:
 		return t.resolveReminderSummary(ev)
+	case model.EventProjectUpdated:
+		return nil, false, nil
 	default:
 		return nil, false, nil
 	}

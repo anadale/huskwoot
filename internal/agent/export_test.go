@@ -8,3 +8,6 @@ var NowKey = nowKey
 
 // ResolveTask exports resolveTask for use in external package tests.
 var ResolveTask = resolveTask
+
+// ResolveProjectRef exports resolveProjectRef for use in external package tests.
+var ResolveProjectRef = resolveProjectRef

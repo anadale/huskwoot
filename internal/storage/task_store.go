@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -129,12 +130,28 @@ func (s *SQLiteTaskStore) UpdateProjectTx(ctx context.Context, tx *sql.Tx, id st
 
 // GetProject returns a project by UUID. Returns nil, nil if not found.
 func (s *SQLiteTaskStore) GetProject(ctx context.Context, id string) (*model.Project, error) {
-	return scanProject(ctx, s.db, id)
+	p, err := scanProject(ctx, s.db, id)
+	if err != nil || p == nil {
+		return p, err
+	}
+	p.Aliases, err = listAliasesForProject(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // GetProjectTx reads a project by UUID within the given transaction.
 func (s *SQLiteTaskStore) GetProjectTx(ctx context.Context, tx *sql.Tx, id string) (*model.Project, error) {
-	return scanProject(ctx, tx, id)
+	p, err := scanProject(ctx, tx, id)
+	if err != nil || p == nil {
+		return p, err
+	}
+	p.Aliases, err = listAliasesForProject(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
 }
 
 // projectQuerier unifies the *sql.DB and *sql.Tx interfaces for a shared SELECT.
@@ -164,10 +181,76 @@ func scanProject(ctx context.Context, q projectQuerier, id string) (*model.Proje
 	return &p, nil
 }
 
-// ListProjects returns all projects ordered by created_at.
+// aliasQuerier is satisfied by both *sql.DB and *sql.Tx for multi-row alias queries.
+type aliasQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// listAliasesForProject fetches aliases for a project, sorted lexicographically.
+func listAliasesForProject(ctx context.Context, q aliasQuerier, projectID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx,
+		`SELECT alias FROM project_aliases WHERE project_id = ? ORDER BY alias`,
+		projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing aliases for project %q: %w", projectID, err)
+	}
+	defer rows.Close()
+
+	aliases := []string{}
+	for rows.Next() {
+		var alias string
+		if err := rows.Scan(&alias); err != nil {
+			return nil, fmt.Errorf("scanning alias: %w", err)
+		}
+		aliases = append(aliases, alias)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating aliases: %w", err)
+	}
+	return aliases, nil
+}
+
+// AddProjectAliasTx inserts an alias for the project within the given transaction.
+func (s *SQLiteTaskStore) AddProjectAliasTx(ctx context.Context, tx *sql.Tx, projectID, alias string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO project_aliases (project_id, alias, created_at) VALUES (?, ?, ?)`,
+		projectID, alias, now,
+	)
+	if err != nil {
+		return fmt.Errorf("adding alias %q to project %q: %w", alias, projectID, err)
+	}
+	return nil
+}
+
+// RemoveProjectAliasTx deletes an alias within the given transaction.
+// Returns nil when the alias does not exist (callers pre-validate membership).
+func (s *SQLiteTaskStore) RemoveProjectAliasTx(ctx context.Context, tx *sql.Tx, projectID, alias string) error {
+	_, err := tx.ExecContext(ctx,
+		`DELETE FROM project_aliases WHERE project_id = ? AND alias = ?`,
+		projectID, alias,
+	)
+	if err != nil {
+		return fmt.Errorf("removing alias %q from project %q: %w", alias, projectID, err)
+	}
+	return nil
+}
+
+// ListAliasesForProject returns the aliases for a project sorted lexicographically.
+func (s *SQLiteTaskStore) ListAliasesForProject(ctx context.Context, projectID string) ([]string, error) {
+	return listAliasesForProject(ctx, s.db, projectID)
+}
+
+// ListProjects returns all projects ordered by created_at, with their aliases.
 func (s *SQLiteTaskStore) ListProjects(ctx context.Context) ([]model.Project, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, slug, description, task_counter, created_at FROM projects ORDER BY created_at`,
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT p.id, p.name, p.slug, p.description, p.task_counter, p.created_at,
+		       GROUP_CONCAT(pa.alias, char(31))
+		FROM projects p
+		LEFT JOIN project_aliases pa ON p.id = pa.project_id
+		GROUP BY p.id
+		ORDER BY p.created_at`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("listing projects: %w", err)
@@ -178,12 +261,20 @@ func (s *SQLiteTaskStore) ListProjects(ctx context.Context) ([]model.Project, er
 	for rows.Next() {
 		var p model.Project
 		var createdAtStr string
-		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.TaskCounter, &createdAtStr); err != nil {
+		var aliasConcat sql.NullString
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.TaskCounter, &createdAtStr, &aliasConcat); err != nil {
 			return nil, fmt.Errorf("scanning project: %w", err)
 		}
 		p.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
 		if err != nil {
 			return nil, fmt.Errorf("parsing created_at: %w", err)
+		}
+		if aliasConcat.Valid && aliasConcat.String != "" {
+			parts := strings.Split(aliasConcat.String, string(rune(31)))
+			sort.Strings(parts)
+			p.Aliases = parts
+		} else {
+			p.Aliases = []string{}
 		}
 		projects = append(projects, p)
 	}
@@ -213,6 +304,7 @@ func (s *SQLiteTaskStore) FindProjectByName(ctx context.Context, name string) (*
 	if err != nil {
 		return nil, fmt.Errorf("parsing created_at for project %q: %w", name, err)
 	}
+	p.Aliases = []string{}
 	return &p, nil
 }
 
