@@ -8,7 +8,7 @@ import (
 func TestEnglishDateLanguage_RelativeAmount(t *testing.T) {
 	now := testNow(t)
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
@@ -44,16 +44,16 @@ func TestEnglishDateLanguage_DayTime(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"today", "today", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
-		{"tomorrow", "tomorrow", time.Date(2026, 4, 16, 0, 0, 0, 0, loc)},
-		{"day after tomorrow", "day after tomorrow", time.Date(2026, 4, 17, 0, 0, 0, 0, loc)},
+		{"today", "today", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"tomorrow", "tomorrow", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
+		{"day after tomorrow", "day after tomorrow", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
 		{"this morning", "this morning", time.Date(2026, 4, 15, 11, 0, 0, 0, loc)},
 		{"this afternoon", "this afternoon", time.Date(2026, 4, 15, 14, 0, 0, 0, loc)},
 		{"this evening", "this evening", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
@@ -82,18 +82,18 @@ func TestEnglishDateLanguage_Weekday(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"on Wednesday (today)", "on Wednesday", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
-		{"on Thursday", "on Thursday", time.Date(2026, 4, 16, 0, 0, 0, 0, loc)},
-		{"by Friday", "by Friday", time.Date(2026, 4, 17, 0, 0, 0, 0, loc)},
-		{"next Monday", "next Monday", time.Date(2026, 4, 27, 0, 0, 0, 0, loc)},
-		{"next Friday", "next Friday", time.Date(2026, 4, 24, 0, 0, 0, 0, loc)},
+		{"on Wednesday (today)", "on Wednesday", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"on Thursday", "on Thursday", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
+		{"by Friday", "by Friday", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
+		{"next Monday", "next Monday", time.Date(2026, 4, 27, 20, 0, 0, 0, loc)},
+		{"next Friday", "next Friday", time.Date(2026, 4, 24, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -102,7 +102,8 @@ func TestEnglishDateLanguage_Weekday(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected match for %q, got none", tt.input)
 			}
-			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() {
+			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() ||
+				got.Hour() != tt.want.Hour() {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
@@ -113,7 +114,7 @@ func TestEnglishDateLanguage_WeekBoundary(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
@@ -122,7 +123,7 @@ func TestEnglishDateLanguage_WeekBoundary(t *testing.T) {
 	}{
 		{"end of week", "end of week", time.Date(2026, 4, 17, 23, 59, 59, 0, loc)},
 		{"end of month", "end of month", time.Date(2026, 4, 30, 23, 59, 59, 0, loc)},
-		{"next week", "next week", time.Date(2026, 4, 20, 0, 0, 0, 0, loc)},
+		{"next week", "next week", time.Date(2026, 4, 20, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -144,7 +145,7 @@ func TestEnglishDateLanguage_ClockTime(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
@@ -175,16 +176,16 @@ func TestEnglishDateLanguage_Weekend(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"this weekend", "this weekend", time.Date(2026, 4, 18, 0, 0, 0, 0, loc)},
+		{"this weekend", "this weekend", time.Date(2026, 4, 18, 20, 0, 0, 0, loc)},
 		{"before the weekend", "before the weekend", time.Date(2026, 4, 17, 23, 59, 59, 0, loc)},
-		{"after the weekend", "after the weekend", time.Date(2026, 4, 20, 0, 0, 0, 0, loc)},
+		{"after the weekend", "after the weekend", time.Date(2026, 4, 20, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -205,18 +206,19 @@ func TestEnglishDateLanguage_ExplicitDate(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"May 5", "May 5", time.Date(2026, 5, 5, 0, 0, 0, 0, loc)},
-		{"5 May", "5 May", time.Date(2026, 5, 5, 0, 0, 0, 0, loc)},
-		{"April 15 (past -> next year)", "April 15", time.Date(2027, 4, 15, 0, 0, 0, 0, loc)},
+		{"May 5", "May 5", time.Date(2026, 5, 5, 20, 0, 0, 0, loc)},
+		{"5 May", "5 May", time.Date(2026, 5, 5, 20, 0, 0, 0, loc)},
+		{"April 15 (today evening, still future)", "April 15", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"January 1 (past -> next year)", "January 1", time.Date(2027, 1, 1, 20, 0, 0, 0, loc)},
 		{"by the 20th", "by the 20th", time.Date(2026, 4, 20, 23, 59, 59, 0, loc)},
-		{"15.04.2026", "15.04.2026", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
+		{"15.04.2026", "15.04.2026", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -225,7 +227,8 @@ func TestEnglishDateLanguage_ExplicitDate(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected match for %q, got none", tt.input)
 			}
-			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() {
+			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() ||
+				got.Hour() != tt.want.Hour() {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
@@ -235,7 +238,7 @@ func TestEnglishDateLanguage_ExplicitDate(t *testing.T) {
 func TestEnglishDateLanguage_NoMatch(t *testing.T) {
 	now := testNow(t)
 	lang := NewDateLanguage("en")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	_, ok := lang.Parse("завтра", now, cfg)
 	if ok {
@@ -245,5 +248,97 @@ func TestEnglishDateLanguage_NoMatch(t *testing.T) {
 	_, ok = lang.Parse("через час", now, cfg)
 	if ok {
 		t.Error("English language should not match 'через час'")
+	}
+}
+
+func TestParse_DefaultTimeOfDay_EN(t *testing.T) {
+	now := testNow(t)
+	loc := now.Location()
+	lang := NewDateLanguage("en")
+
+	cases := []struct {
+		defaultMarker string
+		defaultHour   int
+	}{
+		{"morning", 11},
+		{"lunch", 12},
+		{"afternoon", 14},
+		{"evening", 20},
+	}
+
+	for _, c := range cases {
+		cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: c.defaultHour}}
+
+		t.Run("tomorrow/"+c.defaultMarker, func(t *testing.T) {
+			got, ok := lang.Parse("tomorrow", now, cfg)
+			if !ok {
+				t.Fatalf("expected match for 'tomorrow'")
+			}
+			want := time.Date(2026, 4, 16, c.defaultHour, 0, 0, 0, loc)
+			if got.Hour() != want.Hour() || got.Day() != want.Day() {
+				t.Errorf("got %v, want %v", got, want)
+			}
+		})
+
+		t.Run("on monday/"+c.defaultMarker, func(t *testing.T) {
+			got, ok := lang.Parse("on monday", now, cfg)
+			if !ok {
+				t.Fatalf("expected match for 'on monday'")
+			}
+			if got.Hour() != c.defaultHour {
+				t.Errorf("got hour %d, want %d", got.Hour(), c.defaultHour)
+			}
+		})
+
+		t.Run("this weekend/"+c.defaultMarker, func(t *testing.T) {
+			got, ok := lang.Parse("this weekend", now, cfg)
+			if !ok {
+				t.Fatalf("expected match for 'this weekend'")
+			}
+			want := time.Date(2026, 4, 18, c.defaultHour, 0, 0, 0, loc)
+			if got.Hour() != want.Hour() || got.Day() != want.Day() {
+				t.Errorf("got %v, want %v", got, want)
+			}
+		})
+
+		t.Run("after the weekend/"+c.defaultMarker, func(t *testing.T) {
+			got, ok := lang.Parse("after the weekend", now, cfg)
+			if !ok {
+				t.Fatalf("expected match for 'after the weekend'")
+			}
+			want := time.Date(2026, 4, 20, c.defaultHour, 0, 0, 0, loc)
+			if got.Hour() != want.Hour() || got.Day() != want.Day() {
+				t.Errorf("got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestEnglishDateLanguage_DeadlineTimesUnchanged(t *testing.T) {
+	now := testNow(t)
+	lang := NewDateLanguage("en")
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 11}}
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"end of week", "end of week"},
+		{"by end of week", "by end of week"},
+		{"end of month", "end of month"},
+		{"before the weekend", "before the weekend"},
+		{"by the 20th", "by the 20th"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := lang.Parse(tt.input, now, cfg)
+			if !ok {
+				t.Fatalf("expected match for %q", tt.input)
+			}
+			if got.Hour() != 23 || got.Minute() != 59 || got.Second() != 59 {
+				t.Errorf("%q: got %v, want 23:59:59", tt.input, got)
+			}
+		})
 	}
 }

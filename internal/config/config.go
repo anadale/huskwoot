@@ -115,6 +115,10 @@ type TimeOfDayConfig struct {
 	Afternoon int `toml:"afternoon"`
 	// Evening is the hour for "in the evening" expressions (default 20).
 	Evening int `toml:"evening"`
+	// Default is the time-of-day marker used when a date is given without an explicit time.
+	// Accepted values: "morning", "lunch", "afternoon", "evening". Default: "evening".
+	// Does not affect expressions with "до ..." semantics (those always use 23:59:59).
+	Default string `toml:"default"`
 }
 
 // DateTimeConfig holds date parser and timezone settings.
@@ -363,6 +367,15 @@ func (c *Config) validate() error {
 	}
 	if c.DateTime.TimeOfDay.Evening == 0 {
 		c.DateTime.TimeOfDay.Evening = 20
+	}
+	if c.DateTime.TimeOfDay.Default == "" {
+		c.DateTime.TimeOfDay.Default = "evening"
+	}
+	switch c.DateTime.TimeOfDay.Default {
+	case "morning", "lunch", "afternoon", "evening":
+		// valid
+	default:
+		return fmt.Errorf("invalid datetime.time_of_day.default: %q (expected one of: morning, lunch, afternoon, evening)", c.DateTime.TimeOfDay.Default)
 	}
 
 	switch c.User.Language {

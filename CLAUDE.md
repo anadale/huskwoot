@@ -166,6 +166,7 @@ weekdays = ["mon", "tue", "wed", "thu", "fri"]
 
 [datetime.time_of_day]
 morning = 11; lunch = 12; afternoon = 14; evening = 20
+default = "evening"  # time-of-day marker applied when a date is given without an explicit time; does not affect "до …" deadline expressions
 ```
 
 ### `[reminders]`

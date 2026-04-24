@@ -8,7 +8,7 @@ import (
 func TestRussianDateLanguage_RelativeAmount(t *testing.T) {
 	now := testNow(t)
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
@@ -45,16 +45,16 @@ func TestRussianDateLanguage_DayTime(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"завтра", "завтра", time.Date(2026, 4, 16, 0, 0, 0, 0, loc)},
-		{"сегодня", "сегодня", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
-		{"послезавтра", "послезавтра", time.Date(2026, 4, 17, 0, 0, 0, 0, loc)},
+		{"завтра", "завтра", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
+		{"сегодня", "сегодня", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"послезавтра", "послезавтра", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
 		{"завтра утром", "завтра утром", time.Date(2026, 4, 16, 11, 0, 0, 0, loc)},
 		{"завтра вечером", "завтра вечером", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
 		{"сегодня вечером", "сегодня вечером", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
@@ -82,20 +82,20 @@ func TestRussianDateLanguage_Weekday(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"в среду (today)", "в среду", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
-		{"в четверг", "в четверг", time.Date(2026, 4, 16, 0, 0, 0, 0, loc)},
-		{"в пятницу", "в пятницу", time.Date(2026, 4, 17, 0, 0, 0, 0, loc)},
-		{"к пятнице", "к пятнице", time.Date(2026, 4, 17, 0, 0, 0, 0, loc)},
-		{"в следующий четверг", "в следующий четверг", time.Date(2026, 4, 23, 0, 0, 0, 0, loc)},
-		{"в следующую пятницу", "в следующую пятницу", time.Date(2026, 4, 24, 0, 0, 0, 0, loc)},
-		{"в следующее воскресенье", "в следующее воскресенье", time.Date(2026, 4, 26, 0, 0, 0, 0, loc)},
+		{"в среду (today)", "в среду", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"в четверг", "в четверг", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
+		{"в пятницу", "в пятницу", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
+		{"к пятнице", "к пятнице", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
+		{"в следующий четверг", "в следующий четверг", time.Date(2026, 4, 23, 20, 0, 0, 0, loc)},
+		{"в следующую пятницу", "в следующую пятницу", time.Date(2026, 4, 24, 20, 0, 0, 0, loc)},
+		{"в следующее воскресенье", "в следующее воскресенье", time.Date(2026, 4, 26, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -104,7 +104,7 @@ func TestRussianDateLanguage_Weekday(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected match, got none")
 			}
-			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() {
+			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() || got.Hour() != tt.want.Hour() {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
@@ -115,7 +115,7 @@ func TestRussianDateLanguage_WeekBoundary(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
@@ -124,7 +124,8 @@ func TestRussianDateLanguage_WeekBoundary(t *testing.T) {
 	}{
 		{"до конца недели", "до конца недели", time.Date(2026, 4, 17, 23, 59, 59, 0, loc)},
 		{"до конца месяца", "до конца месяца", time.Date(2026, 4, 30, 23, 59, 59, 0, loc)},
-		{"на следующей неделе", "на следующей неделе", time.Date(2026, 4, 20, 0, 0, 0, 0, loc)},
+		{"на следующей неделе", "на следующей неделе", time.Date(2026, 4, 20, 20, 0, 0, 0, loc)},
+		{"к следующей неделе", "к следующей неделе", time.Date(2026, 4, 20, 20, 0, 0, 0, loc)},
 	}
 
 	for _, tt := range tests {
@@ -145,16 +146,19 @@ func TestRussianDateLanguage_ExplicitDate(t *testing.T) {
 	now := testNow(t)
 	loc := now.Location()
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	tests := []struct {
 		name  string
 		input string
 		want  time.Time
 	}{
-		{"5 мая", "5 мая", time.Date(2026, 5, 5, 0, 0, 0, 0, loc)},
-		{"15.04 (прошедшая -> следующий год)", "15.04", time.Date(2027, 4, 15, 0, 0, 0, 0, loc)},
-		{"15.04.2026", "15.04.2026", time.Date(2026, 4, 15, 0, 0, 0, 0, loc)},
+		{"5 мая", "5 мая", time.Date(2026, 5, 5, 20, 0, 0, 0, loc)},
+		// testNow=14:00, Default=20 → 2026-04-15 20:00 is still in the future today
+		{"15.04 (сегодня, ещё впереди)", "15.04", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		// 1 января 2026 is in the past → rolls over to 2027; rolled-over date also uses Default hour
+		{"1 января (прошедшая дата -> следующий год)", "1 января", time.Date(2027, 1, 1, 20, 0, 0, 0, loc)},
+		{"15.04.2026", "15.04.2026", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
 		{"до 20-го", "до 20-го", time.Date(2026, 4, 20, 23, 59, 59, 0, loc)},
 	}
 
@@ -164,7 +168,7 @@ func TestRussianDateLanguage_ExplicitDate(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected match, got none")
 			}
-			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() {
+			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() || got.Hour() != tt.want.Hour() {
 				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
@@ -174,7 +178,7 @@ func TestRussianDateLanguage_ExplicitDate(t *testing.T) {
 func TestRussianDateLanguage_NoMatch(t *testing.T) {
 	now := testNow(t)
 	lang := NewDateLanguage("ru")
-	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20}}
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
 
 	_, ok := lang.Parse("tomorrow", now, cfg)
 	if ok {
@@ -184,5 +188,73 @@ func TestRussianDateLanguage_NoMatch(t *testing.T) {
 	_, ok = lang.Parse("in 2 hours", now, cfg)
 	if ok {
 		t.Error("Russian language should not match 'in 2 hours'")
+	}
+}
+
+// TestParse_DefaultTimeOfDay verifies that cfg.TimeOfDay.Default is used as the hour for
+// dateless deadline expressions across all four named time-of-day values.
+func TestParse_DefaultTimeOfDay(t *testing.T) {
+	now := testNow(t)
+	lang := NewDateLanguage("ru")
+
+	cases := []struct {
+		name        string
+		defaultHour int
+		input       string
+		wantHour    int
+	}{
+		{"morning/завтра", 11, "завтра", 11},
+		{"lunch/завтра", 12, "завтра", 12},
+		{"afternoon/завтра", 14, "завтра", 14},
+		{"evening/завтра", 20, "завтра", 20},
+		{"morning/в понедельник", 11, "в понедельник", 11},
+		{"evening/в понедельник", 20, "в понедельник", 20},
+		{"morning/в выходные", 11, "в выходные", 11},
+		{"lunch/в выходные", 12, "в выходные", 12},
+		{"afternoon/в выходные", 14, "в выходные", 14},
+		{"evening/после выходных", 20, "после выходных", 20},
+		{"morning/после выходных", 11, "после выходных", 11},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{
+				TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: tt.defaultHour},
+			}
+			got, ok := lang.Parse(tt.input, now, cfg)
+			if !ok {
+				t.Fatalf("expected match for %q, got none", tt.input)
+			}
+			if got.Hour() != tt.wantHour {
+				t.Errorf("%q: got hour %d, want %d (full: %v)", tt.input, got.Hour(), tt.wantHour, got)
+			}
+		})
+	}
+}
+
+// TestRussianDateLanguage_DeadlineExpressions checks that deadline phrases always produce
+// 23:59:59 regardless of cfg.TimeOfDay.Default.
+func TestRussianDateLanguage_DeadlineExpressions(t *testing.T) {
+	now := testNow(t)
+	lang := NewDateLanguage("ru")
+	cfg := Config{TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20}}
+
+	deadlines := []string{
+		"до конца недели",
+		"до конца месяца",
+		"до выходных",
+		"до 15-го",
+	}
+
+	for _, input := range deadlines {
+		t.Run(input, func(t *testing.T) {
+			got, ok := lang.Parse(input, now, cfg)
+			if !ok {
+				t.Fatalf("expected match for %q, got none", input)
+			}
+			if got.Hour() != 23 || got.Minute() != 59 || got.Second() != 59 {
+				t.Errorf("%q: got %v, want 23:59:59", input, got)
+			}
+		})
 	}
 }

@@ -37,6 +37,7 @@ morning   = 11
 lunch     = 12
 afternoon = 14
 evening   = 20
+default   = "evening"  # time-of-day applied when a date is given without explicit time; does not affect "until …" deadline expressions
 
 # HTTP API — required for the mobile app.
 [api]

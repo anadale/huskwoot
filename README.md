@@ -208,6 +208,7 @@ morning   = 11   # used for natural-language deadlines like "by morning"
 lunch     = 12
 afternoon = 14
 evening   = 20
+default   = "evening"  # hour applied when a date is given without an explicit time (e.g. "tomorrow", "on Monday"); does not affect "until …" deadline expressions
 ```
 
 ---

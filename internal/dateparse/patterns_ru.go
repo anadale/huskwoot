@@ -129,7 +129,7 @@ func matchDayTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 
 	for _, d := range days {
 		if d.phrase != "" && lower == d.phrase {
-			t := time.Date(now.Year(), now.Month(), now.Day()+d.offset, 0, 0, 0, 0, now.Location())
+			t := time.Date(now.Year(), now.Month(), now.Day()+d.offset, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return &t, true
 		}
 	}
@@ -185,7 +185,7 @@ func matchDayTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 }
 
 // matchWeekday parses weekday reference phrases ("on Monday", "next Monday", "by Friday").
-func matchWeekday(s string, now time.Time, _ Config) (*time.Time, bool) {
+func matchWeekday(s string, now time.Time, cfg Config) (*time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	type weekdayForms struct {
@@ -207,7 +207,7 @@ func matchWeekday(s string, now time.Time, _ Config) (*time.Time, bool) {
 	for _, wd := range weekdays {
 		if lower == "в "+wd.vForm {
 			target := findNearestWeekday(now, wd.weekday)
-			t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+			t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return &t, true
 		}
 
@@ -216,28 +216,28 @@ func matchWeekday(s string, now time.Time, _ Config) (*time.Time, bool) {
 			if lower == "в следующий "+wd.vForm {
 				target := findNearestWeekday(now, wd.weekday)
 				target = target.AddDate(0, 0, 7)
-				t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+				t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return &t, true
 			}
 		case time.Wednesday, time.Friday, time.Saturday:
 			if lower == "в следующую "+wd.vForm {
 				target := findNearestWeekday(now, wd.weekday)
 				target = target.AddDate(0, 0, 7)
-				t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+				t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return &t, true
 			}
 		case time.Sunday:
 			if lower == "в следующее "+wd.vForm {
 				target := findNearestWeekday(now, wd.weekday)
 				target = target.AddDate(0, 0, 7)
-				t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+				t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return &t, true
 			}
 		}
 
 		if lower == "к "+wd.kForm {
 			target := findNearestWeekday(now, wd.weekday)
-			t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+			t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return &t, true
 		}
 	}
@@ -444,7 +444,7 @@ func matchWeekBoundary(s string, now time.Time, cfg Config) (*time.Time, bool) {
 		if !target.After(now) {
 			target = target.AddDate(0, 0, 7)
 		}
-		result := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+		result := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		return &result, true
 	}
 
@@ -460,7 +460,7 @@ func matchWeekend(s string, now time.Time, cfg Config) (*time.Time, bool) {
 		checkDay := now.AddDate(0, 0, 1)
 		for i := 0; i < 7; i++ {
 			if isWeekend(checkDay.Weekday(), cfg) {
-				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), 0, 0, 0, 0, now.Location())
+				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return &result, true
 			}
 			checkDay = checkDay.AddDate(0, 0, 1)
@@ -504,7 +504,7 @@ func matchWeekend(s string, now time.Time, cfg Config) (*time.Time, bool) {
 		checkDay = weekendDay.AddDate(0, 0, 1)
 		for i := 0; i < 7; i++ {
 			if !isWeekend(checkDay.Weekday(), cfg) {
-				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), 0, 0, 0, 0, now.Location())
+				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return &result, true
 			}
 			checkDay = checkDay.AddDate(0, 0, 1)
@@ -516,7 +516,7 @@ func matchWeekend(s string, now time.Time, cfg Config) (*time.Time, bool) {
 }
 
 // matchExplicitDate parses explicit dates (Russian month names, dd.mm, dd.mm.yyyy, ordinal day).
-func matchExplicitDate(s string, now time.Time, _ Config) (*time.Time, bool) {
+func matchExplicitDate(s string, now time.Time, cfg Config) (*time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	monthMap := map[string]time.Month{
@@ -546,9 +546,9 @@ func matchExplicitDate(s string, now time.Time, _ Config) (*time.Time, bool) {
 			return nil, false
 		}
 		year := now.Year()
-		target := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		target := time.Date(year, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		if target.Before(now) {
-			target = time.Date(year+1, month, day, 0, 0, 0, 0, now.Location())
+			target = time.Date(year+1, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		}
 		return &target, true
 	}
@@ -566,9 +566,9 @@ func matchExplicitDate(s string, now time.Time, _ Config) (*time.Time, bool) {
 		}
 		month := time.Month(monthNum)
 		year := now.Year()
-		target := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		target := time.Date(year, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		if target.Before(now) {
-			target = time.Date(year+1, month, day, 0, 0, 0, 0, now.Location())
+			target = time.Date(year+1, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		}
 		return &target, true
 	}
@@ -588,7 +588,7 @@ func matchExplicitDate(s string, now time.Time, _ Config) (*time.Time, bool) {
 		if err != nil {
 			return nil, false
 		}
-		target := time.Date(year, time.Month(monthNum), day, 0, 0, 0, 0, now.Location())
+		target := time.Date(year, time.Month(monthNum), day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		return &target, true
 	}
 

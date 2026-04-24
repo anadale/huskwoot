@@ -81,6 +81,7 @@ morning = 11    # "in the morning", "by morning"
 lunch = 12      # "at lunch", "by lunch"
 afternoon = 14  # "in the afternoon", "after lunch"
 evening = 20    # "in the evening", "by evening"
+default = "evening"  # time-of-day marker used when a date is given without explicit time (e.g. "tomorrow", "on Monday"); does not affect "until …" deadline expressions
 
 # Channel state, metadata, and history are stored in an SQLite database huskwoot.db,
 # created automatically next to config.toml.

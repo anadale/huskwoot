@@ -12,6 +12,7 @@ type TimeOfDay struct {
 	Lunch     int
 	Afternoon int
 	Evening   int
+	Default   int // hour applied when a date is given without an explicit time
 }
 
 // Config holds date-parsing parameters.

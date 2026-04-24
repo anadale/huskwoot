@@ -1293,6 +1293,47 @@ ttl = "24h"
 	}
 }
 
+func TestLoad_TimeOfDayDefault(t *testing.T) {
+	cases := []struct {
+		name       string
+		configLine string
+		wantValue  string
+		wantErr    bool
+	}{
+		{"empty → evening", "", "evening", false},
+		{"morning accepted", `default = "morning"`, "morning", false},
+		{"lunch accepted", `default = "lunch"`, "lunch", false},
+		{"afternoon accepted", `default = "afternoon"`, "afternoon", false},
+		{"evening accepted", `default = "evening"`, "evening", false},
+		{"garbage → error", `default = "midnight"`, "", true},
+		{"numeric string → error", `default = "20"`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			todSection := ""
+			if tc.configLine != "" {
+				todSection = `
+[datetime.time_of_day]
+` + tc.configLine
+			}
+			content := validBase() + todSection
+			cfg, err := Load(writeConfig(t, content))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s, got nil", tc.name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success for %s, got: %v", tc.name, err)
+			}
+			if cfg.DateTime.TimeOfDay.Default != tc.wantValue {
+				t.Errorf("TimeOfDay.Default = %q, want %q", cfg.DateTime.TimeOfDay.Default, tc.wantValue)
+			}
+		})
+	}
+}
+
 func TestLoad_UserLanguage(t *testing.T) {
 	cases := []struct {
 		name     string

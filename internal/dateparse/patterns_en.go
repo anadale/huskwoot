@@ -22,7 +22,7 @@ func (e *englishDateLanguage) Parse(expr string, now time.Time, cfg Config) (tim
 	if t, ok := matchEnWeekdayAtTime(expr, now); ok {
 		return t, true
 	}
-	if t, ok := matchEnWeekday(expr, now); ok {
+	if t, ok := matchEnWeekday(expr, now, cfg); ok {
 		return t, true
 	}
 	if t, ok := matchEnClockTime(expr, now); ok {
@@ -34,7 +34,7 @@ func (e *englishDateLanguage) Parse(expr string, now time.Time, cfg Config) (tim
 	if t, ok := matchEnWeekend(expr, now, cfg); ok {
 		return t, true
 	}
-	if t, ok := matchEnExplicitDate(expr, now); ok {
+	if t, ok := matchEnExplicitDate(expr, now, cfg); ok {
 		return t, true
 	}
 	return time.Time{}, false
@@ -86,7 +86,7 @@ func matchEnDayTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 	type entry struct {
 		phrase  string
 		dayOff  int
-		hour    int // -1 = day only (0:00)
+		hour    int // -1 = use cfg.TimeOfDay.Default
 	}
 
 	entries := []entry{
@@ -108,7 +108,7 @@ func matchEnDayTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 
 	for _, e := range entries {
 		if lower == e.phrase {
-			hour := 0
+			hour := cfg.TimeOfDay.Default
 			if e.hour >= 0 {
 				hour = e.hour
 			}
@@ -163,19 +163,19 @@ var enWeekdayNames = map[string]time.Weekday{
 	"saturday":  time.Saturday,
 }
 
-func matchEnWeekday(s string, now time.Time) (time.Time, bool) {
+func matchEnWeekday(s string, now time.Time, cfg Config) (time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	for name, wd := range enWeekdayNames {
 		if lower == "on "+name || lower == "by "+name {
 			target := findNearestWeekday(now, wd)
-			t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+			t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return t, true
 		}
 		if lower == "next "+name {
 			target := findNearestWeekday(now, wd)
 			target = target.AddDate(0, 0, 7)
-			t := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+			t := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return t, true
 		}
 	}
@@ -273,7 +273,7 @@ func matchEnWeekBoundary(s string, now time.Time, cfg Config) (time.Time, bool) 
 		if !target.After(now) {
 			target = target.AddDate(0, 0, 7)
 		}
-		result := time.Date(target.Year(), target.Month(), target.Day(), 0, 0, 0, 0, now.Location())
+		result := time.Date(target.Year(), target.Month(), target.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		return result, true
 	}
 
@@ -288,7 +288,7 @@ func matchEnWeekend(s string, now time.Time, cfg Config) (time.Time, bool) {
 		checkDay := now.AddDate(0, 0, 1)
 		for i := 0; i < 7; i++ {
 			if isWeekend(checkDay.Weekday(), cfg) {
-				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), 0, 0, 0, 0, now.Location())
+				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return result, true
 			}
 			checkDay = checkDay.AddDate(0, 0, 1)
@@ -330,7 +330,7 @@ func matchEnWeekend(s string, now time.Time, cfg Config) (time.Time, bool) {
 		checkDay = weekendDay.AddDate(0, 0, 1)
 		for i := 0; i < 7; i++ {
 			if !isWeekend(checkDay.Weekday(), cfg) {
-				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), 0, 0, 0, 0, now.Location())
+				result := time.Date(checkDay.Year(), checkDay.Month(), checkDay.Day(), cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 				return result, true
 			}
 			checkDay = checkDay.AddDate(0, 0, 1)
@@ -356,7 +356,7 @@ var enMonthNames = map[string]time.Month{
 	"december":  time.December,
 }
 
-func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
+func matchEnExplicitDate(s string, now time.Time, cfg Config) (time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	monthList := `january|february|march|april|may|june|july|august|september|october|november|december`
@@ -369,7 +369,7 @@ func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
 		if err != nil || day < 1 || day > 31 {
 			return time.Time{}, false
 		}
-		return resolveEnDate(now, month, day)
+		return resolveEnDate(now, month, day, cfg)
 	}
 
 	// "Day Month" e.g. "5 May"
@@ -380,7 +380,7 @@ func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		month := enMonthNames[matches[2]]
-		return resolveEnDate(now, month, day)
+		return resolveEnDate(now, month, day, cfg)
 	}
 
 	// "Month Day Year" e.g. "May 5 2026"
@@ -395,7 +395,7 @@ func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
 		if err != nil {
 			return time.Time{}, false
 		}
-		t := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+		t := time.Date(year, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		return t, true
 	}
 
@@ -414,7 +414,7 @@ func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
 		if err != nil {
 			return time.Time{}, false
 		}
-		t := time.Date(year, time.Month(monthNum), day, 0, 0, 0, 0, now.Location())
+		t := time.Date(year, time.Month(monthNum), day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 		return t, true
 	}
 
@@ -435,11 +435,11 @@ func matchEnExplicitDate(s string, now time.Time) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func resolveEnDate(now time.Time, month time.Month, day int) (time.Time, bool) {
+func resolveEnDate(now time.Time, month time.Month, day int, cfg Config) (time.Time, bool) {
 	year := now.Year()
-	target := time.Date(year, month, day, 0, 0, 0, 0, now.Location())
+	target := time.Date(year, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 	if target.Before(now) {
-		target = time.Date(year+1, month, day, 0, 0, 0, 0, now.Location())
+		target = time.Date(year+1, month, day, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 	}
 	return target, true
 }

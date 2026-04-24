@@ -128,6 +128,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 			Lunch:     cfg.DateTime.TimeOfDay.Lunch,
 			Afternoon: cfg.DateTime.TimeOfDay.Afternoon,
 			Evening:   cfg.DateTime.TimeOfDay.Evening,
+			Default:   resolveDefaultHour(cfg.DateTime.TimeOfDay),
 		},
 		Weekdays: weekdays,
 	}
@@ -476,6 +477,21 @@ func parseWeekdays(weekdayStrs []string) []time.Weekday {
 	}
 
 	return weekdays
+}
+
+func resolveDefaultHour(tod config.TimeOfDayConfig) int {
+	switch tod.Default {
+	case "morning":
+		return tod.Morning
+	case "lunch":
+		return tod.Lunch
+	case "afternoon":
+		return tod.Afternoon
+	case "evening":
+		return tod.Evening
+	default:
+		return tod.Evening
+	}
 }
 
 type aiComponents struct {
