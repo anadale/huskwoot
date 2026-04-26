@@ -388,6 +388,87 @@ func TestUpdateTaskPatchesFields(t *testing.T) {
 	}
 }
 
+func TestUpdateTaskPatchesSummary(t *testing.T) {
+	h := newTasksHarness(t)
+	ctx := context.Background()
+
+	t.Run("plain summary", func(t *testing.T) {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "первое имя"})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, map[string]any{"summary": "второе имя"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var resp taskResp
+		decodeJSONResp(t, rec.Body, &resp)
+		if resp.Summary != "второе имя" {
+			t.Fatalf("summary=%q, want %q", resp.Summary, "второе имя")
+		}
+	})
+
+	t.Run("summary trimmed", func(t *testing.T) {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "до трима"})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, map[string]any{"summary": "  hello  "})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var resp taskResp
+		decodeJSONResp(t, rec.Body, &resp)
+		if resp.Summary != "hello" {
+			t.Fatalf("summary=%q, want %q", resp.Summary, "hello")
+		}
+	})
+
+	t.Run("summary with details", func(t *testing.T) {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "оригинал"})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, map[string]any{
+			"summary": "новое имя",
+			"details": "новые подробности",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var resp taskResp
+		decodeJSONResp(t, rec.Body, &resp)
+		if resp.Summary != "новое имя" {
+			t.Fatalf("summary=%q, want %q", resp.Summary, "новое имя")
+		}
+		if resp.Details != "новые подробности" {
+			t.Fatalf("details=%q, want %q", resp.Details, "новые подробности")
+		}
+	})
+
+	t.Run("empty summary rejected", func(t *testing.T) {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "не трогай меня"})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, map[string]any{"summary": "   "})
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status=%d, want 422; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("non-string summary rejected", func(t *testing.T) {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "не меняй"})
+		if err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, map[string]any{"summary": 42})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want 400; body=%s", rec.Code, rec.Body.String())
+		}
+	})
+}
+
 func TestCompleteTaskEndpointSetsStatus(t *testing.T) {
 	h := newTasksHarness(t)
 	ctx := context.Background()
@@ -523,7 +604,7 @@ func TestTasksValidationErrors(t *testing.T) {
 		{"invalid ref", http.MethodGet, "/v1/tasks/by-ref/broken", nil, http.StatusBadRequest},
 		{"not found by id", http.MethodGet, "/v1/tasks/unknown-uuid", nil, http.StatusNotFound},
 		{"move without project_id", http.MethodPost, "/v1/tasks/any-id/move", map[string]string{"projectId": ""}, http.StatusUnprocessableEntity},
-		{"patch unknown field", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"summary": "new"}, http.StatusBadRequest},
+		{"patch unknown field", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"garbage": "new"}, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

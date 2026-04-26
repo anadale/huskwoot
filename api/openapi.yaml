@@ -979,9 +979,12 @@ components:
     UpdateTaskRequest:
       type: object
       description: |
-        Supported fields: details, status, deadline. deadline=null clears the due date;
-        an absent field leaves the value unchanged.
+        Supported fields: summary, details, status, deadline. summary is trimmed;
+        an empty string after trim is rejected with 422. deadline=null clears the
+        due date; an absent field leaves the value unchanged.
       properties:
+        summary:
+          type: string
         details:
           type: string
         status:

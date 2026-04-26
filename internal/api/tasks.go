@@ -250,6 +250,10 @@ func (h *tasksHandler) update(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
 		return
 	}
+	if upd.Summary != nil && *upd.Summary == "" {
+		WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, "summary field is required")
+		return
+	}
 	task, err := h.service.UpdateTask(r.Context(), id, upd)
 	if err != nil {
 		if isNotFoundErr(err) {
@@ -396,6 +400,7 @@ func decodeRawMap(body io.Reader) (map[string]json.RawMessage, error) {
 }
 
 var allowedTaskUpdateFields = map[string]bool{
+	"summary":  true,
 	"details":  true,
 	"status":   true,
 	"deadline": true,
@@ -410,6 +415,14 @@ func buildTaskUpdate(raw map[string]json.RawMessage) (model.TaskUpdate, error) {
 		}
 	}
 	var upd model.TaskUpdate
+	if v, ok := raw["summary"]; ok {
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return model.TaskUpdate{}, errors.New("summary must be a string")
+		}
+		s = strings.TrimSpace(s)
+		upd.Summary = &s
+	}
 	if v, ok := raw["details"]; ok {
 		var s string
 		if err := json.Unmarshal(v, &s); err != nil {
