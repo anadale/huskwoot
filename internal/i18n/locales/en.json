@@ -102,5 +102,9 @@
   "err_alias_conflicts_with_name": "alias conflicts with an existing project name or slug",
   "err_alias_limit_reached": "alias limit reached for this project (max 10)",
   "err_alias_not_found": "alias not found for this project",
-  "err_alias_forbidden_for_inbox": "aliases are not allowed for the Inbox project"
+  "err_alias_forbidden_for_inbox": "aliases are not allowed for the Inbox project",
+  "voice.disabled": "Voice transcription is not configured",
+  "voice.error": "Failed to transcribe voice, please try again",
+  "voice.empty": "Couldn't make out the voice, please repeat",
+  "voice.too_long": "Voice message is too long (limit {{.Limit}})"
 }

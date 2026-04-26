@@ -39,6 +39,23 @@ Available in DM:
 - **Complete and move tasks** — between projects
 - **Bind a chat to a project** — so tasks from a specific group go directly to the right project
 
+### Voice Messages in Telegram DM
+
+Send a voice message directly to your bot and it will be transcribed and processed by the DM agent — no typing required. Transcription happens synchronously before the message reaches the agent pipeline; the agent sees plain text and responds normally.
+
+Voice messages are supported only in direct messages (DM). Group and @mention voice messages are not transcribed.
+
+Two transcription providers are available:
+
+- **whisper.cpp** — runs `whisper-cli` locally as a subprocess via ffmpeg. Requires `whisper-cli`, `ffmpeg`, and a model file on the server.
+- **Yandex SpeechKit** — sends audio to Yandex Cloud STT sync REST API. Requires an API key and a folder ID.
+
+When `provider = ""` (or the `[transcriber]` section is absent), the bot replies with a friendly "not configured" message on any voice message and continues to work normally for text input.
+
+See **[Voice recognition setup](docs/voice-recognition.md)** for installation and configuration walkthroughs for both providers.
+
+---
+
 ### @mention and Reply in Groups
 
 Mention the bot (`@botname`) or reply to one of its messages directly in a monitored group. The agent responds in your Telegram DM, with access to all task management tools except project creation and listing (those are DM-only).
@@ -286,6 +303,22 @@ retention_period   = "2160h"   # 90 days after revoke → DELETE from the store 
 - Setting either field to `0s` disables the corresponding sweep. Omitting the `[devices]` section uses the defaults above.
 
 Both values use Go duration format; the `"d"` suffix is not supported (use `"720h"`, not `"30d"`).
+
+---
+
+### `[transcriber]`
+
+Configures voice message transcription for Telegram DM. Voice messages in groups and @mention chats are not transcribed regardless of this setting. When the section is absent or `provider = ""`, the bot replies with a "not configured" message on any voice input and continues to operate normally.
+
+```toml
+[transcriber]
+provider     = "whisper"   # "" | "whisper" | "yandex"; empty = disabled
+max_duration = "5m"        # reject voice messages longer than this (default: 5m)
+```
+
+Provider-specific subsections (`[transcriber.whisper]`, `[transcriber.yandex]`) hold the credentials and runtime options. Step-by-step setup — installing whisper.cpp, picking and downloading a GGML model, creating a Yandex Cloud service account and API key, plus troubleshooting tips — is covered in a dedicated guide:
+
+**→ [Voice recognition setup](docs/voice-recognition.md)**
 
 ---
 

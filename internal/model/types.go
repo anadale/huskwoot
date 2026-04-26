@@ -250,3 +250,14 @@ type Cursor struct {
 	// UpdatedAt is the time the cursor was last updated.
 	UpdatedAt time.Time
 }
+
+// AudioInput carries the raw audio payload for a single recognition call.
+type AudioInput struct {
+	// Data is the full audio body in its original encoding.
+	Data []byte
+	// MimeType describes the encoding (e.g. "audio/ogg" for Telegram voice messages).
+	MimeType string
+	// Duration is the announced length of the recording, used for logging
+	// and to short-circuit recognizers with hard duration limits.
+	Duration time.Duration
+}

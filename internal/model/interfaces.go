@@ -239,6 +239,17 @@ type PushQueue interface {
 	DeleteDelivered(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
+// Transcriber converts a voice/audio recording to plain text.
+// Implementations live in internal/transcribe (WhisperCPP, Yandex).
+type Transcriber interface {
+	// Transcribe returns the recognized text for the given audio payload.
+	// An empty string with nil error indicates the recognizer ran successfully but
+	// produced no text (silence/noise).
+	Transcribe(ctx context.Context, audio AudioInput) (string, error)
+	// Name returns the human-readable transcriber name for logging.
+	Name() string
+}
+
 // Broker fans out published events to active SSE subscribers within a single process.
 // No database access: the broker receives an already-saved event (after the use-case
 // commit) and fans it out over local channels.

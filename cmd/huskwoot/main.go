@@ -32,6 +32,7 @@ import (
 	"github.com/anadale/huskwoot/internal/reminder"
 	"github.com/anadale/huskwoot/internal/sink"
 	"github.com/anadale/huskwoot/internal/storage"
+	"github.com/anadale/huskwoot/internal/transcribe"
 	"github.com/anadale/huskwoot/internal/usecase"
 )
 
@@ -152,8 +153,16 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		return err
 	}
 
+	transcriber, err := transcribe.New(cfg.Transcriber)
+	if err != nil {
+		return fmt.Errorf("initializing transcriber: %w", err)
+	}
+	if transcriber != nil {
+		slog.Info("transcriber configured", "provider", transcriber.Name())
+	}
+
 	guardStore := storage.NewSQLiteGuardStore(db)
-	telegramBot, tgChannels, notifiers, err := buildTelegramComponents(cfg, stateStore, guardStore, hist)
+	telegramBot, tgChannels, notifiers, err := buildTelegramComponents(cfg, stateStore, guardStore, hist, transcriber, cfg.Transcriber.MaxDuration)
 	if err != nil {
 		return err
 	}
@@ -575,7 +584,7 @@ func buildAIComponents(cfg *config.Config, overrides promptOverrides, userName s
 	}, nil
 }
 
-func buildTelegramComponents(cfg *config.Config, stateStore model.StateStore, guardStore model.GuardStore, hist model.History) (*tgbotapi.BotAPI, []model.Channel, []model.Notifier, error) {
+func buildTelegramComponents(cfg *config.Config, stateStore model.StateStore, guardStore model.GuardStore, hist model.History, transcriber model.Transcriber, maxVoiceDuration time.Duration) (*tgbotapi.BotAPI, []model.Channel, []model.Notifier, error) {
 	if cfg.Channels.Telegram == nil {
 		return nil, nil, nil, nil
 	}
@@ -585,15 +594,24 @@ func buildTelegramComponents(cfg *config.Config, stateStore model.StateStore, gu
 		return nil, nil, nil, fmt.Errorf("initializing Telegram bot: %w", err)
 	}
 
+	bundle, err := huskwootI18n.NewBundle(cfg.User.Language)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("i18n bundle for telegram channel: %w", err)
+	}
+	loc := huskwootI18n.NewLocalizer(bundle, cfg.User.Language)
+
 	tgChannel := channel.NewTelegramChannel(bot, channel.TelegramChannelConfig{
-		OwnerIDs:        []string{fmt.Sprintf("%d", cfg.User.TelegramUserID)},
-		OnJoin:          tgCfg.OnJoin,
-		ReactionEnabled: tgCfg.ReactionEnabled,
-		BotID:           fmt.Sprintf("%d", bot.Self.ID),
-		BotUsername:     bot.Self.UserName,
-		WelcomeMessage:  tgCfg.WelcomeMessage,
-		ConfirmTimeout:  tgCfg.ConfirmTimeout,
-		Language:        cfg.User.Language,
+		OwnerIDs:         []string{fmt.Sprintf("%d", cfg.User.TelegramUserID)},
+		OnJoin:           tgCfg.OnJoin,
+		ReactionEnabled:  tgCfg.ReactionEnabled,
+		BotID:            fmt.Sprintf("%d", bot.Self.ID),
+		BotUsername:      bot.Self.UserName,
+		WelcomeMessage:   tgCfg.WelcomeMessage,
+		ConfirmTimeout:   tgCfg.ConfirmTimeout,
+		Language:         cfg.User.Language,
+		Transcriber:      transcriber,
+		MaxVoiceDuration: maxVoiceDuration,
+		Localizer:        loc,
 	}, stateStore, guardStore, hist, channel.HistoryConfig{})
 
 	return bot, []model.Channel{tgChannel}, nil, nil

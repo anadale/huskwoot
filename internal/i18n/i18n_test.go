@@ -128,6 +128,36 @@ func TestTasksMore_English(t *testing.T) {
 	}
 }
 
+func TestVoiceKeys(t *testing.T) {
+	tests := []struct {
+		lang string
+		key  string
+		data any
+		want string
+	}{
+		{"ru", "voice.disabled", nil, "Распознавание голоса не настроено"},
+		{"ru", "voice.error", nil, "Не удалось распознать голос, попробуй ещё раз"},
+		{"ru", "voice.empty", nil, "Не разобрал, повтори, пожалуйста"},
+		{"ru", "voice.too_long", map[string]string{"Limit": "5m0s"}, "Голосовое слишком длинное (лимит 5m0s)"},
+		{"en", "voice.disabled", nil, "Voice transcription is not configured"},
+		{"en", "voice.error", nil, "Failed to transcribe voice, please try again"},
+		{"en", "voice.empty", nil, "Couldn't make out the voice, please repeat"},
+		{"en", "voice.too_long", map[string]string{"Limit": "5m0s"}, "Voice message is too long (limit 5m0s)"},
+	}
+
+	for _, tc := range tests {
+		bundle, err := i18n.NewBundle(tc.lang)
+		if err != nil {
+			t.Fatalf("NewBundle(%s): %v", tc.lang, err)
+		}
+		loc := i18n.NewLocalizer(bundle, tc.lang)
+		got := i18n.Translate(loc, tc.key, tc.data)
+		if got != tc.want {
+			t.Errorf("%s/%s: got %q, want %q", tc.lang, tc.key, got, tc.want)
+		}
+	}
+}
+
 func TestProjectAliasKeysPresent(t *testing.T) {
 	keys := []string{
 		"tool_get_project_desc",

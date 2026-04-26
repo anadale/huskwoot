@@ -5,15 +5,19 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf16"
 
+	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
 )
 
@@ -84,6 +88,19 @@ type TelegramChannelConfig struct {
 	// Language is the UI language ("ru" or "en"). Used for default guard messages.
 	// Falls back to "ru" if empty or unrecognised.
 	Language string
+	// Transcriber converts voice/audio DM messages to text.
+	// nil means voice messages get a "voice.disabled" reply and are not forwarded to the handler.
+	Transcriber model.Transcriber
+	// MaxVoiceDuration is the upper bound on voice message length.
+	// Voice messages exceeding this duration get a "voice.too_long" reply.
+	// 0 means no duration check.
+	MaxVoiceDuration time.Duration
+	// Localizer provides translated strings for voice-related replies.
+	// nil means voice replies are suppressed (no message sent to the user).
+	Localizer *goI18n.Localizer
+	// DownloadFileFn downloads a Telegram file by file ID.
+	// NewTelegramChannel sets a real implementation; override in tests to inject mock bytes.
+	DownloadFileFn func(ctx context.Context, fileID string) ([]byte, error)
 }
 
 // guardMessages holds language-specific guard UI strings.
@@ -157,6 +174,32 @@ func (w *TelegramChannel) stateKey() string {
 // NewTelegramChannel creates a new TelegramChannel with a real Bot API.
 // guardStore may be nil — without it, pending approvals are not persisted across restarts.
 func NewTelegramChannel(bot *tgbotapi.BotAPI, cfg TelegramChannelConfig, state model.StateStore, guardStore model.GuardStore, history model.History, historyCfg HistoryConfig) *TelegramChannel {
+	if cfg.DownloadFileFn == nil {
+		fileDownloadClient := &http.Client{Timeout: 30 * time.Second}
+		cfg.DownloadFileFn = func(ctx context.Context, fileID string) ([]byte, error) {
+			file, err := bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
+			if err != nil {
+				return nil, fmt.Errorf("getting file info: %w", err)
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, file.Link(bot.Token), nil)
+			if err != nil {
+				return nil, fmt.Errorf("creating download request: %w", err)
+			}
+			resp, err := fileDownloadClient.Do(req)
+			if err != nil {
+				return nil, fmt.Errorf("downloading file: %w", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("downloading file: HTTP %d", resp.StatusCode)
+			}
+			data, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+			if err != nil {
+				return nil, fmt.Errorf("reading file: %w", err)
+			}
+			return data, nil
+		}
+	}
 	return newTelegramChannel(bot, cfg, state, guardStore, history, historyCfg)
 }
 
@@ -322,6 +365,17 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 	if !converted {
 		saveCursor()
 		return
+	}
+
+	// Voice handling: transcribe voice/audio DM messages before pipeline processing.
+	// Voice messages in group chats are not transcribed.
+	if msg.Kind == model.MessageKindDM && (tgMsg.Voice != nil || tgMsg.Audio != nil) {
+		text, ok := w.transcribeVoice(ctx, tgMsg)
+		if !ok {
+			saveCursor()
+			return
+		}
+		msg.Text = text
 	}
 
 	if w.history != nil && msg.Text != "" {
@@ -641,6 +695,86 @@ func (w *TelegramChannel) recordBotReply(ctx context.Context, sourceID, text str
 	if err := w.history.Add(ctx, sourceID, entry); err != nil {
 		slog.WarnContext(ctx, "recording bot reply to history", "error", err)
 	}
+}
+
+// replyVoiceI18n sends a translated reply for a voice-related event.
+// No-op when Localizer is nil.
+func (w *TelegramChannel) replyVoiceI18n(ctx context.Context, chatID int64, key string, data any) {
+	if w.cfg.Localizer == nil {
+		return
+	}
+	text := huskwootI18n.Translate(w.cfg.Localizer, key, data)
+	msg := tgbotapi.NewMessage(chatID, text)
+	if _, err := w.bot.Send(msg); err != nil {
+		slog.WarnContext(ctx, "sending voice i18n reply", "key", key, "err", err)
+	}
+}
+
+// transcribeVoice downloads and transcribes the voice/audio attachment from a DM.
+// Returns the recognised text and true on success. Sends a localised reply and returns
+// "", false when the message should not be forwarded to the pipeline handler.
+func (w *TelegramChannel) transcribeVoice(ctx context.Context, tgMsg *tgbotapi.Message) (string, bool) {
+	chatID := tgMsg.Chat.ID
+
+	var fileID string
+	var duration int
+	var mimeType string
+	if tgMsg.Voice != nil {
+		fileID = tgMsg.Voice.FileID
+		duration = tgMsg.Voice.Duration
+		mimeType = "audio/ogg"
+	} else if tgMsg.Audio != nil {
+		fileID = tgMsg.Audio.FileID
+		duration = tgMsg.Audio.Duration
+		mimeType = tgMsg.Audio.MimeType
+		if mimeType == "" {
+			mimeType = "audio/ogg"
+		}
+	}
+
+	d := time.Duration(duration) * time.Second
+
+	if w.cfg.MaxVoiceDuration > 0 && d > w.cfg.MaxVoiceDuration {
+		w.replyVoiceI18n(ctx, chatID, "voice.too_long", map[string]string{"Limit": w.cfg.MaxVoiceDuration.String()})
+		return "", false
+	}
+
+	if w.cfg.Transcriber == nil {
+		w.replyVoiceI18n(ctx, chatID, "voice.disabled", nil)
+		return "", false
+	}
+
+	if w.cfg.DownloadFileFn == nil {
+		slog.ErrorContext(ctx, "voice: DownloadFileFn not set")
+		w.replyVoiceI18n(ctx, chatID, "voice.error", nil)
+		return "", false
+	}
+
+	data, err := w.cfg.DownloadFileFn(ctx, fileID)
+	if err != nil {
+		slog.ErrorContext(ctx, "voice: download failed", "err", err)
+		w.replyVoiceI18n(ctx, chatID, "voice.error", nil)
+		return "", false
+	}
+
+	text, err := w.cfg.Transcriber.Transcribe(ctx, model.AudioInput{
+		Data:     data,
+		MimeType: mimeType,
+		Duration: d,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "voice: transcription failed", "transcriber", w.cfg.Transcriber.Name(), "err", err)
+		w.replyVoiceI18n(ctx, chatID, "voice.error", nil)
+		return "", false
+	}
+
+	text = strings.TrimSpace(text)
+	if text == "" {
+		w.replyVoiceI18n(ctx, chatID, "voice.empty", nil)
+		return "", false
+	}
+
+	return text, true
 }
 
 func (w *TelegramChannel) saveUpdateCursor(ctx context.Context, updateID int) error {

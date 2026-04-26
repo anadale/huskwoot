@@ -1334,6 +1334,269 @@ func TestLoad_TimeOfDayDefault(t *testing.T) {
 	}
 }
 
+func TestLoad_TranscriberSection(t *testing.T) {
+	cases := []struct {
+		name        string
+		extra       string
+		wantErr     bool
+		wantMaxDur  time.Duration
+		wantProvider string
+	}{
+		{
+			name:        "секция отсутствует — ok, дефолт 5m",
+			extra:       "",
+			wantErr:     false,
+			wantMaxDur:  5 * time.Minute,
+			wantProvider: "",
+		},
+		{
+			name: "provider пустой — ok",
+			extra: `
+[transcriber]
+provider = ""
+`,
+			wantErr:     false,
+			wantMaxDur:  5 * time.Minute,
+			wantProvider: "",
+		},
+		{
+			name: "provider whisper с обязательными полями — ok",
+			extra: `
+[transcriber]
+provider = "whisper"
+[transcriber.whisper]
+binary = "/usr/local/bin/whisper-cli"
+model = "/var/models/ggml-base.bin"
+`,
+			wantErr:     false,
+			wantMaxDur:  5 * time.Minute,
+			wantProvider: "whisper",
+		},
+		{
+			name: "provider whisper без binary — ошибка",
+			extra: `
+[transcriber]
+provider = "whisper"
+[transcriber.whisper]
+model = "/var/models/ggml-base.bin"
+`,
+			wantErr: true,
+		},
+		{
+			name: "provider whisper без model — ошибка",
+			extra: `
+[transcriber]
+provider = "whisper"
+[transcriber.whisper]
+binary = "/usr/local/bin/whisper-cli"
+`,
+			wantErr: true,
+		},
+		{
+			name: "provider yandex с обязательными полями — ok",
+			extra: `
+[transcriber]
+provider = "yandex"
+[transcriber.yandex]
+api_key = "aqd-key"
+folder_id = "folder123"
+`,
+			wantErr:     false,
+			wantMaxDur:  5 * time.Minute,
+			wantProvider: "yandex",
+		},
+		{
+			name: "provider yandex без api_key — ошибка",
+			extra: `
+[transcriber]
+provider = "yandex"
+[transcriber.yandex]
+folder_id = "folder123"
+`,
+			wantErr: true,
+		},
+		{
+			name: "provider yandex без folder_id — ошибка",
+			extra: `
+[transcriber]
+provider = "yandex"
+[transcriber.yandex]
+api_key = "aqd-key"
+`,
+			wantErr: true,
+		},
+		{
+			name: "неизвестный provider — ошибка",
+			extra: `
+[transcriber]
+provider = "deepgram"
+`,
+			wantErr: true,
+		},
+		{
+			name: "max_duration валидный — парсится",
+			extra: `
+[transcriber]
+max_duration = "3m"
+`,
+			wantErr:    false,
+			wantMaxDur: 3 * time.Minute,
+		},
+		{
+			name: "max_duration отрицательный — ошибка",
+			extra: `
+[transcriber]
+max_duration = "-1m"
+`,
+			wantErr: true,
+		},
+		{
+			name: "max_duration нулевой — нет ограничения",
+			extra: `
+[transcriber]
+max_duration = "0s"
+`,
+			wantErr: false,
+		},
+		{
+			name: "max_duration невалидный — ошибка",
+			extra: `
+[transcriber]
+max_duration = "5d"
+`,
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, validBase()+tc.extra))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success, got error: %v", err)
+			}
+			if cfg.Transcriber.Provider != tc.wantProvider {
+				t.Errorf("Transcriber.Provider = %q, want %q", cfg.Transcriber.Provider, tc.wantProvider)
+			}
+			if tc.wantMaxDur != 0 && cfg.Transcriber.MaxDuration != tc.wantMaxDur {
+				t.Errorf("Transcriber.MaxDuration = %v, want %v", cfg.Transcriber.MaxDuration, tc.wantMaxDur)
+			}
+		})
+	}
+}
+
+func TestLoad_TranscriberWhisperDefaults(t *testing.T) {
+	content := validBase() + `
+[transcriber]
+provider = "whisper"
+[transcriber.whisper]
+binary = "/usr/local/bin/whisper-cli"
+model = "/var/models/ggml-base.bin"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	w := cfg.Transcriber.Whisper
+	if w.Ffmpeg != "ffmpeg" {
+		t.Errorf("Whisper.Ffmpeg default = %q, want %q", w.Ffmpeg, "ffmpeg")
+	}
+	if w.Timeout != 60*time.Second {
+		t.Errorf("Whisper.Timeout default = %v, want 60s", w.Timeout)
+	}
+}
+
+func TestLoad_TranscriberWhisperExplicit(t *testing.T) {
+	content := validBase() + `
+[transcriber]
+provider = "whisper"
+max_duration = "10m"
+[transcriber.whisper]
+binary = "/usr/local/bin/whisper-cli"
+model = "/var/models/ggml-base.bin"
+language = "en"
+ffmpeg = "/usr/bin/ffmpeg"
+threads = 4
+timeout = "90s"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	w := cfg.Transcriber.Whisper
+	if w.Language != "en" {
+		t.Errorf("Whisper.Language = %q, want %q", w.Language, "en")
+	}
+	if w.Ffmpeg != "/usr/bin/ffmpeg" {
+		t.Errorf("Whisper.Ffmpeg = %q, want %q", w.Ffmpeg, "/usr/bin/ffmpeg")
+	}
+	if w.Threads != 4 {
+		t.Errorf("Whisper.Threads = %d, want 4", w.Threads)
+	}
+	if w.Timeout != 90*time.Second {
+		t.Errorf("Whisper.Timeout = %v, want 90s", w.Timeout)
+	}
+	if cfg.Transcriber.MaxDuration != 10*time.Minute {
+		t.Errorf("Transcriber.MaxDuration = %v, want 10m", cfg.Transcriber.MaxDuration)
+	}
+}
+
+func TestLoad_TranscriberYandexDefaults(t *testing.T) {
+	content := validBase() + `
+[transcriber]
+provider = "yandex"
+[transcriber.yandex]
+api_key = "aqd-key"
+folder_id = "folder123"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	y := cfg.Transcriber.Yandex
+	if y.Language != "ru-RU" {
+		t.Errorf("Yandex.Language default = %q, want %q", y.Language, "ru-RU")
+	}
+	if y.Endpoint != "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize" {
+		t.Errorf("Yandex.Endpoint default = %q", y.Endpoint)
+	}
+	if y.Timeout != 30*time.Second {
+		t.Errorf("Yandex.Timeout default = %v, want 30s", y.Timeout)
+	}
+}
+
+func TestLoad_TranscriberYandexExplicit(t *testing.T) {
+	content := validBase() + `
+[transcriber]
+provider = "yandex"
+[transcriber.yandex]
+api_key = "aqd-key"
+folder_id = "folder123"
+language = "en-US"
+endpoint = "https://custom.endpoint.example.com/stt"
+timeout = "45s"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	y := cfg.Transcriber.Yandex
+	if y.Language != "en-US" {
+		t.Errorf("Yandex.Language = %q, want %q", y.Language, "en-US")
+	}
+	if y.Endpoint != "https://custom.endpoint.example.com/stt" {
+		t.Errorf("Yandex.Endpoint = %q", y.Endpoint)
+	}
+	if y.Timeout != 45*time.Second {
+		t.Errorf("Yandex.Timeout = %v, want 45s", y.Timeout)
+	}
+}
+
 func TestLoad_UserLanguage(t *testing.T) {
 	cases := []struct {
 		name     string

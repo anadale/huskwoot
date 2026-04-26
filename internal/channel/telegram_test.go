@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 
+	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
 )
 
@@ -2021,5 +2023,424 @@ func TestWatch_Guard_PendingMessagesSkipped(t *testing.T) {
 
 	if len(received) != 0 {
 		t.Errorf("handler must not be called for pending chat, got %d messages", len(received))
+	}
+}
+
+// --- Voice transcription tests ---
+
+// mockTranscriber implements model.Transcriber for testing.
+type mockTranscriber struct {
+	mu           sync.Mutex
+	transcribeFn func(ctx context.Context, audio model.AudioInput) (string, error)
+	calls        []model.AudioInput
+}
+
+func (m *mockTranscriber) Transcribe(ctx context.Context, audio model.AudioInput) (string, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, audio)
+	m.mu.Unlock()
+	if m.transcribeFn != nil {
+		return m.transcribeFn(ctx, audio)
+	}
+	return "", nil
+}
+
+func (m *mockTranscriber) Name() string { return "mock" }
+
+func makeTestLocalizer(t *testing.T, lang string) *goI18n.Localizer {
+	t.Helper()
+	bundle, err := huskwootI18n.NewBundle(lang)
+	if err != nil {
+		t.Fatalf("NewBundle(%s): %v", lang, err)
+	}
+	return huskwootI18n.NewLocalizer(bundle, lang)
+}
+
+func makeVoiceMessage(msgID int, chat *tgbotapi.Chat, from *tgbotapi.User, fileID string, duration, date int) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		MessageID: msgID,
+		Chat:      chat,
+		From:      from,
+		Date:      date,
+		Voice:     &tgbotapi.Voice{FileID: fileID, Duration: duration},
+	}
+}
+
+// watchVoice is a test helper that delivers a single voice rawUpdate through Watch
+// and returns all messages received by the handler plus bot.Send calls.
+func watchVoice(t *testing.T, cfg TelegramChannelConfig, tgMsg *tgbotapi.Message) (received []model.Message, sendCalled []tgbotapi.Chattable) {
+	t.Helper()
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+	bot.setUpdates([]rawUpdate{makeRawUpdate(1, tgMsg)})
+
+	w := newTelegramChannel(bot, cfg, state, nil, nil, HistoryConfig{})
+	_ = w.Watch(ctx, func(_ context.Context, msg model.Message) error {
+		received = append(received, msg)
+		return nil
+	})
+
+	bot.mu.Lock()
+	sendCalled = append([]tgbotapi.Chattable{}, bot.sendCalled...)
+	bot.mu.Unlock()
+	return received, sendCalled
+}
+
+// TestWatch_VoiceDM_TranscriberReturnsText verifies that a voice DM is transcribed and
+// the handler receives a message with the recognised text.
+func TestWatch_VoiceDM_TranscriberReturnsText(t *testing.T) {
+	const ownerID int64 = 12345
+	audio := []byte("ogg-bytes")
+
+	tr := &mockTranscriber{
+		transcribeFn: func(_ context.Context, _ model.AudioInput) (string, error) {
+			return "привет мир", nil
+		},
+	}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return audio, nil },
+	}
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 10, 1700000000)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 1 {
+		t.Fatalf("handler must be called once, got %d", len(received))
+	}
+	if received[0].Text != "привет мир" {
+		t.Errorf("Text: want %q, got %q", "привет мир", received[0].Text)
+	}
+	if received[0].Kind != model.MessageKindDM {
+		t.Errorf("Kind: want DM, got %q", received[0].Kind)
+	}
+	// no i18n reply should be sent
+	if len(sendCalled) != 0 {
+		t.Errorf("bot.Send must not be called on success, got %d calls", len(sendCalled))
+	}
+
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("Transcribe must be called once, got %d", len(calls))
+	}
+	if string(calls[0].Data) != string(audio) {
+		t.Errorf("Transcribe received wrong data")
+	}
+}
+
+// TestWatch_VoiceDM_TranscriberError verifies that a transcription error triggers a
+// "voice.error" reply and the handler is NOT called.
+func TestWatch_VoiceDM_TranscriberError(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{
+		transcribeFn: func(_ context.Context, _ model.AudioInput) (string, error) {
+			return "", errors.New("stt unavailable")
+		},
+	}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+	}
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 10, 1700000000)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called on transcription error, got %d messages", len(received))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with error reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Не удалось распознать голос, попробуй ещё раз"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_NilTranscriber verifies that voice DM with nil Transcriber gets a
+// "voice.disabled" reply and the handler is NOT called.
+func TestWatch_VoiceDM_NilTranscriber(t *testing.T) {
+	const ownerID int64 = 12345
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:    []string{"12345"},
+		Transcriber: nil,
+		Localizer:   makeTestLocalizer(t, "ru"),
+	}
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 10, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called when transcriber is nil, got %d messages", len(received))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with disabled reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Распознавание голоса не настроено"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_TooLong verifies that a voice message exceeding MaxVoiceDuration gets
+// a "voice.too_long" reply, and the Transcriber is NOT called.
+func TestWatch_VoiceDM_TooLong(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:         []string{"12345"},
+		Transcriber:      tr,
+		MaxVoiceDuration: 30 * time.Second,
+		Localizer:        makeTestLocalizer(t, "ru"),
+		DownloadFileFn:   func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+	}
+	// 60 seconds > 30 second limit
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 60, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called for too-long voice, got %d messages", len(received))
+	}
+
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("Transcribe must NOT be called for too-long voice, got %d calls", len(calls))
+	}
+
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with too_long reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Голосовое слишком длинное (лимит 30s)"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_TooLong_NoTranscriber verifies that a voice message exceeding
+// MaxVoiceDuration gets "voice.too_long" even when Transcriber is nil.
+// Duration check must happen before the nil-transcriber check.
+func TestWatch_VoiceDM_TooLong_NoTranscriber(t *testing.T) {
+	const ownerID int64 = 12345
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:         []string{"12345"},
+		Transcriber:      nil,
+		MaxVoiceDuration: 30 * time.Second,
+		Localizer:        makeTestLocalizer(t, "ru"),
+		DownloadFileFn:   func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+	}
+	// 60 seconds > 30 second limit
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 60, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called for too-long voice, got %d messages", len(received))
+	}
+
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with too_long reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Голосовое слишком длинное (лимит 30s)"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_WhitespaceResult verifies that a transcription returning only
+// whitespace triggers "voice.empty" and the handler is NOT called.
+func TestWatch_VoiceDM_WhitespaceResult(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{
+		transcribeFn: func(_ context.Context, _ model.AudioInput) (string, error) {
+			return "   \t\n  ", nil
+		},
+	}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+	}
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 5, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called for empty transcription, got %d messages", len(received))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with empty reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Не разобрал, повтори, пожалуйста"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceGroupMessage_TranscriptionNotLaunched verifies that a voice message
+// in a group chat does NOT trigger transcription.
+func TestWatch_VoiceGroupMessage_TranscriptionNotLaunched(t *testing.T) {
+	const groupID int64 = -100
+
+	tr := &mockTranscriber{
+		transcribeFn: func(_ context.Context, _ model.AudioInput) (string, error) {
+			return "text", nil
+		},
+	}
+	cfg := TelegramChannelConfig{
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+	}
+
+	user := makeUser(1, "u", "", "")
+	chat := makeChat(groupID, "Группа")
+	groupVoiceMsg := &tgbotapi.Message{
+		MessageID: 1,
+		Chat:      chat,
+		From:      user,
+		Date:      1000,
+		Voice:     &tgbotapi.Voice{FileID: "file123", Duration: 10},
+	}
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+	bot.setUpdates([]rawUpdate{makeRawUpdate(1, groupVoiceMsg)})
+
+	w := newTelegramChannel(bot, cfg, state, nil, nil, HistoryConfig{})
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+
+	if len(calls) != 0 {
+		t.Errorf("Transcribe must NOT be called for group voice message, got %d calls", len(calls))
+	}
+}
+
+// TestWatch_VoiceDM_DownloadError verifies that a download failure triggers a
+// "voice.error" reply and the handler is NOT called.
+func TestWatch_VoiceDM_DownloadError(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return nil, errors.New("network error") },
+	}
+	tgMsg := makeVoiceMessage(1, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "file123", 10, 1700000000)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called on download error, got %d messages", len(received))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with error reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Не удалось распознать голос, попробуй ещё раз"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("Transcribe must NOT be called on download error, got %d calls", len(calls))
+	}
+}
+
+// TestWatch_VoiceDM_AudioMessage verifies that a Telegram Audio attachment in a DM
+// is transcribed the same way as a Voice message.
+func TestWatch_VoiceDM_AudioMessage(t *testing.T) {
+	const ownerID int64 = 12345
+	audio := []byte("mp3-bytes")
+
+	tr := &mockTranscriber{
+		transcribeFn: func(_ context.Context, _ model.AudioInput) (string, error) {
+			return "текст из аудио", nil
+		},
+	}
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return audio, nil },
+	}
+	tgMsg := &tgbotapi.Message{
+		MessageID: 1,
+		Chat:      makePrivateChat(ownerID),
+		From:      &tgbotapi.User{ID: ownerID},
+		Date:      1700000000,
+		Audio:     &tgbotapi.Audio{FileID: "audio123", Duration: 15, MimeType: "audio/mpeg"},
+	}
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 1 {
+		t.Fatalf("handler must be called once, got %d", len(received))
+	}
+	if received[0].Text != "текст из аудио" {
+		t.Errorf("Text: want %q, got %q", "текст из аудио", received[0].Text)
+	}
+	if len(sendCalled) != 0 {
+		t.Errorf("bot.Send must not be called on success, got %d calls", len(sendCalled))
+	}
+
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("Transcribe must be called once, got %d", len(calls))
+	}
+	if string(calls[0].Data) != string(audio) {
+		t.Errorf("Transcribe received wrong data")
 	}
 }

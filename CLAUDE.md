@@ -31,6 +31,7 @@ internal/push/                — PushQueue, Dispatcher, Templates, RelayClient
 internal/pushproto/           — shared DTOs and HMAC helpers (instance ↔ relay)
 internal/relay/               — push relay: Store, HMACMiddleware, APNs/FCM adapters, Server
 internal/pairing/             — SQLitePairingStore, Broadcaster, TelegramSender
+internal/transcribe/          — Transcriber implementations (WhisperCPP subprocess, Yandex SpeechKit)
 api/openapi.yaml              — OpenAPI 3.1, source of truth for the REST API
 ```
 
@@ -234,6 +235,37 @@ retention_period   = "2160h"  # 90 дней после revoke → физичес
 ```
 
 Retention runner каждый час (`events.Runner.Tick`) перебирает `DeviceStore.ListInactive(now - inactive_threshold)` и для каждой записи делает `Revoke` + `RelayClient.DeleteRegistration`. Ошибка relay логируется, но не прерывает локальный revoke. Отдельно вызывается `DeleteRevokedOlderThan(now - retention_period)` для физического удаления из таблицы `devices`. Значение `0` в любой из настроек отключает соответствующий sweep; в обычном режиме работы используются дефолты 30 / 90 дней.
+
+### `[transcriber]`
+
+Voice messages are transcribed only in Telegram **DM** (`MessageKindDM`). Group and GroupDirect voice messages are not transcribed. When `provider = ""` (or the section is absent), the bot replies with `voice.disabled` i18n message and does not crash.
+
+```toml
+[transcriber]
+provider     = "whisper"   # "" | "whisper" | "yandex"; empty = disabled
+max_duration = "5m"        # hard upper bound on voice duration; default 5m
+
+[transcriber.whisper]
+binary   = "/usr/local/bin/whisper-cli"   # required
+model    = "/var/huskwoot/models/ggml-base.bin"  # required
+language = "ru"           # default: empty (auto-detect)
+ffmpeg   = "ffmpeg"       # default: "ffmpeg" (resolved via PATH)
+threads  = 4              # default: 0 (the -t flag is not passed)
+timeout  = "60s"          # default: 60s
+
+[transcriber.yandex]
+api_key   = "${YANDEX_SPEECHKIT_API_KEY}"   # required
+folder_id = "${YANDEX_FOLDER_ID}"           # required
+language  = "ru-RU"       # default: "ru-RU"
+endpoint  = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"  # default
+timeout   = "30s"         # default: 30s
+```
+
+Validation:
+- `provider == "whisper"` → `binary` and `model` are required.
+- `provider == "yandex"` → `api_key` and `folder_id` are required.
+- `provider` not in `{"", "whisper", "yandex"}` → error.
+- `max_duration` parsed via `time.ParseDuration`; empty → 5m; negative → error.
 
 ## HTTP API
 

@@ -231,17 +231,66 @@ type DevicesConfig struct {
 	RetentionPeriod time.Duration `toml:"-"`
 }
 
+// WhisperConfig holds settings for the whisper.cpp subprocess transcriber.
+type WhisperConfig struct {
+	// Binary is the path to the whisper-cli executable; required.
+	Binary string `toml:"binary"`
+	// Model is the path to the GGML model file; required.
+	Model string `toml:"model"`
+	// Language is the recognition language (e.g. "ru"); empty means auto-detect.
+	Language string `toml:"language"`
+	// Ffmpeg is the path or name of the ffmpeg binary; defaults to "ffmpeg".
+	Ffmpeg string `toml:"ffmpeg"`
+	// Threads is the number of CPU threads passed via -t; 0 means flag is omitted.
+	Threads int `toml:"threads"`
+	// TimeoutRaw is the subprocess execution timeout as a Go duration string (e.g. "60s"); default 60s.
+	TimeoutRaw string `toml:"timeout"`
+	// Timeout is the parsed timeout value.
+	Timeout time.Duration `toml:"-"`
+}
+
+// YandexConfig holds settings for the Yandex SpeechKit REST transcriber.
+type YandexConfig struct {
+	// APIKey is the Yandex Cloud API key; required.
+	APIKey string `toml:"api_key"`
+	// FolderID is the Yandex Cloud folder ID; required.
+	FolderID string `toml:"folder_id"`
+	// Language is the recognition language (e.g. "ru-RU"); defaults to "ru-RU".
+	Language string `toml:"language"`
+	// Endpoint is the SpeechKit REST endpoint URL; defaults to the official endpoint.
+	Endpoint string `toml:"endpoint"`
+	// TimeoutRaw is the HTTP request timeout as a Go duration string (e.g. "30s"); default 30s.
+	TimeoutRaw string `toml:"timeout"`
+	// Timeout is the parsed timeout value.
+	Timeout time.Duration `toml:"-"`
+}
+
+// TranscriberConfig holds settings for the voice transcription feature.
+type TranscriberConfig struct {
+	// Provider selects the transcription backend: "" (disabled), "whisper", or "yandex".
+	Provider string `toml:"provider"`
+	// MaxDurationRaw is the hard upper bound on voice message duration as a Go duration string (e.g. "5m"); default 5m.
+	MaxDurationRaw string `toml:"max_duration"`
+	// MaxDuration is the parsed maximum duration value.
+	MaxDuration time.Duration `toml:"-"`
+	// Whisper holds whisper.cpp-specific settings.
+	Whisper WhisperConfig `toml:"whisper"`
+	// Yandex holds Yandex SpeechKit-specific settings.
+	Yandex YandexConfig `toml:"yandex"`
+}
+
 // Config is the root configuration structure for the application.
 type Config struct {
-	User      UserConfig       `toml:"user"`
-	AI        AIConfig         `toml:"ai"`
-	Channels  ChannelsConfig   `toml:"channels"`
-	History   HistoryConfig    `toml:"history"`
-	DateTime  DateTimeConfig   `toml:"datetime"`
-	Reminders *RemindersConfig `toml:"reminders"`
-	API       APIConfig        `toml:"api"`
-	Push      PushConfig       `toml:"push"`
-	Devices   DevicesConfig    `toml:"devices"`
+	User        UserConfig        `toml:"user"`
+	AI          AIConfig          `toml:"ai"`
+	Channels    ChannelsConfig    `toml:"channels"`
+	History     HistoryConfig     `toml:"history"`
+	DateTime    DateTimeConfig    `toml:"datetime"`
+	Reminders   *RemindersConfig  `toml:"reminders"`
+	API         APIConfig         `toml:"api"`
+	Push        PushConfig        `toml:"push"`
+	Devices     DevicesConfig     `toml:"devices"`
+	Transcriber TranscriberConfig `toml:"transcriber"`
 }
 
 var envVarPattern = regexp.MustCompile(`\$\{([^}]+)\}`)
@@ -400,6 +449,10 @@ func (c *Config) validate() error {
 	}
 
 	if err := c.validateDevices(); err != nil {
+		return err
+	}
+
+	if err := c.validateTranscriber(); err != nil {
 		return err
 	}
 
@@ -629,6 +682,90 @@ func (c *Config) validatePush() error {
 
 	if p.RetryMaxAttempts == 0 {
 		p.RetryMaxAttempts = 4
+	}
+
+	return nil
+}
+
+const defaultTranscriberMaxDuration = 5 * time.Minute
+const defaultWhisperTimeout = 60 * time.Second
+const defaultYandexTimeout = 30 * time.Second
+const defaultYandexLanguage = "ru-RU"
+const defaultYandexEndpoint = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+
+// validateTranscriber validates and normalizes the [transcriber] section.
+func (c *Config) validateTranscriber() error {
+	t := &c.Transcriber
+
+	switch t.Provider {
+	case "", "whisper", "yandex":
+		// valid
+	default:
+		return fmt.Errorf("transcriber.provider %q: allowed values: \"\", \"whisper\", \"yandex\"", t.Provider)
+	}
+
+	if t.MaxDurationRaw == "" {
+		t.MaxDuration = defaultTranscriberMaxDuration
+	} else {
+		d, err := time.ParseDuration(t.MaxDurationRaw)
+		if err != nil {
+			return fmt.Errorf("transcriber.max_duration %q: %w", t.MaxDurationRaw, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("transcriber.max_duration must be non-negative")
+		}
+		t.MaxDuration = d
+	}
+
+	if t.Provider == "whisper" {
+		if t.Whisper.Binary == "" {
+			return fmt.Errorf("transcriber.whisper.binary is required")
+		}
+		if t.Whisper.Model == "" {
+			return fmt.Errorf("transcriber.whisper.model is required")
+		}
+		if t.Whisper.Ffmpeg == "" {
+			t.Whisper.Ffmpeg = "ffmpeg"
+		}
+		if t.Whisper.TimeoutRaw == "" {
+			t.Whisper.Timeout = defaultWhisperTimeout
+		} else {
+			d, err := time.ParseDuration(t.Whisper.TimeoutRaw)
+			if err != nil {
+				return fmt.Errorf("transcriber.whisper.timeout %q: %w", t.Whisper.TimeoutRaw, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("transcriber.whisper.timeout must be positive, got %v", d)
+			}
+			t.Whisper.Timeout = d
+		}
+	}
+
+	if t.Provider == "yandex" {
+		if t.Yandex.APIKey == "" {
+			return fmt.Errorf("transcriber.yandex.api_key is required")
+		}
+		if t.Yandex.FolderID == "" {
+			return fmt.Errorf("transcriber.yandex.folder_id is required")
+		}
+		if t.Yandex.Language == "" {
+			t.Yandex.Language = defaultYandexLanguage
+		}
+		if t.Yandex.Endpoint == "" {
+			t.Yandex.Endpoint = defaultYandexEndpoint
+		}
+		if t.Yandex.TimeoutRaw == "" {
+			t.Yandex.Timeout = defaultYandexTimeout
+		} else {
+			d, err := time.ParseDuration(t.Yandex.TimeoutRaw)
+			if err != nil {
+				return fmt.Errorf("transcriber.yandex.timeout %q: %w", t.Yandex.TimeoutRaw, err)
+			}
+			if d <= 0 {
+				return fmt.Errorf("transcriber.yandex.timeout must be positive, got %v", d)
+			}
+			t.Yandex.Timeout = d
+		}
 	}
 
 	return nil
