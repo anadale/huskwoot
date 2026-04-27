@@ -29,6 +29,8 @@ tags:
     description: Real-time domain event stream via SSE.
   - name: sync
     description: Cold re-sync snapshot for clients that have fallen behind the retention window.
+  - name: datetime
+    description: Server date/time configuration for client preset resolution.
   - name: meta
     description: Service resources (OpenAPI specification).
 security:
@@ -47,6 +49,20 @@ paths:
             application/yaml:
               schema:
                 type: string
+  /v1/datetime/config:
+    get:
+      tags: [datetime]
+      summary: Get date/time configuration
+      description: Returns the server-side date/time configuration for client preset resolution.
+      responses:
+        "200":
+          description: Date/time configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DateTimeConfig"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /v1/me:
     get:
       tags: [me]
@@ -800,6 +816,48 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    DateTimeConfig:
+      type: object
+      required: [timezone, weekdays, timeOfDay, defaultTimeOfDay, nightCutoffMinutes]
+      properties:
+        timezone:
+          type: string
+          description: IANA timezone identifier (e.g. "Europe/Moscow").
+          example: Europe/Moscow
+        weekdays:
+          type: array
+          items:
+            type: string
+            enum: [mon, tue, wed, thu, fri, sat, sun]
+          description: Working days; remaining days are treated as weekends.
+        timeOfDay:
+          type: object
+          required: [morning, lunch, afternoon, evening]
+          properties:
+            morning:
+              type: string
+              pattern: "^[0-2][0-9]:[0-5][0-9]$"
+              example: "11:00"
+            lunch:
+              type: string
+              pattern: "^[0-2][0-9]:[0-5][0-9]$"
+              example: "12:00"
+            afternoon:
+              type: string
+              pattern: "^[0-2][0-9]:[0-5][0-9]$"
+              example: "14:00"
+            evening:
+              type: string
+              pattern: "^[0-2][0-9]:[0-5][0-9]$"
+              example: "20:00"
+        defaultTimeOfDay:
+          type: string
+          enum: [morning, lunch, afternoon, evening]
+          description: Default period used when no explicit time-of-day is specified.
+        nightCutoffMinutes:
+          type: integer
+          description: Minutes from midnight for the night-cutoff boundary; 0 means disabled.
+          example: 0
     Error:
       type: object
       required: [error]

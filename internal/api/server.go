@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/anadale/huskwoot/internal/config"
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/push"
 )
@@ -72,6 +73,8 @@ type Config struct {
 	// Relay is the push relay client for syncing registrations on patchMe and revoke.
 	// Defaults to NilRelayClient (push disabled) when nil.
 	Relay push.RelayClient
+	// DateTime holds date/time configuration served at GET /v1/datetime/config.
+	DateTime config.DateTimeConfig
 }
 
 // Server wraps http.Server and a chi router.
@@ -146,6 +149,7 @@ func (s *Server) routes() http.Handler {
 			}))
 
 			v1.Get("/me", s.getMe)
+			v1.Get("/datetime/config", s.getDateTimeConfig)
 
 			relay := s.cfg.Relay
 			if relay == nil {
