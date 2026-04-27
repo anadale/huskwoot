@@ -368,6 +368,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 				UserName:       cfg.User.UserName,
 				TelegramUserID: cfg.User.TelegramUserID,
 			},
+			DateTime: cfg.DateTime,
 		})
 		go func() {
 			if err := apiSrv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
