@@ -17,8 +17,22 @@ type TimeOfDay struct {
 
 // Config holds date-parsing parameters.
 type Config struct {
-	TimeOfDay TimeOfDay
-	Weekdays  []time.Weekday // empty = Mon..Fri; others are weekends
+	TimeOfDay          TimeOfDay
+	Weekdays           []time.Weekday // empty = Mon..Fri; others are weekends
+	NightCutoffMinutes int            // 0 = off; if now < cutoff, relative offsets ≥1 are shifted by -1
+}
+
+// shiftRelativeDayOffset adjusts a relative day offset by -1 when the night-cutoff
+// feature is active and the current time is before the cutoff.
+// offset=0 ("today") is never shifted. cutoff=0 disables the feature entirely.
+func shiftRelativeDayOffset(offset int, now time.Time, cfg Config) int {
+	if cfg.NightCutoffMinutes == 0 || offset < 1 {
+		return offset
+	}
+	if now.Hour()*60+now.Minute() < cfg.NightCutoffMinutes {
+		return offset - 1
+	}
+	return offset
 }
 
 // Dateparser parses deadline expressions using a language-aware module.

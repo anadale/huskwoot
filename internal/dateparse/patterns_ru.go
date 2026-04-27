@@ -129,7 +129,8 @@ func matchDayTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 
 	for _, d := range days {
 		if d.phrase != "" && lower == d.phrase {
-			t := time.Date(now.Year(), now.Month(), now.Day()+d.offset, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
+			offset := shiftRelativeDayOffset(d.offset, now, cfg)
+			t := time.Date(now.Year(), now.Month(), now.Day()+offset, cfg.TimeOfDay.Default, 0, 0, 0, now.Location())
 			return &t, true
 		}
 	}
@@ -147,11 +148,13 @@ func matchDayTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 			}
 
 			if tp.phrase == "к утру" && d.phrase == "" && now.Hour() >= cfg.TimeOfDay.Morning {
-				t := time.Date(now.Year(), now.Month(), now.Day()+1, cfg.TimeOfDay.Morning, 0, 0, 0, now.Location())
+				offset := shiftRelativeDayOffset(1, now, cfg)
+				t := time.Date(now.Year(), now.Month(), now.Day()+offset, cfg.TimeOfDay.Morning, 0, 0, 0, now.Location())
 				return &t, true
 			}
 
-			targetDay := time.Date(now.Year(), now.Month(), now.Day()+d.offset, 0, 0, 0, 0, now.Location())
+			offset := shiftRelativeDayOffset(d.offset, now, cfg)
+			targetDay := time.Date(now.Year(), now.Month(), now.Day()+offset, 0, 0, 0, 0, now.Location())
 
 			switch tp.marker {
 			case markerMorning:
@@ -260,7 +263,7 @@ func findNearestWeekday(now time.Time, target time.Weekday) time.Time {
 }
 
 // matchDayAtTime parses combinations of a day and an exact time.
-func matchDayAtTime(s string, now time.Time, _ Config) (*time.Time, bool) {
+func matchDayAtTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	dayPhrases := map[string]int{
@@ -279,6 +282,7 @@ func matchDayAtTime(s string, now time.Time, _ Config) (*time.Time, bool) {
 	if !ok {
 		return nil, false
 	}
+	dayOffset = shiftRelativeDayOffset(dayOffset, now, cfg)
 
 	hour, err := strconv.Atoi(matches[2])
 	if err != nil || hour < 0 || hour > 23 {
@@ -428,6 +432,16 @@ func matchWeekBoundary(s string, now time.Time, cfg Config) (*time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	switch lower {
+	case "до завтра":
+		offset := shiftRelativeDayOffset(1, now, cfg)
+		result := time.Date(now.Year(), now.Month(), now.Day()+offset, 23, 59, 59, 0, now.Location())
+		return &result, true
+
+	case "до послезавтра":
+		offset := shiftRelativeDayOffset(2, now, cfg)
+		result := time.Date(now.Year(), now.Month(), now.Day()+offset, 23, 59, 59, 0, now.Location())
+		return &result, true
+
 	case "до конца недели":
 		target := findNearestWeekday(now, time.Friday)
 		result := time.Date(target.Year(), target.Month(), target.Day(), 23, 59, 59, 0, now.Location())

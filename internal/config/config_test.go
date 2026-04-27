@@ -1597,6 +1597,57 @@ timeout = "45s"
 	}
 }
 
+func TestLoad_NightCutoff(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantMin int
+		wantErr bool
+	}{
+		{"empty string → 0 (off)", "", 0, false},
+		{"00:00 → 0 (off)", "00:00", 0, false},
+		{"05:00 → 300", "05:00", 300, false},
+		{"23:59 → 1439", "23:59", 1439, false},
+		{"single digit no colon → error", "5", 0, true},
+		{"05:60 out of range → error", "05:60", 0, true},
+		{"abc → error", "abc", 0, true},
+		{"24:00 out of range → error", "24:00", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := ""
+			if tc.value != "" {
+				extra = "\n[datetime]\nnight_cutoff = \"" + tc.value + "\"\n"
+			}
+			cfg, err := Load(writeConfig(t, validBase()+extra))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for night_cutoff=%q, got nil", tc.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success for night_cutoff=%q, got: %v", tc.value, err)
+			}
+			if cfg.DateTime.NightCutoffMinutes != tc.wantMin {
+				t.Errorf("NightCutoffMinutes = %d, want %d", cfg.DateTime.NightCutoffMinutes, tc.wantMin)
+			}
+		})
+	}
+
+	// Explicit night_cutoff = "" in the TOML (distinct from missing field — exercises the "" branch in validate).
+	t.Run("explicit empty string in toml → 0 (off)", func(t *testing.T) {
+		extra := "\n[datetime]\nnight_cutoff = \"\"\n"
+		cfg, err := Load(writeConfig(t, validBase()+extra))
+		if err != nil {
+			t.Fatalf("expected success for night_cutoff=\"\", got: %v", err)
+		}
+		if cfg.DateTime.NightCutoffMinutes != 0 {
+			t.Errorf("NightCutoffMinutes = %d, want 0", cfg.DateTime.NightCutoffMinutes)
+		}
+	})
+}
+
 func TestLoad_UserLanguage(t *testing.T) {
 	cases := []struct {
 		name     string

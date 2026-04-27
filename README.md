@@ -219,6 +219,7 @@ History provides conversational context to the extraction model — surrounding 
 [datetime]
 timezone = "Europe/Moscow"                      # IANA timezone (default: system local)
 weekdays = ["mon", "tue", "wed", "thu", "fri"]  # working days; others are treated as weekends
+# night_cutoff = "05:00"                         # see below
 
 [datetime.time_of_day]
 morning   = 11   # used for natural-language deadlines like "by morning"
@@ -227,6 +228,15 @@ afternoon = 14
 evening   = 20
 default   = "evening"  # hour applied when a date is given without an explicit time (e.g. "tomorrow", "on Monday"); does not affect "until …" deadline expressions
 ```
+
+**`night_cutoff`** — опциональная настройка для ночных пользователей. Если вы часто работаете ночью и говорите боту «завтра» в 02:00, имея в виду текущий календарный день (до сна), включите эту опцию:
+
+```toml
+[datetime]
+night_cutoff = "05:00"  # до 05:00 «завтра» означает «сегодня», «послезавтра» — «завтра»
+```
+
+До указанного времени (граница строгая: в `05:00:00` сдвиг уже **не работает**) слова «завтра»/«tomorrow» и «послезавтра»/«day after tomorrow» сдвигаются на −1 день; дедлайн-выражения «до завтра» и «до послезавтра» сдвигаются так же. Слово «сегодня»/«today» всегда остаётся буквальным — текущим календарным днём. Остальные конструкции (дни недели, «через N дней», конкретные даты) не затрагиваются. Значение `""` или `"00:00"` отключает функцию (поведение по умолчанию).
 
 ---
 

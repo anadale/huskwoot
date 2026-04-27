@@ -74,6 +74,8 @@ ttl = "24h"
 [datetime]
 # timezone = "Europe/Moscow"                      # optional: IANA timezone identifier (defaults to local)
 # weekdays = ["mon", "tue", "wed", "thu", "fri"]  # optional: working days (default mon–fri); others are treated as weekends
+# night_cutoff = "05:00"  # opt-in: before this time, "tomorrow"/"послезавтра" shift back by one day (e.g. at 02:00 "tomorrow" means today).
+#                         # "today"/"сегодня" is always the current calendar day (asymmetric). "" or "00:00" = off (default).
 
 # Hours for various parts of the day (defaults: 11, 12, 14, 20)
 [datetime.time_of_day]

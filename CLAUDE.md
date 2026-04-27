@@ -164,6 +164,7 @@ TOML file `config.toml` in configDir. `${ENV_VAR}` placeholders are expanded on 
 [datetime]
 timezone = "Europe/Moscow"
 weekdays = ["mon", "tue", "wed", "thu", "fri"]
+night_cutoff = "05:00"  # optional: before this time, "tomorrow"→today, "day after tomorrow"→tomorrow, "до завтра"/"до послезавтра" shifted too; "today" is always literal (not shifted); "" or "00:00" = off (default)
 
 [datetime.time_of_day]
 morning = 11; lunch = 12; afternoon = 14; evening = 20

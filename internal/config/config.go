@@ -130,6 +130,13 @@ type DateTimeConfig struct {
 	Weekdays []string `toml:"weekdays"`
 	// TimeOfDay is the nested table with hours for various periods of the day.
 	TimeOfDay TimeOfDayConfig `toml:"time_of_day"`
+	// NightCutoff is the opt-in shift boundary in "HH:MM" format (e.g. "05:00").
+	// When current time is before this boundary, relative day words like "tomorrow"
+	// are shifted back by one calendar day (asymmetric: "today" is never shifted).
+	// Empty string or "00:00" means the feature is disabled (default).
+	NightCutoff string `toml:"night_cutoff"`
+	// NightCutoffMinutes is the parsed boundary in minutes since midnight; 0 = off.
+	NightCutoffMinutes int `toml:"-"`
 }
 
 // ReminderSchedule describes named digest schedule slots.
@@ -425,6 +432,16 @@ func (c *Config) validate() error {
 		// valid
 	default:
 		return fmt.Errorf("invalid datetime.time_of_day.default: %q (expected one of: morning, lunch, afternoon, evening)", c.DateTime.TimeOfDay.Default)
+	}
+
+	if nc := c.DateTime.NightCutoff; nc == "" || nc == "00:00" {
+		c.DateTime.NightCutoffMinutes = 0
+	} else {
+		h, m, err := parseHHMM(nc)
+		if err != nil {
+			return fmt.Errorf("invalid datetime.night_cutoff %q: %w", nc, err)
+		}
+		c.DateTime.NightCutoffMinutes = h*60 + m
 	}
 
 	switch c.User.Language {

@@ -1574,6 +1574,105 @@ func TestParse_ExplicitDate(t *testing.T) {
 	}
 }
 
+func TestShiftRelativeDayOffset(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		t.Fatalf("failed to load Europe/Moscow: %v", err)
+	}
+
+	// Mon 2026-04-27 02:00 MSK — used for "before cutoff" cases
+	nightNow := time.Date(2026, 4, 27, 2, 0, 0, 0, loc)
+	// Mon 2026-04-27 06:00 MSK — used for "after/at cutoff" cases
+	dayNow := time.Date(2026, 4, 27, 6, 0, 0, 0, loc)
+	// Mon 2026-04-27 05:00:00 MSK — exactly at cutoff boundary
+	exactNow := time.Date(2026, 4, 27, 5, 0, 0, 0, loc)
+
+	tests := []struct {
+		name   string
+		offset int
+		now    time.Time
+		cutoff int // NightCutoffMinutes
+		want   int
+	}{
+		// cutoff disabled
+		{"cutoff=0 offset=0", 0, nightNow, 0, 0},
+		{"cutoff=0 offset=1", 1, nightNow, 0, 1},
+		{"cutoff=0 offset=2", 2, nightNow, 0, 2},
+
+		// offset=0 (today) is never shifted regardless of cutoff
+		{"offset=0 not shifted even before cutoff", 0, nightNow, 300, 0},
+
+		// offset<0 also not shifted
+		{"offset=-1 not shifted", -1, nightNow, 300, -1},
+
+		// now < cutoff → shift offset ≥1 by -1
+		{"now=02:00 cutoff=300 offset=1 → 0", 1, nightNow, 300, 0},
+		{"now=02:00 cutoff=300 offset=2 → 1", 2, nightNow, 300, 1},
+
+		// now exactly at cutoff → no shift (strict less-than)
+		{"now=05:00 cutoff=300 offset=1 → 1 (no shift)", 1, exactNow, 300, 1},
+		{"now=05:00 cutoff=300 offset=2 → 2 (no shift)", 2, exactNow, 300, 2},
+
+		// now > cutoff → no shift
+		{"now=06:00 cutoff=300 offset=1 → 1 (no shift)", 1, dayNow, 300, 1},
+		{"now=06:00 cutoff=300 offset=2 → 2 (no shift)", 2, dayNow, 300, 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{NightCutoffMinutes: tt.cutoff}
+			got := shiftRelativeDayOffset(tt.offset, tt.now, cfg)
+			if got != tt.want {
+				t.Errorf("shiftRelativeDayOffset(%d, %v, cutoff=%d) = %d, want %d",
+					tt.offset, tt.now, tt.cutoff, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse_NightCutoff_Integration(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		t.Fatalf("failed to load Europe/Moscow: %v", err)
+	}
+
+	cfg := Config{
+		TimeOfDay:          TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20},
+		NightCutoffMinutes: 300, // 05:00
+	}
+
+	tests := []struct {
+		name      string
+		nowHour   int
+		input     string
+		wantDay   int // expected day of month
+		wantMonth time.Month
+	}{
+		// Mon 2026-04-27 02:00 MSK — before cutoff: "завтра" shifts back to today
+		{"завтра at 02:00 with cutoff=05:00 → today (Apr 27)", 2, "завтра", 27, time.April},
+		// "сегодня" must always remain today regardless of cutoff
+		{"сегодня at 02:00 with cutoff=05:00 → today literal", 2, "сегодня", 27, time.April},
+		// At 06:00 (after cutoff): "завтра" stays tomorrow
+		{"завтра at 06:00 with cutoff=05:00 → tomorrow (Apr 28)", 6, "завтра", 28, time.April},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Date(2026, 4, 27, tt.nowHour, 0, 0, 0, loc)
+			result, err := Parse(tt.input, now, cfg)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result == nil {
+				t.Fatalf("want time, got nil")
+			}
+			if result.Day() != tt.wantDay || result.Month() != tt.wantMonth {
+				t.Errorf("want %s %d, got %v", tt.wantMonth, tt.wantDay, *result)
+			}
+		})
+	}
+}
+
 func TestParse_DayOfMonth_SkipsMonthWithoutDay(t *testing.T) {
 	// Edge case: now is Jan 31 after 23:59:59 — "until the 31st" must resolve to March 31,
 	// not February (which has no 31st — Go normalises it to March 3).

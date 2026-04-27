@@ -314,6 +314,74 @@ func TestParse_DefaultTimeOfDay_EN(t *testing.T) {
 	}
 }
 
+func TestEnglishDateLanguage_NightCutoff(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Moscow")
+	if err != nil {
+		t.Fatalf("failed to load Europe/Moscow: %v", err)
+	}
+	lang := NewDateLanguage("en")
+	cfgCutoff := Config{
+		TimeOfDay:          TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20},
+		NightCutoffMinutes: 300, // 05:00
+	}
+	cfgNoCutoff := Config{
+		TimeOfDay: TimeOfDay{Morning: 11, Lunch: 12, Afternoon: 14, Evening: 20, Default: 20},
+	}
+
+	// now = Monday 2026-04-13 02:00 — before cutoff
+	nowBefore := time.Date(2026, 4, 13, 2, 0, 0, 0, loc)
+	// now = Monday 2026-04-13 04:59 — still before cutoff
+	nowBefore459 := time.Date(2026, 4, 13, 4, 59, 0, 0, loc)
+	// now = Monday 2026-04-13 05:00 — exactly at cutoff, no shift
+	nowAt := time.Date(2026, 4, 13, 5, 0, 0, 0, loc)
+	// now = Monday 2026-04-13 06:00 — after cutoff
+	nowAfter := time.Date(2026, 4, 13, 6, 0, 0, 0, loc)
+
+	tests := []struct {
+		name  string
+		now   time.Time
+		cfg   Config
+		input string
+		want  time.Time
+	}{
+		// before cutoff, with cutoff enabled: tomorrow → same calendar day (Monday)
+		{"tomorrow before cutoff", nowBefore, cfgCutoff, "tomorrow", time.Date(2026, 4, 13, 20, 0, 0, 0, loc)},
+		// day after tomorrow → next calendar day (Tuesday)
+		{"day after tomorrow before cutoff", nowBefore, cfgCutoff, "day after tomorrow", time.Date(2026, 4, 14, 20, 0, 0, 0, loc)},
+		// today is always literal (offset=0, never shifted)
+		{"today literal", nowBefore, cfgCutoff, "today", time.Date(2026, 4, 13, 20, 0, 0, 0, loc)},
+		// tomorrow morning → same calendar day, morning hour
+		{"tomorrow morning before cutoff", nowBefore, cfgCutoff, "tomorrow morning", time.Date(2026, 4, 13, 11, 0, 0, 0, loc)},
+		// tomorrow at 14:00 → same calendar day 14:00
+		{"tomorrow at 14:00 before cutoff", nowBefore, cfgCutoff, "tomorrow at 14:00", time.Date(2026, 4, 13, 14, 0, 0, 0, loc)},
+		// day after tomorrow morning → Tuesday morning
+		{"day after tomorrow morning before cutoff", nowBefore, cfgCutoff, "the day after tomorrow morning", time.Date(2026, 4, 14, 11, 0, 0, 0, loc)},
+		// 04:59: still shifted
+		{"tomorrow at 04:59", nowBefore459, cfgCutoff, "tomorrow", time.Date(2026, 4, 13, 20, 0, 0, 0, loc)},
+		// exactly at cutoff: no shift
+		{"tomorrow at 05:00 exact", nowAt, cfgCutoff, "tomorrow", time.Date(2026, 4, 14, 20, 0, 0, 0, loc)},
+		// after cutoff: no shift
+		{"tomorrow after cutoff", nowAfter, cfgCutoff, "tomorrow", time.Date(2026, 4, 14, 20, 0, 0, 0, loc)},
+		// regression: cutoff=0 → no shift
+		{"tomorrow no cutoff", nowBefore, cfgNoCutoff, "tomorrow", time.Date(2026, 4, 14, 20, 0, 0, 0, loc)},
+		{"day after tomorrow no cutoff", nowBefore, cfgNoCutoff, "day after tomorrow", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"today no cutoff", nowBefore, cfgNoCutoff, "today", time.Date(2026, 4, 13, 20, 0, 0, 0, loc)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := lang.Parse(tt.input, tt.now, tt.cfg)
+			if !ok {
+				t.Fatalf("expected match for %q, got none", tt.input)
+			}
+			if got.Year() != tt.want.Year() || got.Month() != tt.want.Month() || got.Day() != tt.want.Day() ||
+				got.Hour() != tt.want.Hour() || got.Minute() != tt.want.Minute() {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEnglishDateLanguage_DeadlineTimesUnchanged(t *testing.T) {
 	now := testNow(t)
 	lang := NewDateLanguage("en")

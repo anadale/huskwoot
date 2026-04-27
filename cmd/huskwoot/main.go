@@ -131,7 +131,8 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 			Evening:   cfg.DateTime.TimeOfDay.Evening,
 			Default:   resolveDefaultHour(cfg.DateTime.TimeOfDay),
 		},
-		Weekdays: weekdays,
+		Weekdays:           weekdays,
+		NightCutoffMinutes: cfg.DateTime.NightCutoffMinutes,
 	}
 	dateLang := dateparse.NewDateLanguage(cfg.User.Language)
 	dp := dateparse.New(dateTimeCfg, dateLang)

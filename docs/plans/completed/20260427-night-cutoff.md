@@ -125,10 +125,10 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `internal/dateparse/dateparse.go`
 - Modify: `internal/dateparse/dateparse_test.go` (или создать новый `shift_test.go`, если файла нет — на этапе имплементации проверить и решить)
 
-- [ ] добавить поле `NightCutoffMinutes int` в `dateparse.Config`
-- [ ] реализовать хелпер `shiftRelativeDayOffset(offset int, now time.Time, cfg Config) int` со строгой границей `<`
-- [ ] написать table-driven тесты на хелпер: `cutoff=0`, `offset=0`, `now < cutoff & offset≥1`, `now == cutoff`, `now > cutoff`, `cutoff=5:00 & offset=2`
-- [ ] запустить `go test ./internal/dateparse/...` — должны пройти
+- [x] добавить поле `NightCutoffMinutes int` в `dateparse.Config`
+- [x] реализовать хелпер `shiftRelativeDayOffset(offset int, now time.Time, cfg Config) int` со строгой границей `<`
+- [x] написать table-driven тесты на хелпер: `cutoff=0`, `offset=0`, `now < cutoff & offset≥1`, `now == cutoff`, `now > cutoff`, `cutoff=5:00 & offset=2`
+- [x] запустить `go test ./internal/dateparse/...` — должны пройти
 
 ### Task 2: Wire helper into Russian patterns
 
@@ -136,12 +136,12 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `internal/dateparse/patterns_ru.go`
 - Modify: `internal/dateparse/patterns_ru_test.go`
 
-- [ ] вызвать `shiftRelativeDayOffset` для офсета `d.offset` в простой ветке `if d.phrase != "" && lower == d.phrase` (~line 130)
-- [ ] вызвать для офсета в комбинированной ветке «завтра утром»/«послезавтра ночью» (~line 137)
-- [ ] вызвать для офсета в таблице `<слово> в HH:MM` (~line 267)
-- [ ] добавить table-driven тесты: 02:00 пн c cutoff=300 → «завтра»→пн, «послезавтра»→вт, «сегодня»→пн (literal); «завтра в 14:00»→пн 14:00; «послезавтра утром»→вт+morning; 06:00→без сдвига; 04:59→сдвиг; 05:00→без сдвига; cutoff=0 (regression) — без сдвига
-- [ ] добавить тест на «до завтра» с cutoff: подтвердить, что deadline-выражение тоже сдвигается (desired)
-- [ ] запустить `go test ./internal/dateparse/...` — должны пройти
+- [x] вызвать `shiftRelativeDayOffset` для офсета `d.offset` в простой ветке `if d.phrase != "" && lower == d.phrase` (~line 130)
+- [x] вызвать для офсета в комбинированной ветке «завтра утром»/«послезавтра ночью» (~line 137)
+- [x] вызвать для офсета в таблице `<слово> в HH:MM` (~line 267)
+- [x] добавить table-driven тесты: 02:00 пн c cutoff=300 → «завтра»→пн, «послезавтра»→вт, «сегодня»→пн (literal); «завтра в 14:00»→пн 14:00; «послезавтра утром»→вт+morning; 06:00→без сдвига; 04:59→сдвиг; 05:00→без сдвига; cutoff=0 (regression) — без сдвига
+- [x] добавить тест на «до завтра» с cutoff: подтвердить, что deadline-выражение тоже сдвигается (desired)
+- [x] запустить `go test ./internal/dateparse/...` — должны пройти
 
 ### Task 3: Wire helper into English patterns
 
@@ -149,9 +149,9 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `internal/dateparse/patterns_en.go`
 - Modify: `internal/dateparse/patterns_en_test.go`
 
-- [ ] вызвать `shiftRelativeDayOffset` в аналогичных местах en-патернов (`today/tomorrow/day after tomorrow` и комбинации с временем суток ~line 93-106; таблица `<word> at HH:MM` ~line 127)
-- [ ] добавить зеркальные table-driven тесты: 02:00 c cutoff=300 → "tomorrow"→today (calendar), "day after tomorrow"→tomorrow (calendar), "today"→literal; "tomorrow at 14:00"→pn 14:00; "tomorrow morning"→same-day morning; cutoff=0 regression
-- [ ] запустить `go test ./internal/dateparse/...` — должны пройти
+- [x] вызвать `shiftRelativeDayOffset` в аналогичных местах en-патернов (`today/tomorrow/day after tomorrow` и комбинации с временем суток ~line 93-106; таблица `<word> at HH:MM` ~line 127)
+- [x] добавить зеркальные table-driven тесты: 02:00 c cutoff=300 → "tomorrow"→today (calendar), "day after tomorrow"→tomorrow (calendar), "today"→literal; "tomorrow at 14:00"→pn 14:00; "tomorrow morning"→same-day morning; cutoff=0 regression
+- [x] запустить `go test ./internal/dateparse/...` — должны пройти
 
 ### Task 4: Add night_cutoff to config loading + validation
 
@@ -159,10 +159,10 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `internal/config/config.go`
 - Modify: `internal/config/config_test.go`
 
-- [ ] добавить поля `NightCutoff string` и `NightCutoffMinutes int` (`toml:"-"`) в `DateTimeConfig`
-- [ ] в `applyDefaults` (или в фазе валидации, по аналогии с `TimeOfDay.Default`): пустая строка / `"00:00"` → `NightCutoffMinutes = 0`; парсить `"HH:MM"` через хелпер `parseHHMM` (создать или reuse, если есть для reminders schedule); невалидный формат → ошибка `invalid datetime.night_cutoff: %q`
-- [ ] добавить table-driven тесты: `""` → 0, `"00:00"` → 0, `"05:00"` → 300, `"23:59"` → 1439, `"5"` → ошибка, `"05:60"` → ошибка, `"abc"` → ошибка, `"24:00"` → ошибка
-- [ ] запустить `go test ./internal/config/...` — должны пройти
+- [x] добавить поля `NightCutoff string` и `NightCutoffMinutes int` (`toml:"-"`) в `DateTimeConfig`
+- [x] в `applyDefaults` (или в фазе валидации, по аналогии с `TimeOfDay.Default`): пустая строка / `"00:00"` → `NightCutoffMinutes = 0`; парсить `"HH:MM"` через хелпер `parseHHMM` (создать или reuse, если есть для reminders schedule); невалидный формат → ошибка `invalid datetime.night_cutoff: %q`
+- [x] добавить table-driven тесты: `""` → 0, `"00:00"` → 0, `"05:00"` → 300, `"23:59"` → 1439, `"5"` → ошибка, `"05:60"` → ошибка, `"abc"` → ошибка, `"24:00"` → ошибка
+- [x] запустить `go test ./internal/config/...` — должны пройти
 
 ### Task 5: Bridge config → dateparse and verify end-to-end
 
@@ -170,29 +170,29 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `cmd/huskwoot/main.go` (или другое место, где собирается `dateparse.Config` из `config.DateTimeConfig` — найти grep'ом `dateparse.Config{`)
 - При необходимости modify: `internal/dateparse/dateparse_test.go` (интеграционный тест)
 
-- [ ] grep по `dateparse.Config{` — определить точку сборки и пробросить `NightCutoffMinutes: cfg.DateTime.NightCutoffMinutes`
-- [ ] добавить интеграционный тест в `dateparse_test.go`: загрузить минимальный конфиг с `night_cutoff = "05:00"`, парсить «завтра» с фиксированным `now=02:00` и проверить, что вернулась дата текущего календарного дня
-- [ ] запустить `go test ./...` — все пакеты должны быть зелёными
-- [ ] запустить `go vet ./...` — без замечаний
+- [x] grep по `dateparse.Config{` — определить точку сборки и пробросить `NightCutoffMinutes: cfg.DateTime.NightCutoffMinutes`
+- [x] добавить интеграционный тест в `dateparse_test.go`: загрузить минимальный конфиг с `night_cutoff = "05:00"`, парсить «завтра» с фиксированным `now=02:00` и проверить, что вернулась дата текущего календарного дня
+- [x] запустить `go test ./...` — все пакеты должны быть зелёными
+- [x] запустить `go vet ./...` — без замечаний
 
 ### Task 6: Update example config
 
 **Files:**
 - Modify: `config.example.toml`
 
-- [ ] добавить в секцию `[datetime]` (~line 76, после `weekdays`) закомментированную строку `# night_cutoff = "05:00"` с английским пояснением: семантика, asymmetric behavior с `today`, что `""`/`"00:00"` = off
-- [ ] убедиться, что комментарий на английском, без эмоджи
-- [ ] (тесты не требуются для example-файла)
+- [x] добавить в секцию `[datetime]` (~line 76, после `weekdays`) закомментированную строку `# night_cutoff = "05:00"` с английским пояснением: семантика, asymmetric behavior с `today`, что `""`/`"00:00"` = off
+- [x] убедиться, что комментарий на английском, без эмоджи
+- [x] (тесты не требуются для example-файла)
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] verify: 02:00 пн с `night_cutoff="05:00"` — «завтра»/«tomorrow» → пн (текущий календарный)
-- [ ] verify: 02:00 пн с `night_cutoff="05:00"` — «сегодня»/«today» → пн (literal, не меняется)
-- [ ] verify: 06:00 пн — без сдвига (cutoff не сработал)
-- [ ] verify: `night_cutoff=""` (default) — поведение всех существующих тестов не изменилось
-- [ ] verify: невалидный `night_cutoff` — ошибка загрузки конфига
-- [ ] run full test suite: `go test ./...`
-- [ ] run `go vet ./...`
+- [x] verify: 02:00 пн с `night_cutoff="05:00"` — «завтра»/«tomorrow» → пн (текущий календарный)
+- [x] verify: 02:00 пн с `night_cutoff="05:00"` — «сегодня»/«today» → пн (literal, не меняется)
+- [x] verify: 06:00 пн — без сдвига (cutoff не сработал)
+- [x] verify: `night_cutoff=""` (default) — поведение всех существующих тестов не изменилось
+- [x] verify: невалидный `night_cutoff` — ошибка загрузки конфига
+- [x] run full test suite: `go test ./...`
+- [x] run `go vet ./...`
 
 ### Task 8: [Final] Update documentation
 
@@ -200,9 +200,9 @@ config.toml → config.Load → applyDefaults (parseHHMM → NightCutoffMinutes 
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] в `README.md` (datetime-секция) добавить короткий абзац про `night_cutoff` с примером ночного сценария — на русском, как и остальной README
-- [ ] в `CLAUDE.md` (блок `[datetime]`) добавить строку про `night_cutoff` параллельно с `time_of_day.default`, явно указав, что «сегодня»/«today» не сдвигается
-- [ ] переместить этот план в `docs/plans/completed/` (создать директорию при необходимости — она уже существует)
+- [x] в `README.md` (datetime-секция) добавить короткий абзац про `night_cutoff` с примером ночного сценария — на русском, как и остальной README
+- [x] в `CLAUDE.md` (блок `[datetime]`) добавить строку про `night_cutoff` параллельно с `time_of_day.default`, явно указав, что «сегодня»/«today» не сдвигается
+- [x] переместить этот план в `docs/plans/completed/` (создать директорию при необходимости — она уже существует)
 
 ## Post-Completion
 

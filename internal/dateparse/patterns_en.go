@@ -16,7 +16,7 @@ func (e *englishDateLanguage) Parse(expr string, now time.Time, cfg Config) (tim
 	if t, ok := matchEnDayTime(expr, now, cfg); ok {
 		return t, true
 	}
-	if t, ok := matchEnDayAtTime(expr, now); ok {
+	if t, ok := matchEnDayAtTime(expr, now, cfg); ok {
 		return t, true
 	}
 	if t, ok := matchEnWeekdayAtTime(expr, now); ok {
@@ -112,7 +112,8 @@ func matchEnDayTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 			if e.hour >= 0 {
 				hour = e.hour
 			}
-			t := time.Date(now.Year(), now.Month(), now.Day()+e.dayOff, hour, 0, 0, 0, now.Location())
+			dayOff := shiftRelativeDayOffset(e.dayOff, now, cfg)
+			t := time.Date(now.Year(), now.Month(), now.Day()+dayOff, hour, 0, 0, 0, now.Location())
 			return t, true
 		}
 	}
@@ -120,7 +121,7 @@ func matchEnDayTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-func matchEnDayAtTime(s string, now time.Time) (time.Time, bool) {
+func matchEnDayAtTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 	lower := strings.ToLower(strings.TrimSpace(s))
 
 	dayPhrases := map[string]int{
@@ -136,6 +137,7 @@ func matchEnDayAtTime(s string, now time.Time) (time.Time, bool) {
 	}
 
 	dayOffset := dayPhrases[matches[1]]
+	dayOffset = shiftRelativeDayOffset(dayOffset, now, cfg)
 	hour, err := strconv.Atoi(matches[2])
 	if err != nil || hour < 0 || hour > 23 {
 		return time.Time{}, false
