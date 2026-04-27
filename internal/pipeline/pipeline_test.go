@@ -1269,6 +1269,36 @@ func TestProcess_ClassPromise_ReactPendingThenDone(t *testing.T) {
 	}
 }
 
+func TestProcess_ClassPromise_NoTasksExtracted_ReactCleared(t *testing.T) {
+	classifier := &mockClassifier{class: model.ClassPromise}
+	extractor := &mockExtractor{tasks: nil}
+	taskSvc := &mockTaskService{}
+	tracker := &reactTracker{}
+
+	cfg := testConfig()
+	cfg.Classifiers = groupClassifiers(classifier)
+	cfg.Extractors = groupExtractors(extractor)
+	cfg.Tasks = taskSvc
+	p := New(cfg)
+
+	msg := testGroupMsg("owner-123")
+	msg.ReactFn = tracker.fn
+
+	if err := p.Process(context.Background(), msg); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	if len(tracker.emojis) != 2 {
+		t.Fatalf("want 2 ReactFn calls, got %d: %v", len(tracker.emojis), tracker.emojis)
+	}
+	if tracker.emojis[0] != "✍️" {
+		t.Errorf("first reaction = %q, want %q", tracker.emojis[0], "✍️")
+	}
+	if tracker.emojis[1] != "" {
+		t.Errorf("second reaction = %q, want empty (cleared) when no tasks extracted", tracker.emojis[1])
+	}
+}
+
 func TestProcess_ClassPromise_ExtractorError_ReactDoneNotCalled(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{err: errors.New("ошибка экстрактора")}

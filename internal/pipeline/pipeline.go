@@ -106,10 +106,15 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 		p.logger.InfoContext(ctx, "message classified as promise",
 			"msg_id", msg.ID, "preview", textPreview(msg.Text, 80))
 		p.reactPending(ctx, msg)
-		if err := p.processPromise(ctx, msg); err != nil {
+		created, err := p.processPromise(ctx, msg)
+		if err != nil {
 			return err
 		}
-		p.reactDone(ctx, msg)
+		if created {
+			p.reactDone(ctx, msg)
+		} else {
+			p.reactClear(ctx, msg)
+		}
 		return nil
 	default:
 		p.logger.WarnContext(ctx, "unknown classification", "class", class, "msg_id", msg.ID)
@@ -152,12 +157,13 @@ func (p *Pipeline) processChat(ctx context.Context, msg model.Message) error {
 
 // processPromise handles a promise message:
 // extracts tasks, saves via TaskService, dispatches to notifiers.
-func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) error {
+// Returns true when at least one task was extracted (regardless of persistence outcome).
+func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool, error) {
 	extractor := p.extractors[msg.Kind]
 	if extractor == nil {
 		p.logger.WarnContext(ctx, "no extractor found for message kind",
 			"kind", msg.Kind, "msg_id", msg.ID)
-		return nil
+		return false, nil
 	}
 
 	var history []model.HistoryEntry
@@ -171,11 +177,11 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) error 
 
 	extracted, err := extractor.Extract(ctx, msg, history)
 	if err != nil {
-		return fmt.Errorf("extracting task: %w", err)
+		return false, fmt.Errorf("extracting task: %w", err)
 	}
 	if len(extracted) == 0 {
 		p.logger.InfoContext(ctx, "no tasks extracted: low model confidence", "msg_id", msg.ID)
-		return nil
+		return false, nil
 	}
 
 	projectID := ""
@@ -223,7 +229,7 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) error 
 	}
 
 	p.dispatchNotifiers(ctx, tasksToNotify)
-	return nil
+	return true, nil
 }
 
 func (p *Pipeline) reactPending(ctx context.Context, msg model.Message) {
@@ -241,6 +247,17 @@ func (p *Pipeline) reactDone(ctx context.Context, msg model.Message) {
 	}
 	if err := msg.ReactFn(ctx, "👍"); err != nil {
 		p.logger.WarnContext(ctx, "error setting done reaction", "msg_id", msg.ID, "error", err)
+	}
+}
+
+// reactClear removes the pending reaction without leaving a success marker.
+// Used when a message was classified as a promise but no actionable task was extracted.
+func (p *Pipeline) reactClear(ctx context.Context, msg model.Message) {
+	if msg.ReactFn == nil {
+		return
+	}
+	if err := msg.ReactFn(ctx, ""); err != nil {
+		p.logger.WarnContext(ctx, "error clearing reaction", "msg_id", msg.ID, "error", err)
 	}
 }
 
