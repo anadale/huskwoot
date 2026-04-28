@@ -106,5 +106,11 @@
   "voice.disabled": "Voice transcription is not configured",
   "voice.error": "Failed to transcribe voice, please try again",
   "voice.empty": "Couldn't make out the voice, please repeat",
-  "voice.too_long": "Voice message is too long (limit {{.Limit}})"
+  "voice.too_long": "Voice message is too long (limit {{.Limit}})",
+  "forward.extracted_tasks": {
+    "one": "Extracted {{.Count}} task to project «{{.Project}}»:\n{{.Tasks}}",
+    "other": "Extracted {{.Count}} tasks to project «{{.Project}}»:\n{{.Tasks}}"
+  },
+  "forward.no_promises_found": "No promises from you found in this conversation, messages left intact",
+  "forward.project_not_found": "Project «{{.Hint}}» not found, tasks placed in Inbox"
 }

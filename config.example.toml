@@ -43,6 +43,11 @@ on_join = "monitor"
 # reaction_enabled = true             # add ✍️ reaction to message when a promise is detected
 # confirm_timeout = "1m"              # confirmation timeout when bot is added to a group (0 — guard disabled)
 # welcome_message = "Hi! Reply to this message or add a reaction to confirm."
+# Forward-batch: extract promises you made in 1:1 Telegram chats.
+# Forward messages from a 1:1 chat to this DM bot; it accumulates them and processes
+# after a silence timeout or when you send any non-forward message (trigger).
+# forward_batch_timeout = "10s"         # silence timeout for auto-processing; empty or "0s" disables the feature
+# delete_forwards_after_extract = false # delete forwarded messages + trigger from DM after successful extraction
 
 # IMAP: mailbox monitoring (multiple [[channels.imap]] sections are supported)
 [[channels.imap]]

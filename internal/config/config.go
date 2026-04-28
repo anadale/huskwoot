@@ -61,6 +61,14 @@ type TelegramWatcherConfig struct {
 	ConfirmTimeoutRaw string `toml:"confirm_timeout"`
 	// ConfirmTimeout is the parsed confirmation timeout value.
 	ConfirmTimeout time.Duration `toml:"-"`
+	// ForwardBatchTimeoutRaw is the silence timeout after the last forward before automatic batch
+	// processing is triggered. A Go duration string (e.g. "10s"). Empty or "0s" disables the feature.
+	ForwardBatchTimeoutRaw string `toml:"forward_batch_timeout"`
+	// ForwardBatchTimeout is the parsed timeout value. Zero means the feature is disabled.
+	ForwardBatchTimeout time.Duration `toml:"-"`
+	// DeleteForwardsAfterExtract controls whether the bot deletes forwarded messages and the
+	// trigger message from the DM after successful task extraction.
+	DeleteForwardsAfterExtract bool `toml:"delete_forwards_after_extract"`
 }
 
 // IMAPConfig describes a single IMAP connection.
@@ -372,6 +380,17 @@ func (c *Config) validate() error {
 				return fmt.Errorf("channels.telegram.confirm_timeout cannot be negative")
 			}
 			c.Channels.Telegram.ConfirmTimeout = d
+		}
+
+		if tg.ForwardBatchTimeoutRaw != "" {
+			d, err := time.ParseDuration(tg.ForwardBatchTimeoutRaw)
+			if err != nil {
+				return fmt.Errorf("channels.telegram.forward_batch_timeout: invalid format %q: %w", tg.ForwardBatchTimeoutRaw, err)
+			}
+			if d < 0 {
+				return fmt.Errorf("channels.telegram.forward_batch_timeout cannot be negative")
+			}
+			c.Channels.Telegram.ForwardBatchTimeout = d
 		}
 	}
 

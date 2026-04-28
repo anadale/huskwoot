@@ -88,6 +88,117 @@ func NewTaskExtractor(client Completer, cfg ExtractorConfig) (*TaskExtractor, er
 	}, nil
 }
 
+// ForwardTaskExtractor extracts promises made to a counterpart from a formatted 1:1 conversation batch.
+type ForwardTaskExtractor struct {
+	client     Completer
+	systemTmpl *template.Template
+	userTmpl   *template.Template
+	dateparser *dateparse.Dateparser
+	now        func() time.Time
+	threshold  float64
+}
+
+// NewForwardExtractor creates a ForwardTaskExtractor with the forward-specific system prompt.
+// Uses default confidence threshold (0.5) and time.Now for deadline calculation.
+func NewForwardExtractor(client Completer, lang string, dpCfg dateparse.Config) (*ForwardTaskExtractor, error) {
+	if lang == "" {
+		lang = "ru"
+	}
+	systemSrc := loadPrompt(promptsFS, lang, "extractor_forward_system")
+	userSrc := loadPrompt(promptsFS, lang, "extractor_user")
+
+	sysTmpl, err := template.New("forward-extractor-system").Parse(systemSrc)
+	if err != nil {
+		return nil, fmt.Errorf("parsing system template: %w", err)
+	}
+	userTmpl, err := template.New("forward-extractor-user").Parse(userSrc)
+	if err != nil {
+		return nil, fmt.Errorf("parsing user template: %w", err)
+	}
+
+	return &ForwardTaskExtractor{
+		client:     client,
+		systemTmpl: sysTmpl,
+		userTmpl:   userTmpl,
+		dateparser: dateparse.New(dpCfg, dateparse.NewDateLanguage(lang)),
+		now:        time.Now,
+		threshold:  0.5,
+	}, nil
+}
+
+// Extract extracts tasks from a formatted forward conversation.
+// Implements model.Extractor; the formatted conversation text is taken from msg.Text.
+// history is unused — counterpart context is embedded in the formatted text by FormatForwardBatch.
+func (e *ForwardTaskExtractor) Extract(ctx context.Context, msg model.Message, _ []model.HistoryEntry) ([]model.Task, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	now := e.now()
+	data := extractorData{
+		Text: msg.Text,
+		Now:  now.Format("2006-01-02 15:04:05 -07:00"),
+	}
+
+	systemPrompt, err := renderTemplate(e.systemTmpl, data)
+	if err != nil {
+		return nil, fmt.Errorf("rendering system prompt: %w", err)
+	}
+	userPrompt, err := renderTemplate(e.userTmpl, data)
+	if err != nil {
+		return nil, fmt.Errorf("rendering user prompt: %w", err)
+	}
+
+	raw, err := e.client.Complete(ctx, systemPrompt, userPrompt)
+	if err != nil {
+		return nil, fmt.Errorf("calling AI client: %w", err)
+	}
+
+	if idx := strings.Index(raw, "```"); idx != -1 {
+		raw = raw[idx+3:]
+		if nl := strings.IndexByte(raw, '\n'); nl != -1 {
+			raw = raw[nl+1:]
+		}
+		if end := strings.Index(raw, "```"); end != -1 {
+			raw = raw[:end]
+		}
+		raw = strings.TrimSpace(raw)
+	}
+
+	var responses []extractorModelResponse
+	if err := json.Unmarshal([]byte(raw), &responses); err != nil {
+		return nil, fmt.Errorf("parsing model JSON response: %w", err)
+	}
+
+	var tasks []model.Task
+	for _, resp := range responses {
+		if resp.Confidence < e.threshold {
+			continue
+		}
+
+		task := model.Task{
+			Summary:    resp.Summary,
+			Details:    resp.Context,
+			Topic:      resp.Topic,
+			Confidence: resp.Confidence,
+			CreatedAt:  now,
+		}
+
+		if resp.Deadline != nil && !strings.EqualFold(*resp.Deadline, "null") && *resp.Deadline != "" {
+			deadline, parseErr := e.dateparser.Parse(*resp.Deadline, now)
+			if parseErr != nil {
+				slog.WarnContext(ctx, "failed to parse forward deadline, saving task without it",
+					"deadline", *resp.Deadline, "error", parseErr)
+			} else {
+				task.Deadline = deadline
+			}
+		}
+
+		tasks = append(tasks, task)
+	}
+
+	return tasks, nil
+}
+
 // extractorModelResponse is the JSON structure of the model response.
 type extractorModelResponse struct {
 	Summary    string  `json:"summary"`

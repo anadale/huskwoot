@@ -949,3 +949,112 @@ func TestExtractor_SystemPromptHasDeadlineRules(t *testing.T) {
 		t.Errorf("system prompt does not contain example 'завтра', prompt:\n%s", cap.systemPrompt)
 	}
 }
+
+// --- ForwardExtractor tests ---
+
+func TestForwardExtractor_SelfForwardWithDeadline(t *testing.T) {
+	resp := `[{"summary":"Отправить слайды","context":"Обещано: Вася. По просьбе выслать материалы по проекту.","topic":"Проект","project":"","deadline":"2026-04-26T00:00:00Z","confidence":0.9}]`
+	mock := &mockCompleter{response: resp}
+	e, err := ai.NewForwardExtractor(mock, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	formatted := "Переписка между мной и Вася:\n\n[я, 2026-04-25 14:30] Завтра пришлю слайды.\n[Вася, 2026-04-25 14:32] Спасибо."
+	tasks, err := e.Extract(context.Background(), model.Message{Text: formatted}, nil)
+	if err != nil {
+		t.Fatalf("Extract() error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].Summary != "Отправить слайды" {
+		t.Errorf("Summary = %q, want %q", tasks[0].Summary, "Отправить слайды")
+	}
+	if !strings.Contains(tasks[0].Details, "Обещано: Вася") {
+		t.Errorf("Details does not contain 'Обещано: Вася', got: %q", tasks[0].Details)
+	}
+	if tasks[0].Deadline == nil {
+		t.Error("Deadline = nil, want a deadline")
+	}
+}
+
+func TestForwardExtractor_CounterpartForwardReturnsEmpty(t *testing.T) {
+	mock := &mockCompleter{response: `[]`}
+	e, err := ai.NewForwardExtractor(mock, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	formatted := "Переписка между мной и Вася:\n\n[Вася, 2026-04-25 14:30] Пришли слайды завтра."
+	tasks, err := e.Extract(context.Background(), model.Message{Text: formatted}, nil)
+	if err != nil {
+		t.Fatalf("Extract() error: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("len(tasks) = %d, want 0 (no self-promises)", len(tasks))
+	}
+}
+
+func TestForwardExtractor_AIError(t *testing.T) {
+	mock := &mockCompleter{err: errors.New("сервис недоступен")}
+	e, err := ai.NewForwardExtractor(mock, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	_, err = e.Extract(context.Background(), model.Message{Text: "текст"}, nil)
+	if err == nil {
+		t.Error("Extract() must return an error when AI client errors")
+	}
+}
+
+func TestForwardExtractor_InvalidJSON(t *testing.T) {
+	mock := &mockCompleter{response: "не JSON"}
+	e, err := ai.NewForwardExtractor(mock, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	_, err = e.Extract(context.Background(), model.Message{Text: "текст"}, nil)
+	if err == nil {
+		t.Error("Extract() must return an error for invalid JSON")
+	}
+}
+
+func TestForwardExtractor_SystemPromptContents(t *testing.T) {
+	cap := &capturingCompleter{
+		response: `[]`,
+	}
+	e, err := ai.NewForwardExtractor(cap, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	formatted := "Переписка между мной и Вася:\n\n[я, 2026-04-25 14:30] Пришлю документы."
+	_, _ = e.Extract(context.Background(), model.Message{Text: formatted}, nil)
+
+	if !strings.Contains(cap.systemPrompt, "Обещано") {
+		t.Errorf("forward extractor system prompt does not contain 'Обещано', got: %s", cap.systemPrompt)
+	}
+	if !strings.Contains(cap.userPrompt, "Переписка между мной и Вася") {
+		t.Errorf("forward extractor user prompt does not contain conversation text")
+	}
+}
+
+func TestForwardExtractor_LowConfidenceFiltered(t *testing.T) {
+	resp := `[{"summary":"Может отправлю","context":"Обещано: Вася.","topic":"","project":"","deadline":null,"confidence":0.3}]`
+	mock := &mockCompleter{response: resp}
+	e, err := ai.NewForwardExtractor(mock, "ru", dateparse.Config{})
+	if err != nil {
+		t.Fatalf("NewForwardExtractor: %v", err)
+	}
+
+	tasks, err := e.Extract(context.Background(), model.Message{Text: "текст"}, nil)
+	if err != nil {
+		t.Fatalf("Extract() error: %v", err)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("len(tasks) = %d, want 0 (low confidence filtered)", len(tasks))
+	}
+}

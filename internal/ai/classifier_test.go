@@ -298,3 +298,98 @@ func TestGroupClassifier_ContextTimeout(t *testing.T) {
 		t.Error("Classify() must return an error for a cancelled context")
 	}
 }
+
+// --- ForwardClassifier tests ---
+
+func newTestForwardClassifier(t *testing.T, mock *mockCompleter) *ai.ForwardClassifier {
+	t.Helper()
+	c, err := ai.NewForwardClassifier(mock, "ru")
+	if err != nil {
+		t.Fatalf("NewForwardClassifier: %v", err)
+	}
+	return c
+}
+
+func TestForwardClassifier_ReturnsPromise(t *testing.T) {
+	mock := &mockCompleter{response: "promise"}
+	c := newTestForwardClassifier(t, mock)
+
+	text := "[я, 2026-04-25 14:30] Завтра пришлю слайды.\n[Вася, 2026-04-25 14:32] Спасибо."
+	got, err := c.Classify(context.Background(), model.Message{Text: text})
+	if err != nil {
+		t.Fatalf("Classify() error: %v", err)
+	}
+	if got != model.ClassPromise {
+		t.Errorf("Classify() = %v, want ClassPromise", got)
+	}
+}
+
+func TestForwardClassifier_ReturnsSkip(t *testing.T) {
+	mock := &mockCompleter{response: "skip"}
+	c := newTestForwardClassifier(t, mock)
+
+	got, err := c.Classify(context.Background(), model.Message{Text: ""})
+	if err != nil {
+		t.Fatalf("Classify() error: %v", err)
+	}
+	if got != model.ClassSkip {
+		t.Errorf("Classify() = %v, want ClassSkip", got)
+	}
+}
+
+func TestForwardClassifier_AllVariants(t *testing.T) {
+	cases := []struct {
+		response string
+		want     model.Classification
+	}{
+		{"promise", model.ClassPromise},
+		{"Promise", model.ClassPromise},
+		{"PROMISE", model.ClassPromise},
+		{"promise.", model.ClassPromise},
+		{"skip", model.ClassSkip},
+		{"Skip", model.ClassSkip},
+		{"skip.", model.ClassSkip},
+	}
+	for _, tc := range cases {
+		mock := &mockCompleter{response: tc.response}
+		c := newTestForwardClassifier(t, mock)
+
+		got, err := c.Classify(context.Background(), model.Message{Text: "текст переписки"})
+		if err != nil {
+			t.Errorf("Classify() with response %q returned error: %v", tc.response, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Classify() with response %q = %v, want %v", tc.response, got, tc.want)
+		}
+	}
+}
+
+func TestForwardClassifier_AIError(t *testing.T) {
+	mock := &mockCompleter{err: errors.New("сеть недоступна")}
+	c := newTestForwardClassifier(t, mock)
+
+	_, err := c.Classify(context.Background(), model.Message{Text: "текст"})
+	if err == nil {
+		t.Error("Classify() must return an error when AI client errors")
+	}
+}
+
+func TestForwardClassifier_SystemPromptContents(t *testing.T) {
+	cap := &capturingCompleter{response: "skip"}
+	c, err := ai.NewForwardClassifier(cap, "ru")
+	if err != nil {
+		t.Fatalf("NewForwardClassifier: %v", err)
+	}
+
+	_, _ = c.Classify(context.Background(), model.Message{Text: "текст переписки"})
+
+	for _, s := range []string{"promise", "skip"} {
+		if !strings.Contains(cap.systemPrompt, s) {
+			t.Errorf("ForwardClassifier system prompt does not contain %q", s)
+		}
+	}
+	if !strings.Contains(cap.userPrompt, "текст переписки") {
+		t.Errorf("ForwardClassifier user prompt does not contain the conversation text")
+	}
+}

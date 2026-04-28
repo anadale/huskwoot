@@ -39,6 +39,20 @@ Available in DM:
 - **Complete and move tasks** — between projects
 - **Bind a chat to a project** — so tasks from a specific group go directly to the right project
 
+### Extracting Promises from Forwarded 1:1 Messages
+
+In a private Telegram chat you can't add a bot — so commitments you make there get lost. Huskwoot solves this: forward any selection of messages from a 1:1 conversation into your DM with the bot. The bot accumulates them silently, then extracts the promises **you** made and creates tasks automatically.
+
+- **Trigger:** wait for the silence timeout (`forward_batch_timeout`) or send any non-forwarded message to kick off processing immediately. Include `#<project-slug-or-alias>` (e.g. `обработай #вася` or just `#вася`) to route tasks to a specific project; otherwise they go to Inbox.
+- **What's recognized:** only your promises — detected from Telegram forward metadata (`forward_from.id`). Your messages are labeled `[я, …]`; the other person's messages provide context.
+- **Cleanup:** set `delete_forwards_after_extract = true` to have the bot delete the forwarded messages and trigger from DM after successful extraction, keeping your history clean. The bot's confirmation reply stays.
+
+```toml
+[channels.telegram]
+forward_batch_timeout         = "10s"   # auto-process after 10 s of silence; "" or "0s" disables
+delete_forwards_after_extract = false   # clean up forwarded messages after extraction
+```
+
 ### Voice Messages in Telegram DM
 
 Send a voice message directly to your bot and it will be transcribed and processed by the DM agent — no typing required. Transcription happens synchronously before the message reaches the agent pipeline; the agent sees plain text and responds normally.
@@ -400,6 +414,51 @@ Device registration happens automatically:
 - [Push relay operator guide](docs/push-relay/setup.md) — APNs/FCM key setup, smoke test
 - [HMAC protocol reference](docs/push-relay/hmac.md) — for client developers
 - [Onboarding an instance to the relay](deploy/push-relay/README.md)
+
+---
+
+## Извлечение обещаний из форварднутых сообщений
+
+### Зачем
+
+В личных чатах Telegram (1:1) нельзя добавить бота. Обещания, которые вы даёте собеседнику, нигде не фиксируются автоматически — их нужно вручную пересказывать боту или записывать отдельно.
+
+### Как пользоваться
+
+1. Выберите несколько сообщений из личной переписки с кем-либо и перешлите их в DM к вашему боту.
+2. Бот молча накапливает пересланные сообщения.
+3. Либо подождите паузу (задаётся `forward_batch_timeout`), либо напишите боту любое обычное сообщение-триггер — обработка запустится немедленно.
+4. Бот извлечёт ваши обещания и создаст задачи. Если задачи найдены — пришлёт подтверждение со списком.
+
+**Выбор проекта:** добавьте в текст триггера `#<slug-или-alias-проекта>` (например, `обработай #вася` или просто `#вася`) — задачи попадут в указанный проект. Без хинта — в Inbox.
+
+### Что распознаётся
+
+Только **ваши** обещания — т.е. сообщения, которые вы отправляли собеседнику. Определение основано на метаданных Telegram-форварда (`forward_from.id`). Ваши реплики в диалоге помечаются `[я, …]`, сообщения собеседника — `[Имя, …]`; всё это передаётся языковой модели в виде размеченного текста переписки.
+
+**Не распознаются:**
+- форварды из групп и каналов (обрабатываются как обычные DM)
+- обещания собеседника (только ваши)
+- голосовые и медиа-сообщения без подписи (помечаются `[голосовое/вложение]`, обычно классифицируются как skip)
+- переписка с пользователями, скрывшими историю пересылок (имя/ID может отсутствовать)
+
+### Удаление форвардов
+
+При `delete_forwards_after_extract = true` бот удаляет пересланные сообщения и сообщение-триггер из DM после успешного извлечения задач — чтобы не засорять историю переписки. Подтверждение бота остаётся. При классификации `skip` форварды **не удаляются**.
+
+### Конфигурация
+
+```toml
+[channels.telegram]
+forward_batch_timeout         = "10s"   # пауза тишины для авто-обработки; "" или "0s" — фича выключена
+delete_forwards_after_extract = false   # удалять форварды + триггер из DM при успешном извлечении
+```
+
+### Ограничения
+
+- Окно удаления сообщений в Telegram — 48 часов; на практике обработка происходит за секунды, поэтому в окно всегда укладываемся.
+- Если сервер упал между сохранением задач и удалением форвардов в Telegram — задачи уже в базе, форварды останутся в DM (приемлемо: повторная обработка не создаст дублей благодаря `INSERT OR IGNORE`).
+- При перезапуске сервера sweeper подхватит незавершённые батчи на первом тике.
 
 ---
 

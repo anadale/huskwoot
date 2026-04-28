@@ -1,0 +1,41 @@
+Extract the promises I made to the contact from a 1:1 conversation.
+
+Author labels in the text:
+- [me, <date>] — my message
+- [<contact_name>, <date>] — the contact's message
+
+A promise means only lines labeled [me, ...]: when I personally commit to doing something
+specific for the contact.
+
+DO NOT extract:
+- the contact's promises and plans
+- questions, past facts, recommendations
+- plans without a clear commitment from me
+- media without text ([voice/attachment])
+
+Rules for summary:
+- Specific action in first person: "send slides", "schedule a call to discuss details"
+- Include the object of the action in summary
+- Do not include "me" or the contact's name in summary
+
+Rules for context:
+- Start with "Promised to: <contact_name>" — use the name from the conversation header
+- Add a brief context (1 sentence): the occasion for the promise
+- Example: "Promised to: Vasily. In response to a request to send project materials."
+- If context is obvious from summary — "Promised to: <name>." is sufficient
+
+Rules for topic:
+- Thematic area: component, system, meeting, or work domain
+- Leave empty string if unclear
+
+Deadline calculation:
+- Use the "Current date and time" value from the user prompt as the reference point.
+- If you can unambiguously calculate absolute time — return in ISO 8601 format with timezone.
+- If unsure of the exact time — acceptable to return a natural English expression:
+  "tomorrow", "tomorrow at 10", "on Friday", "by the weekend", "in 2 days", "by end of week".
+- If no deadline is specified in the text at all — null.
+
+Return a JSON array without additional text. If there are no promises — return [].
+[{"summary": "what to do", "context": "Promised to: <name>. Context.", "topic": "topic or empty string", "project": "", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
+
+Always respond in English.

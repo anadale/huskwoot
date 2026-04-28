@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -162,8 +163,32 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		slog.Info("transcriber configured", "provider", transcriber.Name())
 	}
 
+	forwardEnabled := cfg.Channels.Telegram != nil && cfg.Channels.Telegram.ForwardBatchTimeout > 0
+
+	var forwardBuffer model.ForwardBuffer
+	var forwardSignalCh chan model.ForwardDispatchSignal
+	var forwardClassifier model.Classifier
+	var forwardExtractor model.Extractor
+	if forwardEnabled {
+		forwardBuffer = storage.NewSQLiteForwardBuffer(db)
+		forwardSignalCh = make(chan model.ForwardDispatchSignal, 64)
+		fwdClassifier, err := ai.NewForwardClassifier(aiComps.smartClient, cfg.User.Language)
+		if err != nil {
+			return fmt.Errorf("initializing forward classifier: %w", err)
+		}
+		forwardClassifier = fwdClassifier
+		fwdExtractor, err := ai.NewForwardExtractor(aiComps.smartClient, cfg.User.Language, dateTimeCfg)
+		if err != nil {
+			return fmt.Errorf("initializing forward extractor: %w", err)
+		}
+		forwardExtractor = fwdExtractor
+	}
+
 	guardStore := storage.NewSQLiteGuardStore(db)
-	telegramBot, tgChannels, notifiers, err := buildTelegramComponents(cfg, stateStore, guardStore, hist, transcriber, cfg.Transcriber.MaxDuration)
+	telegramBot, tgChannel, tgChannels, notifiers, err := buildTelegramComponents(
+		cfg, stateStore, guardStore, hist, transcriber, cfg.Transcriber.MaxDuration,
+		forwardBuffer, forwardSignalCh,
+	)
 	if err != nil {
 		return err
 	}
@@ -270,6 +295,18 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		Extractors:  buildExtractors(aiComps),
 		Notifiers:   notifiers,
 		Logger:      logger,
+		// Forward batch dependencies (nil classifiers/extractor disables the branch).
+		ForwardClassifier: forwardClassifier,
+		ForwardExtractor:  forwardExtractor,
+		ForwardBuffer:     forwardBuffer,
+		DB:                db,
+		TaskStore:         taskStore,
+		EventStore:        eventStore,
+		PushQueue:         pushQueue,
+		Broker:            broker,
+		DeviceStore:       deviceStore,
+		Localizer:         agentLoc,
+		Timezone:          loc,
 	})
 
 	msgCh := make(chan model.Message, 100)
@@ -280,6 +317,36 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	if forwardEnabled && tgChannel != nil {
+		enrichFn := pipeline.EnrichFn(func(chatID string) (
+			func(context.Context, []string) error,
+			func(context.Context, string) error,
+			error,
+		) {
+			id, err := strconv.ParseInt(chatID, 10, 64)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid forward chat ID %q: %w", chatID, err)
+			}
+			var delFn func(context.Context, []string) error
+			if cfg.Channels.Telegram.DeleteForwardsAfterExtract {
+				delFn = tgChannel.BuildDeleteFn(id)
+			}
+			return delFn, tgChannel.BuildReplyFn(id), nil
+		})
+		dispatcher := pipeline.NewForwardDispatcher(forwardBuffer, forwardSignalCh, pipe, enrichFn, logger)
+		sweeper := pipeline.NewForwardBatchSweeper(
+			forwardBuffer, dispatcher,
+			cfg.Channels.Telegram.ForwardBatchTimeout,
+			5*time.Second, time.Now, logger,
+		)
+		go dispatcher.Run(ctx)
+		go sweeper.Run(ctx)
+		logger.Info("forward batch processing active",
+			"timeout", cfg.Channels.Telegram.ForwardBatchTimeout,
+			"delete_after_extract", cfg.Channels.Telegram.DeleteForwardsAfterExtract,
+		)
 	}
 
 	ownerBot := telegramBot
@@ -586,37 +653,49 @@ func buildAIComponents(cfg *config.Config, overrides promptOverrides, userName s
 	}, nil
 }
 
-func buildTelegramComponents(cfg *config.Config, stateStore model.StateStore, guardStore model.GuardStore, hist model.History, transcriber model.Transcriber, maxVoiceDuration time.Duration) (*tgbotapi.BotAPI, []model.Channel, []model.Notifier, error) {
+func buildTelegramComponents(
+	cfg *config.Config,
+	stateStore model.StateStore,
+	guardStore model.GuardStore,
+	hist model.History,
+	transcriber model.Transcriber,
+	maxVoiceDuration time.Duration,
+	forwardBuffer model.ForwardBuffer,
+	forwardSignal chan<- model.ForwardDispatchSignal,
+) (*tgbotapi.BotAPI, *channel.TelegramChannel, []model.Channel, []model.Notifier, error) {
 	if cfg.Channels.Telegram == nil {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	tgCfg := cfg.Channels.Telegram
 	bot, err := tgbotapi.NewBotAPI(tgCfg.Token)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("initializing Telegram bot: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("initializing Telegram bot: %w", err)
 	}
 
 	bundle, err := huskwootI18n.NewBundle(cfg.User.Language)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("i18n bundle for telegram channel: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("i18n bundle for telegram channel: %w", err)
 	}
 	loc := huskwootI18n.NewLocalizer(bundle, cfg.User.Language)
 
 	tgChannel := channel.NewTelegramChannel(bot, channel.TelegramChannelConfig{
-		OwnerIDs:         []string{fmt.Sprintf("%d", cfg.User.TelegramUserID)},
-		OnJoin:           tgCfg.OnJoin,
-		ReactionEnabled:  tgCfg.ReactionEnabled,
-		BotID:            fmt.Sprintf("%d", bot.Self.ID),
-		BotUsername:      bot.Self.UserName,
-		WelcomeMessage:   tgCfg.WelcomeMessage,
-		ConfirmTimeout:   tgCfg.ConfirmTimeout,
-		Language:         cfg.User.Language,
-		Transcriber:      transcriber,
-		MaxVoiceDuration: maxVoiceDuration,
-		Localizer:        loc,
+		OwnerIDs:                   []string{fmt.Sprintf("%d", cfg.User.TelegramUserID)},
+		OnJoin:                     tgCfg.OnJoin,
+		ReactionEnabled:            tgCfg.ReactionEnabled,
+		BotID:                      fmt.Sprintf("%d", bot.Self.ID),
+		BotUsername:                bot.Self.UserName,
+		WelcomeMessage:             tgCfg.WelcomeMessage,
+		ConfirmTimeout:             tgCfg.ConfirmTimeout,
+		Language:                   cfg.User.Language,
+		Transcriber:                transcriber,
+		MaxVoiceDuration:           maxVoiceDuration,
+		Localizer:                  loc,
+		ForwardBuffer:              forwardBuffer,
+		ForwardSignal:              forwardSignal,
+		DeleteForwardsAfterExtract: tgCfg.DeleteForwardsAfterExtract,
 	}, stateStore, guardStore, hist, channel.HistoryConfig{})
 
-	return bot, []model.Channel{tgChannel}, nil, nil
+	return bot, tgChannel, []model.Channel{tgChannel}, nil, nil
 }
 
 func buildDMNotifier(bot *tgbotapi.BotAPI, ownerID int64, lang string) (model.Notifier, error) {

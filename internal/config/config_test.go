@@ -1648,6 +1648,120 @@ func TestLoad_NightCutoff(t *testing.T) {
 	})
 }
 
+func TestLoad_ForwardBatchTimeout(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"empty → 0 (disabled)", "", 0, false},
+		{"0s → 0 (disabled)", `forward_batch_timeout = "0s"`, 0, false},
+		{"10s → 10s", `forward_batch_timeout = "10s"`, 10 * time.Second, false},
+		{"1m → 60s", `forward_batch_timeout = "1m"`, 60 * time.Second, false},
+		{"-1s → error", `forward_batch_timeout = "-1s"`, 0, true},
+		{"abc → error", `forward_batch_timeout = "abc"`, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := `
+[user]
+telegram_user_id = 1
+
+[ai]
+[ai.fast]
+base_url = "https://api.example.com"
+api_key = "key"
+model = "gpt-4o-mini"
+
+[ai.smart]
+base_url = "https://api.example.com"
+api_key = "key"
+model = "gpt-4o"
+
+[channels.telegram]
+token = "token"
+` + tc.raw + `
+
+[history]
+max_messages = 100
+ttl = "1h"
+`
+			cfg, err := Load(writeConfig(t, base))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success, got error: %v", err)
+			}
+			if cfg.Channels.Telegram.ForwardBatchTimeout != tc.want {
+				t.Errorf("ForwardBatchTimeout = %v, want %v", cfg.Channels.Telegram.ForwardBatchTimeout, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_DeleteForwardsAfterExtract(t *testing.T) {
+	base := func(line string) string {
+		return `
+[user]
+telegram_user_id = 1
+
+[ai]
+[ai.fast]
+base_url = "https://api.example.com"
+api_key = "key"
+model = "gpt-4o-mini"
+
+[ai.smart]
+base_url = "https://api.example.com"
+api_key = "key"
+model = "gpt-4o"
+
+[channels.telegram]
+token = "token"
+` + line + `
+
+[history]
+max_messages = 100
+ttl = "1h"
+`
+	}
+
+	t.Run("default is false", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, base("")))
+		if err != nil {
+			t.Fatalf("expected success: %v", err)
+		}
+		if cfg.Channels.Telegram.DeleteForwardsAfterExtract {
+			t.Error("DeleteForwardsAfterExtract default = true, want false")
+		}
+	})
+
+	t.Run("explicit true", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, base("delete_forwards_after_extract = true")))
+		if err != nil {
+			t.Fatalf("expected success: %v", err)
+		}
+		if !cfg.Channels.Telegram.DeleteForwardsAfterExtract {
+			t.Error("DeleteForwardsAfterExtract = false, want true")
+		}
+	})
+
+	t.Run("explicit false", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, base("delete_forwards_after_extract = false")))
+		if err != nil {
+			t.Fatalf("expected success: %v", err)
+		}
+		if cfg.Channels.Telegram.DeleteForwardsAfterExtract {
+			t.Error("DeleteForwardsAfterExtract = true, want false")
+		}
+	})
+}
+
 func TestLoad_UserLanguage(t *testing.T) {
 	cases := []struct {
 		name     string

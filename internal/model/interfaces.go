@@ -239,6 +239,22 @@ type PushQueue interface {
 	DeleteDelivered(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
+// ForwardBuffer persists forwarded messages between receipt and batch processing.
+// Append is idempotent — repeated calls with the same (ChatID, MessageID) are no-ops.
+type ForwardBuffer interface {
+	// Append adds a forward entry to the buffer. Duplicate (ChatID, MessageID) pairs are ignored.
+	Append(ctx context.Context, e ForwardEntry) error
+	// LastReceivedAt returns the maximum ReceivedAt timestamp for the given chat.
+	// Returns zero time and false when the buffer is empty for that chat.
+	LastReceivedAt(ctx context.Context, chatID string) (time.Time, bool, error)
+	// LoadBatch returns all entries for the given chat ordered by OriginalDate ASC, id ASC.
+	LoadBatch(ctx context.Context, chatID string) ([]ForwardEntry, error)
+	// DeleteBatchTx deletes all entries for the given chat within the provided transaction.
+	DeleteBatchTx(ctx context.Context, tx *sql.Tx, chatID string) error
+	// ListPendingChats returns chat IDs whose MAX(received_at) is strictly before the given threshold.
+	ListPendingChats(ctx context.Context, before time.Time) ([]string, error)
+}
+
 // Transcriber converts a voice/audio recording to plain text.
 // Implementations live in internal/transcribe (WhisperCPP, Yandex).
 type Transcriber interface {

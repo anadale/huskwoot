@@ -67,10 +67,13 @@ Configuration commands (e.g. binding a group chat to a project) are handled thro
 - `MessageKindBatch` — email from IMAP
 - `MessageKindGroup` — regular message in a Telegram group chat
 - `MessageKindGroupDirect` — mention (`@bot`) or reply to the bot; detected via `TelegramChannelConfig.BotID`
+- `MessageKindForwardBatch` — accumulated forwarded messages from a 1:1 Telegram chat, dispatched by timeout or user trigger
 
 Reactions (`msg.ReactFn`): ✍️ after Promise classification, 👍 after successful processing. `nil` when `reaction_enabled: false`.
 
 `HistoryFn` is set for Group/GroupDirect/DM (when `history != nil`); `nil` for IMAP. Pipeline calls it in `processPromise`.
+
+**History hygiene:** forwarded messages and the user-trigger message are **not written** to `SQLiteHistory`. Only the bot's reply after extraction is recorded via the standard `recordBotReply` path.
 
 ### Transactional pattern (use-case layer)
 
@@ -82,10 +85,46 @@ The use-case layer owns `*sql.DB` and transactions. Write-method pattern:
 
 Atomicity of "entity + event + push_queue" is guaranteed by a single transaction. `Broker` does not write to the DB.
 
+### Forward batch flow (Telegram 1:1 promises)
+
+Allows the owner to forward arbitrary messages from a private 1:1 Telegram chat into DM with the bot. The bot accumulates them in SQLite, then on timeout or user trigger extracts promises the owner made and creates tasks.
+
+```
+TelegramChannel.handleDirectMessage(m)
+  ├─ forward from user → ForwardBuffer.Append(entry)
+  │    IsSelfAuthored = (ForwardFrom.ID == cfg.User.TelegramUserID)
+  │    NOT written to SQLiteHistory; NOT sent to pipeline
+  │
+  ├─ regular DM + buffer non-empty → ForwardDispatcher.Submit(signal)
+  │    trigger message NOT written to SQLiteHistory; NOT sent to ChatService
+  │
+  └─ regular DM + buffer empty → ChatService.HandleMessage (unchanged)
+
+ForwardBatchSweeper (ticker, default 5s interval)
+  → ListPendingChats(now - timeout) → ForwardDispatcher.Submit per chat_id
+
+ForwardDispatcher (single-goroutine consumer)
+  → LoadBatch → Pipeline.Process(MessageKindForwardBatch)
+```
+
+Pipeline `processForwardBatch`:
+1. Parse `triggerText` via `parseTriggerProjectHint` → resolve project or fallback Inbox.
+2. Format buffer via `FormatForwardBatch` → labeled block `[я, …]` / `[name, …]`.
+3. `ForwardClassifier.Classify` → `promise` | `skip`.
+   - `skip`: tx → `DeleteBatchTx`; reply "no promises found"; Telegram forwards are NOT deleted.
+4. `ForwardExtractor.Extract` → `[]model.Task`.
+5. Single tx: `CreateTaskTx` × N + `EventStore.Insert` × N + `PushQueue.Enqueue` × N + `DeleteBatchTx`. Commit.
+6. `Broker.Notify(events)` after commit.
+7. If `DeleteForwardsAfterExtract && len(tasks) > 0`: call `payload.DeleteFn`; errors → `slog.Warn` only.
+8. Reply with task list.
+
+Transactional invariant: "tasks + buffer clear" are atomic. On crash between commit and Telegram delete, tasks are saved and forwards remain in DM (acceptable). Sweeper handles restart recovery.
+
 ### Classifiers
 
 - `SimpleClassifier` (Batch) — `promise` or `skip`
 - `GroupClassifier` (Group) — `promise` or `skip`
+- `ForwardClassifier` (ForwardBatch) — `promise` or `skip`; focuses on promises made by the owner (`[я, …]` lines)
 
 ### MetaStore and project binding
 
@@ -104,6 +143,7 @@ Stores:
 - `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
 - `push.SQLitePushQueue` — push job queue. Table `push_queue`. `ON DELETE CASCADE` on `event_seq` (retention deletes pending jobs together with events).
+- `storage.SQLiteForwardBuffer` — accumulates forwarded Telegram messages pending extraction. Table `forward_buffer` with `UNIQUE(chat_id, message_id)` for idempotency. Methods: `Append` (INSERT OR IGNORE), `LastReceivedAt`, `LoadBatch` (ordered by `original_date ASC`), `DeleteBatchTx` (tx-aware), `ListPendingChats(before time.Time)` (chats where `MAX(received_at) < before`).
 
 Human-readable task reference: `<slug>#<number>` (method `Task.DisplayID()`).
 
@@ -236,6 +276,16 @@ retention_period   = "2160h"  # 90 дней после revoke → физичес
 ```
 
 Retention runner каждый час (`events.Runner.Tick`) перебирает `DeviceStore.ListInactive(now - inactive_threshold)` и для каждой записи делает `Revoke` + `RelayClient.DeleteRegistration`. Ошибка relay логируется, но не прерывает локальный revoke. Отдельно вызывается `DeleteRevokedOlderThan(now - retention_period)` для физического удаления из таблицы `devices`. Значение `0` в любой из настроек отключает соответствующий sweep; в обычном режиме работы используются дефолты 30 / 90 дней.
+
+### `[channels.telegram]` (forward batch)
+
+```toml
+[channels.telegram]
+forward_batch_timeout         = "10s"   # silence window before auto-processing; "" or "0s" disables the feature
+delete_forwards_after_extract = false   # delete forwarded messages + trigger from DM on successful extraction
+```
+
+`ForwardBatchTimeout` is parsed via `time.ParseDuration`; empty string is equivalent to `"0s"` and disables the feature. Negative values produce a config error. When disabled, `TelegramChannel` treats forwarded messages as regular DMs (no accumulation).
 
 ### `[transcriber]`
 

@@ -2,8 +2,10 @@ package channel
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -2442,5 +2444,413 @@ func TestWatch_VoiceDM_AudioMessage(t *testing.T) {
 	}
 	if string(calls[0].Data) != string(audio) {
 		t.Errorf("Transcribe received wrong data")
+	}
+}
+
+// mockForwardBufferFull implements model.ForwardBuffer for use in TelegramChannel tests.
+type mockForwardBufferFull struct {
+	mu          sync.Mutex
+	appendCalls []model.ForwardEntry
+	appendErr   error
+	lastTime    time.Time
+	hasLast     bool
+	lastErr     error
+}
+
+func newMockForwardBuffer() *mockForwardBufferFull {
+	return &mockForwardBufferFull{}
+}
+
+func (m *mockForwardBufferFull) Append(_ context.Context, e model.ForwardEntry) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.appendErr != nil {
+		return m.appendErr
+	}
+	m.appendCalls = append(m.appendCalls, e)
+	return nil
+}
+
+func (m *mockForwardBufferFull) LastReceivedAt(_ context.Context, _ string) (time.Time, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastTime, m.hasLast, m.lastErr
+}
+
+func (m *mockForwardBufferFull) LoadBatch(_ context.Context, _ string) ([]model.ForwardEntry, error) {
+	return nil, nil
+}
+
+func (m *mockForwardBufferFull) DeleteBatchTx(_ context.Context, _ *sql.Tx, _ string) error {
+	return nil
+}
+
+func (m *mockForwardBufferFull) ListPendingChats(_ context.Context, _ time.Time) ([]string, error) {
+	return nil, nil
+}
+
+// TestHandlePrivateDM_ForwardFromOwner_AccumulatedAsSelf verifies that a forwarded
+// message originally sent by the owner is accumulated with IsSelfAuthored=true.
+func TestHandlePrivateDM_ForwardFromOwner_AccumulatedAsSelf(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	fwdMsg := &tgbotapi.Message{
+		MessageID:   10,
+		Chat:        makePrivateChat(ownerID),
+		From:        makeUser(ownerID, "owner", "Owner", ""),
+		Text:        "Завтра пришлю слайды",
+		Date:        1700001000,
+		ForwardFrom: makeUser(ownerID, "owner", "Owner", ""),
+		ForwardDate: 1700000000,
+	}
+	bot.setUpdates([]rawUpdate{makeRawUpdate(1, fwdMsg)})
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+		ForwardSignal: sigCh,
+	}, state, nil, nil, HistoryConfig{})
+
+	var handlerCalled bool
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
+		handlerCalled = true
+		return nil
+	})
+
+	if handlerCalled {
+		t.Error("handler must not be called for forward message")
+	}
+
+	buf.mu.Lock()
+	appended := buf.appendCalls
+	buf.mu.Unlock()
+
+	if len(appended) != 1 {
+		t.Fatalf("Append must be called once, got %d", len(appended))
+	}
+	e := appended[0]
+	if e.ChatID != strconv.FormatInt(ownerID, 10) {
+		t.Errorf("ChatID: want %q, got %q", strconv.FormatInt(ownerID, 10), e.ChatID)
+	}
+	if e.MessageID != "10" {
+		t.Errorf("MessageID: want %q, got %q", "10", e.MessageID)
+	}
+	if !e.IsSelfAuthored {
+		t.Error("IsSelfAuthored: want true for owner forward")
+	}
+	if e.ForwardFromID != strconv.FormatInt(ownerID, 10) {
+		t.Errorf("ForwardFromID: want %q, got %q", strconv.FormatInt(ownerID, 10), e.ForwardFromID)
+	}
+	if e.Text != "Завтра пришлю слайды" {
+		t.Errorf("Text: want %q, got %q", "Завтра пришлю слайды", e.Text)
+	}
+}
+
+// TestHandlePrivateDM_ForwardFromCounterpart_AccumulatedAsNotSelf verifies that a forwarded
+// message from the conversation partner is accumulated with IsSelfAuthored=false.
+func TestHandlePrivateDM_ForwardFromCounterpart_AccumulatedAsNotSelf(t *testing.T) {
+	const ownerID int64 = 12345
+	const contactID int64 = 67890
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	fwdMsg := &tgbotapi.Message{
+		MessageID:   11,
+		Chat:        makePrivateChat(ownerID),
+		From:        makeUser(ownerID, "owner", "Owner", ""),
+		Text:        "Жду слайды",
+		Date:        1700001100,
+		ForwardFrom: makeUser(contactID, "contact", "Ivan", ""),
+		ForwardDate: 1700000100,
+	}
+	bot.setUpdates([]rawUpdate{makeRawUpdate(2, fwdMsg)})
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	buf.mu.Lock()
+	appended := buf.appendCalls
+	buf.mu.Unlock()
+
+	if len(appended) != 1 {
+		t.Fatalf("Append must be called once, got %d", len(appended))
+	}
+	e := appended[0]
+	if e.IsSelfAuthored {
+		t.Error("IsSelfAuthored: want false for counterpart forward")
+	}
+	if e.ForwardFromName != "contact" {
+		t.Errorf("ForwardFromName: want %q, got %q", "contact", e.ForwardFromName)
+	}
+}
+
+// TestHandlePrivateDM_HiddenPrivacyForward_AccumulatedWithNameOnly verifies that a forward
+// from a user with hidden privacy is accumulated using ForwardSenderName with no ID.
+func TestHandlePrivateDM_HiddenPrivacyForward_AccumulatedWithNameOnly(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	fwdMsg := &tgbotapi.Message{
+		MessageID:         12,
+		Chat:              makePrivateChat(ownerID),
+		From:              makeUser(ownerID, "owner", "Owner", ""),
+		Text:              "Скрытый отправитель",
+		Date:              1700001200,
+		ForwardSenderName: "Hidden User",
+		ForwardDate:       1700000200,
+	}
+	bot.setUpdates([]rawUpdate{makeRawUpdate(3, fwdMsg)})
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	buf.mu.Lock()
+	appended := buf.appendCalls
+	buf.mu.Unlock()
+
+	if len(appended) != 1 {
+		t.Fatalf("Append must be called once, got %d", len(appended))
+	}
+	e := appended[0]
+	if e.ForwardFromID != "" {
+		t.Errorf("ForwardFromID: want empty for hidden privacy, got %q", e.ForwardFromID)
+	}
+	if e.ForwardFromName != "Hidden User" {
+		t.Errorf("ForwardFromName: want %q, got %q", "Hidden User", e.ForwardFromName)
+	}
+	if e.IsSelfAuthored {
+		t.Error("IsSelfAuthored: want false when ID is unknown")
+	}
+}
+
+// TestHandlePrivateDM_ForwardFromChannel_NotAccumulated verifies that a message forwarded
+// from a channel is NOT accumulated and goes through the normal DM flow.
+func TestHandlePrivateDM_ForwardFromChannel_NotAccumulated(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	channel := &tgbotapi.Chat{ID: -100999, Type: "channel", Title: "My Channel"}
+	fwdMsg := &tgbotapi.Message{
+		MessageID:       13,
+		Chat:            makePrivateChat(ownerID),
+		From:            makeUser(ownerID, "owner", "Owner", ""),
+		Text:            "Пост из канала",
+		Date:            1700001300,
+		ForwardFromChat: channel,
+		ForwardDate:     1700000300,
+	}
+	bot.setUpdates([]rawUpdate{makeRawUpdate(4, fwdMsg)})
+
+	var handlerCalled bool
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
+		handlerCalled = true
+		return nil
+	})
+
+	buf.mu.Lock()
+	appended := buf.appendCalls
+	buf.mu.Unlock()
+
+	if len(appended) != 0 {
+		t.Errorf("Append must NOT be called for channel forward, got %d calls", len(appended))
+	}
+	if !handlerCalled {
+		t.Error("handler must be called for channel-forward DM (treated as regular DM)")
+	}
+}
+
+// TestHandlePrivateDM_RegularDM_EmptyBuffer_NormalFlow verifies that a regular DM
+// with an empty buffer goes through the normal pipeline flow.
+func TestHandlePrivateDM_RegularDM_EmptyBuffer_NormalFlow(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer() // hasLast = false by default
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	dm := makeMessage(20, makePrivateChat(ownerID), makeUser(ownerID, "owner", "", ""), "задача из головы", 1700002000)
+	bot.setUpdates([]rawUpdate{makeRawUpdate(5, dm)})
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	var handlerMessages []model.Message
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+		ForwardSignal: sigCh,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, msg model.Message) error {
+		handlerMessages = append(handlerMessages, msg)
+		return nil
+	})
+
+	if len(handlerMessages) != 1 {
+		t.Fatalf("handler must be called once for regular DM, got %d", len(handlerMessages))
+	}
+	if handlerMessages[0].Text != "задача из головы" {
+		t.Errorf("Text: want %q, got %q", "задача из головы", handlerMessages[0].Text)
+	}
+	if len(sigCh) != 0 {
+		t.Error("forward signal must NOT be sent when buffer is empty")
+	}
+}
+
+// TestHandlePrivateDM_RegularDM_NonEmptyBuffer_SendsTriggerSignal verifies that a regular
+// DM sent while the buffer is non-empty triggers a ForwardDispatchSignal instead of being
+// forwarded to the pipeline handler.
+func TestHandlePrivateDM_RegularDM_NonEmptyBuffer_SendsTriggerSignal(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+	buf.hasLast = true
+	buf.lastTime = time.Unix(1700000000, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	dm := makeMessage(21, makePrivateChat(ownerID), makeUser(ownerID, "owner", "", ""), "обработай", 1700003000)
+	bot.setUpdates([]rawUpdate{makeRawUpdate(6, dm)})
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	var handlerCalled bool
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+		ForwardSignal: sigCh,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
+		handlerCalled = true
+		return nil
+	})
+
+	if handlerCalled {
+		t.Error("handler must NOT be called when trigger signal is sent")
+	}
+	if len(sigCh) != 1 {
+		t.Fatalf("exactly one forward signal must be sent, got %d", len(sigCh))
+	}
+	sig := <-sigCh
+	if sig.ChatID != strconv.FormatInt(ownerID, 10) {
+		t.Errorf("signal ChatID: want %q, got %q", strconv.FormatInt(ownerID, 10), sig.ChatID)
+	}
+	if sig.TriggerText != "обработай" {
+		t.Errorf("signal TriggerText: want %q, got %q", "обработай", sig.TriggerText)
+	}
+	if sig.TriggerID != "21" {
+		t.Errorf("signal TriggerID: want %q, got %q", "21", sig.TriggerID)
+	}
+	if sig.Source != "user-trigger" {
+		t.Errorf("signal Source: want %q, got %q", "user-trigger", sig.Source)
+	}
+	if sig.ReplyFn == nil {
+		t.Error("signal ReplyFn must not be nil")
+	}
+	if sig.DeleteFn != nil {
+		t.Error("signal DeleteFn must be nil when DeleteForwardsAfterExtract=false")
+	}
+}
+
+// TestHandlePrivateDM_DeleteForwardsEnabled_SignalHasDeleteFn verifies that when
+// DeleteForwardsAfterExtract is true the dispatch signal carries a non-nil DeleteFn.
+func TestHandlePrivateDM_DeleteForwardsEnabled_SignalHasDeleteFn(t *testing.T) {
+	const ownerID int64 = 12345
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+	buf.hasLast = true
+	buf.lastTime = time.Unix(1700000000, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	dm := makeMessage(30, makePrivateChat(ownerID), makeUser(ownerID, "owner", "", ""), "готово", 1700004000)
+	bot.setUpdates([]rawUpdate{makeRawUpdate(7, dm)})
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:                   []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer:              buf,
+		ForwardSignal:              sigCh,
+		DeleteForwardsAfterExtract: true,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	if len(sigCh) != 1 {
+		t.Fatalf("one signal expected, got %d", len(sigCh))
+	}
+	sig := <-sigCh
+	if sig.DeleteFn == nil {
+		t.Error("signal DeleteFn must not be nil when DeleteForwardsAfterExtract=true")
+	}
+}
+
+// TestBuildDeleteFn_CallsDeleteMessagesAPI verifies that BuildDeleteFn returns a function
+// that calls the Telegram deleteMessages endpoint.
+func TestBuildDeleteFn_CallsDeleteMessagesAPI(t *testing.T) {
+	const chatID int64 = 12345
+
+	bot := newMockBot(0)
+	w := newTelegramChannel(bot, TelegramChannelConfig{}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	deleteFn := w.BuildDeleteFn(chatID)
+	if err := deleteFn(context.Background(), []string{"1", "2", "3"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	bot.mu.Lock()
+	calls := bot.makeReqCalls
+	bot.mu.Unlock()
+
+	if len(calls) == 0 {
+		t.Fatal("MakeRequest must be called at least once")
+	}
+	if calls[0] != "deleteMessages" {
+		t.Errorf("first call: want %q, got %q", "deleteMessages", calls[0])
 	}
 }

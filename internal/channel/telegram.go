@@ -101,6 +101,15 @@ type TelegramChannelConfig struct {
 	// DownloadFileFn downloads a Telegram file by file ID.
 	// NewTelegramChannel sets a real implementation; override in tests to inject mock bytes.
 	DownloadFileFn func(ctx context.Context, fileID string) ([]byte, error)
+	// ForwardBuffer accumulates forwarded messages for batch processing.
+	// nil disables the forward batch feature.
+	ForwardBuffer model.ForwardBuffer
+	// ForwardSignal is the channel used to notify the dispatcher that a DM chat
+	// has a complete forward batch ready for processing. nil disables dispatching.
+	ForwardSignal chan<- model.ForwardDispatchSignal
+	// DeleteForwardsAfterExtract controls whether the bot deletes forwarded messages
+	// and the trigger message from the DM after successful task extraction.
+	DeleteForwardsAfterExtract bool
 }
 
 // guardMessages holds language-specific guard UI strings.
@@ -359,6 +368,14 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 		}
 		saveCursor()
 		return
+	}
+
+	// Forward batch: intercept private messages before normal conversion so that
+	// forwarded 1:1 messages are routed to the buffer and triggers are dispatched.
+	if tgMsg.Chat.Type == "private" && w.cfg.ForwardBuffer != nil {
+		if w.handlePrivateDMForBuffer(ctx, tgMsg, upd.UpdateID) {
+			return
+		}
 	}
 
 	msg, converted := w.convertMessage(tgMsg)
@@ -979,6 +996,179 @@ func (w *TelegramChannel) checkAndExpirePending(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// isForwardFromUser reports whether m is a message forwarded from a 1:1 user conversation
+// (as opposed to a channel or group forward, or a non-forwarded message).
+func isForwardFromUser(m *tgbotapi.Message) bool {
+	return m.ForwardDate > 0 && m.ForwardFromChat == nil
+}
+
+// handlePrivateDMForBuffer intercepts private messages when the forward buffer is enabled.
+// It returns true when the message was fully consumed (appended to buffer or sent as a
+// dispatch trigger), so that processRawUpdate can skip the normal pipeline path.
+func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbotapi.Message, updateID int) bool {
+	if m.From == nil {
+		return false
+	}
+	authorID := strconv.FormatInt(m.From.ID, 10)
+	if _, ok := w.ownerIDs[authorID]; !ok {
+		return false
+	}
+	chatIDStr := strconv.FormatInt(m.Chat.ID, 10)
+
+	if isForwardFromUser(m) {
+		entry := w.buildForwardEntry(m, chatIDStr)
+		if err := w.cfg.ForwardBuffer.Append(ctx, entry); err != nil {
+			slog.WarnContext(ctx, "appending to forward buffer", "error", err, "chat_id", chatIDStr)
+		}
+		if err := w.saveUpdateCursor(ctx, updateID); err != nil {
+			slog.Error("saving cursor after forward append", "error", err, "update_id", updateID)
+		}
+		return true
+	}
+
+	// Regular (non-forward) DM: if the buffer is non-empty, this message is a trigger.
+	if w.cfg.ForwardSignal != nil {
+		_, hasBuf, err := w.cfg.ForwardBuffer.LastReceivedAt(ctx, chatIDStr)
+		if err != nil {
+			slog.WarnContext(ctx, "checking forward buffer", "error", err, "chat_id", chatIDStr)
+		}
+		if hasBuf {
+			chatID := m.Chat.ID
+			sig := model.ForwardDispatchSignal{
+				ChatID:      chatIDStr,
+				TriggerText: m.Text,
+				TriggerID:   strconv.Itoa(m.MessageID),
+				Source:      "user-trigger",
+				ReplyFn: func(ctx context.Context, text string) error {
+					reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
+					reply.ParseMode = tgbotapi.ModeMarkdownV2
+					sent, err := w.bot.Send(reply)
+					if err != nil {
+						return err
+					}
+					w.recordBotReply(ctx, "dm", text, sent.Date)
+					return nil
+				},
+			}
+			if w.cfg.DeleteForwardsAfterExtract {
+				sig.DeleteFn = w.BuildDeleteFn(chatID)
+			}
+			select {
+			case w.cfg.ForwardSignal <- sig:
+			default:
+				slog.WarnContext(ctx, "forward signal channel full, dropping trigger", "chat_id", chatIDStr)
+			}
+			if err := w.saveUpdateCursor(ctx, updateID); err != nil {
+				slog.Error("saving cursor after forward trigger", "error", err, "update_id", updateID)
+			}
+			return true
+		}
+	}
+
+	return false
+}
+
+// buildForwardEntry constructs a ForwardEntry from a forwarded Telegram message.
+func (w *TelegramChannel) buildForwardEntry(m *tgbotapi.Message, chatID string) model.ForwardEntry {
+	var forwardFromID, forwardFromName string
+	if m.ForwardFrom != nil {
+		forwardFromID = strconv.FormatInt(m.ForwardFrom.ID, 10)
+		forwardFromName = buildDisplayName(m.ForwardFrom)
+	} else {
+		forwardFromName = m.ForwardSenderName
+	}
+
+	var isSelf bool
+	if forwardFromID != "" {
+		_, isSelf = w.ownerIDs[forwardFromID]
+	}
+
+	text := m.Text
+	if text == "" {
+		text = m.Caption
+	}
+
+	return model.ForwardEntry{
+		ChatID:          chatID,
+		MessageID:       strconv.Itoa(m.MessageID),
+		ForwardFromID:   forwardFromID,
+		ForwardFromName: forwardFromName,
+		IsSelfAuthored:  isSelf,
+		OriginalDate:    time.Unix(int64(m.ForwardDate), 0),
+		ReceivedAt:      time.Unix(int64(m.Date), 0),
+		Text:            text,
+	}
+}
+
+// BuildReplyFn returns a function that sends a text reply to the given DM chat
+// and records it in history. Used to enrich sweeper-sourced dispatch signals.
+func (w *TelegramChannel) BuildReplyFn(chatID int64) func(context.Context, string) error {
+	return func(ctx context.Context, text string) error {
+		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
+		reply.ParseMode = tgbotapi.ModeMarkdownV2
+		sent, err := w.bot.Send(reply)
+		if err != nil {
+			return err
+		}
+		w.recordBotReply(ctx, "dm", text, sent.Date)
+		return nil
+	}
+}
+
+// BuildDeleteFn returns a function that deletes Telegram messages by their string IDs
+// from the given chat. The returned function is safe to store in ForwardDispatchSignal.DeleteFn.
+func (w *TelegramChannel) BuildDeleteFn(chatID int64) func(context.Context, []string) error {
+	return func(ctx context.Context, ids []string) error {
+		intIDs := make([]int, 0, len(ids))
+		for _, id := range ids {
+			n, err := strconv.Atoi(id)
+			if err != nil {
+				slog.WarnContext(ctx, "invalid message id in delete list", "id", id)
+				continue
+			}
+			intIDs = append(intIDs, n)
+		}
+		return w.deleteMessages(ctx, chatID, intIDs)
+	}
+}
+
+// deleteMessages deletes Telegram messages in batches of up to 100.
+// Uses the deleteMessages Bot API method; falls back to individual deleteMessage calls
+// if the batch method is not supported by the server.
+func (w *TelegramChannel) deleteMessages(ctx context.Context, chatID int64, messageIDs []int) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	chatIDStr := strconv.FormatInt(chatID, 10)
+	for len(messageIDs) > 0 {
+		n := 100
+		if n > len(messageIDs) {
+			n = len(messageIDs)
+		}
+		batch := messageIDs[:n]
+		messageIDs = messageIDs[n:]
+
+		idsJSON, _ := json.Marshal(batch)
+		_, err := w.bot.MakeRequest("deleteMessages", tgbotapi.Params{
+			"chat_id":     chatIDStr,
+			"message_ids": string(idsJSON),
+		})
+		if err == nil {
+			continue
+		}
+		// Fallback: delete individually.
+		for _, id := range batch {
+			if _, ferr := w.bot.MakeRequest("deleteMessage", tgbotapi.Params{
+				"chat_id":    chatIDStr,
+				"message_id": strconv.Itoa(id),
+			}); ferr != nil {
+				slog.WarnContext(ctx, "deleting message", "error", ferr, "chat_id", chatID, "message_id", id)
+			}
+		}
+	}
+	return nil
 }
 
 // recoverPendingFromStore loads persisted pending approvals on startup.

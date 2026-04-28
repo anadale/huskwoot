@@ -49,6 +49,7 @@ func TestUpAppliesAll(t *testing.T) {
 	wantTables := []string{
 		"projects", "tasks", "cursors", "channel_projects", "messages",
 		"devices", "events", "push_queue", "pairing_requests", "project_aliases",
+		"forward_buffer",
 	}
 	for _, name := range wantTables {
 		var got string
@@ -277,6 +278,69 @@ func TestProjectAliasesCascadeDelete(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("aliases should be cascade-deleted, got %d remaining", count)
+	}
+}
+
+func TestMigrationsCreatesForwardBufferTable(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	if err := migrations.Up(db); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	wantCols := map[string]bool{
+		"id":               true,
+		"chat_id":          true,
+		"message_id":       true,
+		"forward_from_id":  true,
+		"forward_from_name": true,
+		"is_self_authored": true,
+		"original_date":    true,
+		"text":             true,
+		"received_at":      true,
+	}
+
+	rows, err := db.Query(`PRAGMA table_info(forward_buffer)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dfltValue, pk interface{}
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[name] = true
+	}
+	for col := range wantCols {
+		if !got[col] {
+			t.Errorf("column %q missing from forward_buffer", col)
+		}
+	}
+
+	var idxName string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_forward_buffer_chat_received'`).Scan(&idxName); err != nil {
+		t.Fatalf("index idx_forward_buffer_chat_received not found: %v", err)
+	}
+
+	// Verify UNIQUE constraint on (chat_id, message_id)
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO forward_buffer(chat_id, message_id, is_self_authored, original_date, received_at) VALUES (?, ?, ?, ?, ?)`,
+		"chat-1", "msg-1", 1, now, now); err != nil {
+		t.Fatalf("inserting forward entry: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO forward_buffer(chat_id, message_id, is_self_authored, original_date, received_at) VALUES (?, ?, ?, ?, ?)`,
+		"chat-1", "msg-1", 0, now, now); err == nil {
+		t.Fatal("expected UNIQUE constraint violation on (chat_id, message_id)")
 	}
 }
 

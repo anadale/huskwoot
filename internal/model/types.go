@@ -18,6 +18,8 @@ const (
 	MessageKindGroup MessageKind = "group"
 	// MessageKindGroupDirect is a bot-directed message in a group chat (mention or reply to bot).
 	MessageKindGroupDirect MessageKind = "group_direct"
+	// MessageKindForwardBatch is a batch of forwarded messages from a 1:1 Telegram chat.
+	MessageKindForwardBatch MessageKind = "forward_batch"
 )
 
 // Classification is the result of message classification.
@@ -63,6 +65,68 @@ type Reaction struct {
 	UserID string
 }
 
+// ForwardEntry is a single forwarded message stored in the forward buffer.
+type ForwardEntry struct {
+	// ChatID is the DM chat identifier.
+	ChatID string
+	// MessageID is the Telegram message identifier within the chat.
+	MessageID string
+	// ForwardFromID is the original sender's Telegram user ID (empty when privacy is hidden).
+	ForwardFromID string
+	// ForwardFromName is the display name of the original sender.
+	ForwardFromName string
+	// IsSelfAuthored is true when the forwarded message was authored by the bot owner.
+	IsSelfAuthored bool
+	// OriginalDate is the timestamp of the original message.
+	OriginalDate time.Time
+	// ReceivedAt is the time the forward was received in the DM.
+	ReceivedAt time.Time
+	// Text is the message body (empty for voice/media without a caption).
+	Text string
+}
+
+// ForwardDispatchSignal is sent by TelegramChannel to the dispatcher goroutine to
+// trigger processing of accumulated forwarded messages for a given DM chat.
+type ForwardDispatchSignal struct {
+	// ChatID is the DM chat identifier.
+	ChatID string
+	// TriggerText is the text of the user message that triggered processing
+	// (empty when the sweeper initiates processing due to a timeout).
+	TriggerText string
+	// TriggerID is the Telegram message ID of the trigger message
+	// (empty when initiated by the sweeper).
+	TriggerID string
+	// Source indicates what triggered dispatch: "user-trigger" or "sweeper".
+	Source string
+	// ReplyFn sends a reply to the DM chat.
+	ReplyFn func(ctx context.Context, text string) error
+	// DeleteFn deletes Telegram messages from the DM chat by their string IDs.
+	// nil when delete_forwards_after_extract is false.
+	DeleteFn func(ctx context.Context, ids []string) error
+}
+
+// ForwardBatchPayload carries a batch of forwarded messages for pipeline processing.
+type ForwardBatchPayload struct {
+	// ChatID is the DM chat identifier.
+	ChatID string
+	// Forwards is the list of forwarded messages loaded from the buffer.
+	Forwards []ForwardEntry
+	// TriggerText is the text of the user message that triggered processing
+	// (empty when processing was triggered by a timeout sweeper).
+	TriggerText string
+	// TriggerID is the Telegram message ID of the trigger message
+	// (empty when triggered by the sweeper).
+	TriggerID string
+	// DeleteFn deletes the given Telegram message IDs from the DM chat.
+	// nil when delete_forwards_after_extract is false.
+	DeleteFn func(ctx context.Context, ids []string) error
+	// ReplyFn sends a reply to the DM chat.
+	ReplyFn func(ctx context.Context, text string) error
+	// Counterpart is the display name of the most frequent non-self sender in Forwards.
+	// Empty when all forwards are self-authored or privacy is hidden for all.
+	Counterpart string
+}
+
 // Message describes a single message from a channel.
 type Message struct {
 	// ID is the unique message identifier within the channel.
@@ -92,6 +156,8 @@ type Message struct {
 	// HistoryFn is a callback for fetching the chat message history (nil if history is not needed).
 	// Set by the channel for group messages; nil for DM and IMAP.
 	HistoryFn func(ctx context.Context) ([]HistoryEntry, error)
+	// ForwardBatch carries the forward batch payload; non-nil only when Kind == MessageKindForwardBatch.
+	ForwardBatch *ForwardBatchPayload
 }
 
 // Task describes a task extracted from a user promise.

@@ -125,6 +125,62 @@ func (c *SimpleClassifier) Classify(ctx context.Context, msg model.Message) (mod
 	return parseClassification(resp)
 }
 
+// ForwardClassifier classifies a forwarded 1:1 conversation as Promise or Skip.
+// It determines whether the batch contains promises made by me to the counterpart.
+type ForwardClassifier struct {
+	client     Completer
+	systemTmpl *template.Template
+	userTmpl   *template.Template
+}
+
+// NewForwardClassifier creates a ForwardClassifier using the forward-specific system prompt.
+func NewForwardClassifier(client Completer, lang string) (*ForwardClassifier, error) {
+	if lang == "" {
+		lang = "ru"
+	}
+	systemSrc := loadPrompt(promptsFS, lang, "classifier_forward_system")
+	userSrc := loadPrompt(promptsFS, lang, "classifier_user")
+
+	sysTmpl, err := template.New("forward-classifier-system").Parse(systemSrc)
+	if err != nil {
+		return nil, fmt.Errorf("parsing system template: %w", err)
+	}
+	userTmpl, err := template.New("forward-classifier-user").Parse(userSrc)
+	if err != nil {
+		return nil, fmt.Errorf("parsing user template: %w", err)
+	}
+	return &ForwardClassifier{
+		client:     client,
+		systemTmpl: sysTmpl,
+		userTmpl:   userTmpl,
+	}, nil
+}
+
+// Classify classifies the forward batch conversation, returning ClassPromise or ClassSkip.
+// Implements model.Classifier; the formatted conversation text is taken from msg.Text.
+func (c *ForwardClassifier) Classify(ctx context.Context, msg model.Message) (model.Classification, error) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	data := classifierData{Text: msg.Text}
+
+	systemPrompt, err := renderTemplate(c.systemTmpl, data)
+	if err != nil {
+		return model.ClassSkip, fmt.Errorf("rendering system prompt: %w", err)
+	}
+	userPrompt, err := renderTemplate(c.userTmpl, data)
+	if err != nil {
+		return model.ClassSkip, fmt.Errorf("rendering user prompt: %w", err)
+	}
+
+	resp, err := c.client.Complete(ctx, systemPrompt, userPrompt)
+	if err != nil {
+		return model.ClassSkip, fmt.Errorf("calling AI client: %w", err)
+	}
+
+	return parseClassification(resp)
+}
+
 // GroupClassifier classifies group messages: Promise or Skip.
 // Implements the model.Classifier interface.
 type GroupClassifier struct {

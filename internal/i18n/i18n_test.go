@@ -158,6 +158,63 @@ func TestVoiceKeys(t *testing.T) {
 	}
 }
 
+func TestForwardKeys(t *testing.T) {
+	tests := []struct {
+		lang  string
+		key   string
+		data  any
+		count int
+		want  string
+	}{
+		{
+			"ru", "forward.extracted_tasks",
+			map[string]any{"Count": 1, "Project": "inbox", "Tasks": "- тест"},
+			1, "Извлёк 1 задачу в проект «inbox»:\n- тест",
+		},
+		{
+			"ru", "forward.extracted_tasks",
+			map[string]any{"Count": 3, "Project": "inbox", "Tasks": "- тест"},
+			3, "Извлёк 3 задачи в проект «inbox»:\n- тест",
+		},
+		{
+			"ru", "forward.extracted_tasks",
+			map[string]any{"Count": 5, "Project": "inbox", "Tasks": "- тест"},
+			5, "Извлёк 5 задач в проект «inbox»:\n- тест",
+		},
+		{
+			"en", "forward.extracted_tasks",
+			map[string]any{"Count": 1, "Project": "inbox", "Tasks": "- test"},
+			1, "Extracted 1 task to project «inbox»:\n- test",
+		},
+		{
+			"en", "forward.extracted_tasks",
+			map[string]any{"Count": 3, "Project": "inbox", "Tasks": "- test"},
+			3, "Extracted 3 tasks to project «inbox»:\n- test",
+		},
+		{"ru", "forward.no_promises_found", nil, 0, "Обещаний от тебя в этой переписке не нашёл, сообщения оставил"},
+		{"en", "forward.no_promises_found", nil, 0, "No promises from you found in this conversation, messages left intact"},
+		{"ru", "forward.project_not_found", map[string]string{"Hint": "вася"}, 0, "Проект «вася» не найден, положил задачи в Inbox"},
+		{"en", "forward.project_not_found", map[string]string{"Hint": "vasya"}, 0, "Project «vasya» not found, tasks placed in Inbox"},
+	}
+
+	for _, tc := range tests {
+		bundle, err := i18n.NewBundle(tc.lang)
+		if err != nil {
+			t.Fatalf("NewBundle(%s): %v", tc.lang, err)
+		}
+		loc := i18n.NewLocalizer(bundle, tc.lang)
+		var got string
+		if tc.count > 0 {
+			got = i18n.Translate(loc, tc.key, tc.data, tc.count)
+		} else {
+			got = i18n.Translate(loc, tc.key, tc.data)
+		}
+		if got != tc.want {
+			t.Errorf("%s/%s (count=%d): got %q, want %q", tc.lang, tc.key, tc.count, got, tc.want)
+		}
+	}
+}
+
 func TestProjectAliasKeysPresent(t *testing.T) {
 	keys := []string{
 		"tool_get_project_desc",
