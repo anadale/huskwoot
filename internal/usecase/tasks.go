@@ -4,11 +4,17 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/anadale/huskwoot/internal/model"
 )
+
+// ErrTaskNotFound — sentinel для случаев, когда задача отсутствует. Оборачивается через
+// fmt.Errorf("...: %w", ErrTaskNotFound), чтобы isNotFoundErr (api/projects.go) распознавал
+// not-found и возвращал HTTP 404 вместо 500.
+var ErrTaskNotFound = errors.New("task not found")
 
 // TaskServiceDeps collects the dependencies for TaskService.
 type TaskServiceDeps struct {
@@ -242,7 +248,7 @@ func (s *taskService) MoveTask(ctx context.Context, id, newProjectID string) (*m
 		return nil, fmt.Errorf("чтение задачи после переноса: %w", err)
 	}
 	if task == nil {
-		return nil, fmt.Errorf("задача %s не найдена после переноса", id)
+		return nil, fmt.Errorf("задача %s не найдена после переноса: %w", id, ErrTaskNotFound)
 	}
 
 	ev, err := s.recordEvent(ctx, tx, model.EventTaskMoved, task.ID, wrapTaskPayload(task, nil), activeIDs)
@@ -307,7 +313,7 @@ func (s *taskService) updateAndEmit(ctx context.Context, id string, upd model.Ta
 			return nil, fmt.Errorf("чтение задачи до обновления: %w", err)
 		}
 		if original == nil {
-			return nil, fmt.Errorf("задача %s не найдена", id)
+			return nil, fmt.Errorf("задача %s не найдена: %w", id, ErrTaskNotFound)
 		}
 	}
 
@@ -320,7 +326,7 @@ func (s *taskService) updateAndEmit(ctx context.Context, id string, upd model.Ta
 		return nil, fmt.Errorf("чтение задачи после обновления: %w", err)
 	}
 	if task == nil {
-		return nil, fmt.Errorf("задача %s не найдена после обновления", id)
+		return nil, fmt.Errorf("задача %s не найдена после обновления: %w", id, ErrTaskNotFound)
 	}
 
 	var payload taskEventPayload

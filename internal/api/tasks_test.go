@@ -388,6 +388,18 @@ func TestUpdateTaskPatchesFields(t *testing.T) {
 	}
 }
 
+// PATCH несуществующей задачи должен возвращать 404, а не 500: иначе клиентский drainer
+// интерпретирует 5xx как «ретраить» и бомбит сервер.
+func TestUpdateTaskMissingReturns404(t *testing.T) {
+	h := newTasksHarness(t)
+
+	missingID := "79811A80-AEFA-4C05-A0E4-A9FAE1C53A43"
+	rec := h.do(http.MethodPatch, "/v1/tasks/"+missingID, map[string]any{"summary": "x"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestUpdateTaskPatchesSummary(t *testing.T) {
 	h := newTasksHarness(t)
 	ctx := context.Background()

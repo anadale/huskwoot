@@ -212,14 +212,19 @@ func isUniqueConstraintErr(err error) bool {
 		strings.Contains(msg, "constraint failed: UNIQUE")
 }
 
-// isNotFoundErr is a heuristic to distinguish "not found" errors from others.
-// Error messages are produced in storage/task_store.go and usecase/projects.go.
+// isNotFoundErr distinguishes "not found" errors from others. Sentinel checks
+// (errors.Is) are preferred; the legacy substring fallback covers errors from
+// storage/task_store.go that wrap raw "not found" strings without sentinels.
 func isNotFoundErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "not found")
+	if errors.Is(err, usecase.ErrTaskNotFound) ||
+		errors.Is(err, usecase.ErrProjectNotFound) ||
+		errors.Is(err, usecase.ErrAliasNotFound) {
+		return true
+	}
+	return strings.Contains(err.Error(), "not found")
 }
 
 // aliasErrorCode maps alias sentinel errors from the usecase layer to API error
