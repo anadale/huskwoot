@@ -325,21 +325,24 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 
 	if upd.MessageReaction != nil {
 		r := upd.MessageReaction
+		accepted := w.isReactionConfirmation(r)
 		var userID int64
 		if r.User != nil {
 			userID = r.User.ID
 		}
-		slog.DebugContext(ctx, "guard: message_reaction received",
+		decision := "reject"
+		if accepted {
+			decision = "accept"
+		}
+		slog.DebugContext(ctx, "guard: message_reaction processed",
 			"chat_id", r.Chat.ID,
 			"message_id", r.MessageID,
 			"user_id", userID,
-			"owner_ids", w.cfg.OwnerIDs,
+			"decision", decision,
 		)
-		if w.isReactionConfirmation(r) {
+		if accepted {
 			slog.InfoContext(ctx, "guard: reaction confirmation accepted", "chat_id", r.Chat.ID)
 			w.confirmChat(ctx, r.Chat.ID)
-		} else {
-			slog.DebugContext(ctx, "guard: reaction confirmation rejected", "chat_id", r.Chat.ID)
 		}
 		saveCursor()
 		return
@@ -521,17 +524,7 @@ func (w *TelegramChannel) convertMessage(m *tgbotapi.Message) (model.Message, bo
 			return w.sendReaction(strconv.FormatInt(chatID, 10), strconv.Itoa(msgID), emoji)
 		}
 	}
-	sourceID := strconv.FormatInt(chatID, 10)
-	msg.ReplyFn = func(ctx context.Context, text string) error {
-		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
-		reply.ParseMode = tgbotapi.ModeMarkdownV2
-		sent, err := w.bot.Send(reply)
-		if err != nil {
-			return err
-		}
-		w.recordBotReply(ctx, sourceID, text, sent.Date)
-		return nil
-	}
+	msg.ReplyFn = w.buildReplyFn(chatID, strconv.FormatInt(chatID, 10))
 
 	if m.From != nil {
 		msg.Author = strconv.FormatInt(m.From.ID, 10)
@@ -579,16 +572,7 @@ func (w *TelegramChannel) convertDMMessage(m *tgbotapi.Message) (model.Message, 
 			return w.sendReaction(strconv.FormatInt(chatID, 10), strconv.Itoa(msgID), emoji)
 		}
 	}
-	msg.ReplyFn = func(ctx context.Context, text string) error {
-		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
-		reply.ParseMode = tgbotapi.ModeMarkdownV2
-		sent, err := w.bot.Send(reply)
-		if err != nil {
-			return err
-		}
-		w.recordBotReply(ctx, "dm", text, sent.Date)
-		return nil
-	}
+	msg.ReplyFn = w.buildReplyFn(chatID, "dm")
 
 	if m.ReplyToMessage != nil {
 		reply := w.convertReplyMessage(m.ReplyToMessage)
@@ -632,23 +616,28 @@ func (w *TelegramChannel) isBotDirected(m *tgbotapi.Message) bool {
 
 	// Check @mention of the bot in the text.
 	// Telegram entity offsets are in UTF-16 units, so convert the string to UTF-16
-	// for correct offset application when non-ASCII text precedes the mention.
-	if w.cfg.BotUsername != "" {
-		target := "@" + w.cfg.BotUsername
-		utf16Text := utf16.Encode([]rune(m.Text))
-		for _, entity := range m.Entities {
-			if entity.Type == "mention" {
-				end := entity.Offset + entity.Length
-				if end <= len(utf16Text) {
-					mentioned := string(utf16.Decode(utf16Text[entity.Offset:end]))
-					if strings.EqualFold(mentioned, target) {
-						return true
-					}
-				}
-			}
+	// only when at least one mention entity is present.
+	if w.cfg.BotUsername == "" {
+		return false
+	}
+	target := "@" + w.cfg.BotUsername
+	var utf16Text []uint16
+	for _, entity := range m.Entities {
+		if entity.Type != "mention" {
+			continue
+		}
+		if utf16Text == nil {
+			utf16Text = utf16.Encode([]rune(m.Text))
+		}
+		end := entity.Offset + entity.Length
+		if end > len(utf16Text) {
+			continue
+		}
+		mentioned := string(utf16.Decode(utf16Text[entity.Offset:end]))
+		if strings.EqualFold(mentioned, target) {
+			return true
 		}
 	}
-
 	return false
 }
 
@@ -702,6 +691,21 @@ func (w *TelegramChannel) botDisplayName() string {
 		return w.cfg.BotUsername
 	}
 	return "bot"
+}
+
+// buildReplyFn returns a ReplyFn closure that sends a MarkdownV2 reply to chatID
+// and records it in history under sourceID.
+func (w *TelegramChannel) buildReplyFn(chatID int64, sourceID string) func(context.Context, string) error {
+	return func(ctx context.Context, text string) error {
+		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
+		reply.ParseMode = tgbotapi.ModeMarkdownV2
+		sent, err := w.bot.Send(reply)
+		if err != nil {
+			return err
+		}
+		w.recordBotReply(ctx, sourceID, text, sent.Date)
+		return nil
+	}
 }
 
 // recordBotReply records the bot's reply to history. No-op if history is nil or text is empty.
@@ -915,49 +919,39 @@ func (w *TelegramChannel) confirmChat(ctx context.Context, chatID int64) {
 	}
 }
 
+// matchesPendingWelcome returns true when (chatID, userID) identifies an owner
+// acting on the welcome message stored in pending; msgID must equal the stored
+// welcomeMsgID. Used for both reply and reaction confirmation paths.
+func (w *TelegramChannel) matchesPendingWelcome(chatID, userID int64, msgID int) bool {
+	if userID == 0 {
+		return false
+	}
+	if _, ok := w.ownerIDs[strconv.FormatInt(userID, 10)]; !ok {
+		return false
+	}
+	w.pendingMu.Lock()
+	pa, ok := w.pending[chatID]
+	w.pendingMu.Unlock()
+	if !ok {
+		return false
+	}
+	return msgID == pa.welcomeMsgID
+}
+
 // isReplyConfirmation returns true if the message is an owner reply to the welcome message.
 func (w *TelegramChannel) isReplyConfirmation(msg *tgbotapi.Message) bool {
 	if msg.From == nil || msg.ReplyToMessage == nil {
 		return false
 	}
-	authorID := strconv.FormatInt(msg.From.ID, 10)
-	if _, ok := w.ownerIDs[authorID]; !ok {
-		return false
-	}
-	w.pendingMu.Lock()
-	pa, ok := w.pending[msg.Chat.ID]
-	w.pendingMu.Unlock()
-	if !ok {
-		return false
-	}
-	return msg.ReplyToMessage.MessageID == pa.welcomeMsgID
+	return w.matchesPendingWelcome(msg.Chat.ID, msg.From.ID, msg.ReplyToMessage.MessageID)
 }
 
 // isReactionConfirmation returns true if the reaction is from an owner on the welcome message.
 func (w *TelegramChannel) isReactionConfirmation(r *rawMessageReaction) bool {
 	if r.User == nil {
-		slog.Debug("guard: isReactionConfirmation: User is nil")
 		return false
 	}
-	userID := strconv.FormatInt(r.User.ID, 10)
-	if _, ok := w.ownerIDs[userID]; !ok {
-		slog.Debug("guard: isReactionConfirmation: user not in ownerIDs", "user_id", userID, "owner_ids", w.cfg.OwnerIDs)
-		return false
-	}
-	w.pendingMu.Lock()
-	pa, ok := w.pending[r.Chat.ID]
-	w.pendingMu.Unlock()
-	if !ok {
-		slog.Debug("guard: isReactionConfirmation: chat not in pending", "chat_id", r.Chat.ID)
-		return false
-	}
-	match := r.MessageID == pa.welcomeMsgID
-	slog.Debug("guard: isReactionConfirmation: message_id check",
-		"reaction_msg_id", r.MessageID,
-		"welcome_msg_id", pa.welcomeMsgID,
-		"match", match,
-	)
-	return match
+	return w.matchesPendingWelcome(r.Chat.ID, r.User.ID, r.MessageID)
 }
 
 // leaveChat calls the leaveChat Bot API method for the given chat.
@@ -1051,16 +1045,7 @@ func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbot
 				TriggerText: m.Text,
 				TriggerID:   strconv.Itoa(m.MessageID),
 				Source:      "user-trigger",
-				ReplyFn: func(ctx context.Context, text string) error {
-					reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
-					reply.ParseMode = tgbotapi.ModeMarkdownV2
-					sent, err := w.bot.Send(reply)
-					if err != nil {
-						return err
-					}
-					w.recordBotReply(ctx, "dm", text, sent.Date)
-					return nil
-				},
+				ReplyFn:     w.buildReplyFn(chatID, "dm"),
 			}
 			if w.cfg.DeleteForwardsAfterExtract {
 				sig.DeleteFn = w.BuildDeleteFn(chatID)
@@ -1110,16 +1095,7 @@ func (w *TelegramChannel) buildForwardEntry(m *tgbotapi.Message, chatID string) 
 // BuildReplyFn returns a function that sends a text reply to the given DM chat
 // and records it in history. Used to enrich sweeper-sourced dispatch signals.
 func (w *TelegramChannel) BuildReplyFn(chatID int64) func(context.Context, string) error {
-	return func(ctx context.Context, text string) error {
-		reply := tgbotapi.NewMessage(chatID, mdToTelegramV2(text))
-		reply.ParseMode = tgbotapi.ModeMarkdownV2
-		sent, err := w.bot.Send(reply)
-		if err != nil {
-			return err
-		}
-		w.recordBotReply(ctx, "dm", text, sent.Date)
-		return nil
-	}
+	return w.buildReplyFn(chatID, "dm")
 }
 
 // BuildDeleteFn returns a function that deletes Telegram messages by their string IDs
@@ -1188,30 +1164,36 @@ func (w *TelegramChannel) recoverPendingFromStore(ctx context.Context) {
 		return
 	}
 	now := time.Now()
+	w.pendingMu.Lock()
 	for _, p := range records {
 		if now.After(p.Deadline) {
-			slog.InfoContext(ctx, "guard: leaving chat after restart (timeout expired)",
-				"chat_id", p.ChatID,
-				"deadline", p.Deadline,
-			)
-			if err := w.leaveChat(ctx, p.ChatID); err != nil {
-				slog.ErrorContext(ctx, "guard: failed to leave chat after restart", "chat_id", p.ChatID, "error", err)
-			}
-			if err := w.guardStore.DeletePending(ctx, p.ChatID); err != nil {
-				slog.ErrorContext(ctx, "guard: failed to delete expired pending from store", "chat_id", p.ChatID, "error", err)
-			}
-		} else {
-			slog.InfoContext(ctx, "guard: restored pending approval from store",
-				"chat_id", p.ChatID,
-				"welcome_msg_id", p.WelcomeMsgID,
-				"deadline", p.Deadline,
-			)
-			w.pendingMu.Lock()
-			w.pending[p.ChatID] = &pendingApproval{
-				welcomeMsgID: p.WelcomeMsgID,
-				deadline:     p.Deadline,
-			}
-			w.pendingMu.Unlock()
+			continue
+		}
+		slog.InfoContext(ctx, "guard: restored pending approval from store",
+			"chat_id", p.ChatID,
+			"welcome_msg_id", p.WelcomeMsgID,
+			"deadline", p.Deadline,
+		)
+		w.pending[p.ChatID] = &pendingApproval{
+			welcomeMsgID: p.WelcomeMsgID,
+			deadline:     p.Deadline,
+		}
+	}
+	w.pendingMu.Unlock()
+
+	for _, p := range records {
+		if !now.After(p.Deadline) {
+			continue
+		}
+		slog.InfoContext(ctx, "guard: leaving chat after restart (timeout expired)",
+			"chat_id", p.ChatID,
+			"deadline", p.Deadline,
+		)
+		if err := w.leaveChat(ctx, p.ChatID); err != nil {
+			slog.ErrorContext(ctx, "guard: failed to leave chat after restart", "chat_id", p.ChatID, "error", err)
+		}
+		if err := w.guardStore.DeletePending(ctx, p.ChatID); err != nil {
+			slog.ErrorContext(ctx, "guard: failed to delete expired pending from store", "chat_id", p.ChatID, "error", err)
 		}
 	}
 }
