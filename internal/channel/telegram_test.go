@@ -29,6 +29,9 @@ type mockBot struct {
 	makeReqErr    error
 	updateBatches []json.RawMessage
 	cancelFn      func()
+	// makeReqResponder, if non-nil, is called for every MakeRequest and overrides
+	// the default logic. The call is tracked in makeReqCalls before the responder fires.
+	makeReqResponder func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error)
 }
 
 func newMockBot(_ int) *mockBot {
@@ -62,6 +65,12 @@ func (m *mockBot) MakeRequest(endpoint string, params tgbotapi.Params) (*tgbotap
 	m.makeReqCalls = append(m.makeReqCalls, endpoint)
 	m.makeReqParams = append(m.makeReqParams, params)
 
+	if m.makeReqResponder != nil {
+		responder := m.makeReqResponder
+		m.mu.Unlock()
+		return responder(endpoint, params)
+	}
+
 	if m.makeReqErr != nil {
 		m.mu.Unlock()
 		return nil, m.makeReqErr
@@ -93,8 +102,9 @@ func (m *mockBot) MakeRequest(endpoint string, params tgbotapi.Params) (*tgbotap
 
 // mockStateStore implements model.StateStore in memory for testing.
 type mockStateStore struct {
-	mu      sync.Mutex
-	cursors map[string]*model.Cursor
+	mu               sync.Mutex
+	cursors          map[string]*model.Cursor
+	saveCursorCalls  int
 }
 
 func newMockStateStore() *mockStateStore {
@@ -112,6 +122,7 @@ func (s *mockStateStore) SaveCursor(_ context.Context, channelID string, cursor 
 	defer s.mu.Unlock()
 	c := cursor
 	s.cursors[channelID] = &c
+	s.saveCursorCalls++
 	return nil
 }
 
@@ -2928,5 +2939,569 @@ func TestBuildDeleteFn_CallsDeleteMessagesAPI(t *testing.T) {
 	}
 	if calls[0] != "deleteMessages" {
 		t.Errorf("first call: want %q, got %q", "deleteMessages", calls[0])
+	}
+}
+
+// TestWatch_BackoffOnError verifies that Watch exponentially backs off on
+// consecutive getUpdates errors: 1s → 2s → 4s.
+func TestWatch_BackoffOnError(t *testing.T) {
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	var mu sync.Mutex
+	var sleptDurations []time.Duration
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	callCount := 0
+	bot.makeReqResponder = func(endpoint string, _ tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+		if endpoint != "getUpdates" {
+			return &tgbotapi.APIResponse{Ok: true}, nil
+		}
+		mu.Lock()
+		callCount++
+		n := callCount
+		mu.Unlock()
+		switch n {
+		case 1, 2, 3:
+			return nil, errors.New("network error")
+		default:
+			cancel()
+			return &tgbotapi.APIResponse{Ok: true, Result: json.RawMessage("[]")}, nil
+		}
+	}
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	w.sleeper = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		sleptDurations = append(sleptDurations, d)
+		mu.Unlock()
+		return nil
+	}
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	mu.Lock()
+	got := append([]time.Duration(nil), sleptDurations...)
+	mu.Unlock()
+
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+	if len(got) != len(want) {
+		t.Fatalf("sleep count: want %d, got %d (%v)", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("sleep[%d]: want %v, got %v", i, w, got[i])
+		}
+	}
+}
+
+// TestWatch_RetryAfterRespected verifies that Watch uses RetryAfter from a
+// Telegram API error instead of the exponential backoff duration.
+func TestWatch_RetryAfterRespected(t *testing.T) {
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	var mu sync.Mutex
+	var sleptDurations []time.Duration
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	callCount := 0
+	bot.makeReqResponder = func(endpoint string, _ tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+		if endpoint != "getUpdates" {
+			return &tgbotapi.APIResponse{Ok: true}, nil
+		}
+		mu.Lock()
+		callCount++
+		n := callCount
+		mu.Unlock()
+		if n == 1 {
+			return nil, &tgbotapi.Error{
+				ResponseParameters: tgbotapi.ResponseParameters{RetryAfter: 7},
+			}
+		}
+		cancel()
+		return &tgbotapi.APIResponse{Ok: true, Result: json.RawMessage("[]")}, nil
+	}
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	w.sleeper = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		sleptDurations = append(sleptDurations, d)
+		mu.Unlock()
+		return nil
+	}
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	mu.Lock()
+	got := append([]time.Duration(nil), sleptDurations...)
+	mu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("sleep count: want 1, got %d (%v)", len(got), got)
+	}
+	if got[0] != 7*time.Second {
+		t.Errorf("sleep duration: want 7s, got %v", got[0])
+	}
+}
+
+// TestWatch_BackoffResetsOnSuccess verifies that a successful getUpdates resets
+// the backoff to 1s so the next error starts from the beginning.
+func TestWatch_BackoffResetsOnSuccess(t *testing.T) {
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	var mu sync.Mutex
+	var sleptDurations []time.Duration
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	callCount := 0
+	bot.makeReqResponder = func(endpoint string, _ tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+		if endpoint != "getUpdates" {
+			return &tgbotapi.APIResponse{Ok: true}, nil
+		}
+		mu.Lock()
+		callCount++
+		n := callCount
+		mu.Unlock()
+		switch n {
+		case 1:
+			return nil, errors.New("first error")
+		case 2:
+			return &tgbotapi.APIResponse{Ok: true, Result: json.RawMessage("[]")}, nil
+		case 3:
+			return nil, errors.New("second error")
+		default:
+			cancel()
+			return &tgbotapi.APIResponse{Ok: true, Result: json.RawMessage("[]")}, nil
+		}
+	}
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	w.sleeper = func(_ context.Context, d time.Duration) error {
+		mu.Lock()
+		sleptDurations = append(sleptDurations, d)
+		mu.Unlock()
+		return nil
+	}
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	mu.Lock()
+	got := append([]time.Duration(nil), sleptDurations...)
+	mu.Unlock()
+
+	want := []time.Duration{time.Second, time.Second}
+	if len(got) != len(want) {
+		t.Fatalf("sleep count: want %d, got %d (%v)", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("sleep[%d]: want %v, got %v", i, w, got[i])
+		}
+	}
+}
+
+// TestWatch_BatchCursorSavedOnce verifies that for a batch of 5 updates where all
+// processRawUpdate calls return true, SaveCursor is called exactly once with the
+// update_id of the last update.
+func TestWatch_BatchCursorSavedOnce(t *testing.T) {
+	const groupID int64 = -100
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	chat := makeChat(groupID, "Чат")
+	user := makeUser(1, "u", "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	// All 5 updates in a single batch.
+	bot.setUpdates([]rawUpdate{
+		makeRawUpdate(1, makeMessage(1, chat, user, "раз", 1000)),
+		makeRawUpdate(2, makeMessage(2, chat, user, "два", 2000)),
+		makeRawUpdate(3, makeMessage(3, chat, user, "три", 3000)),
+		makeRawUpdate(4, makeMessage(4, chat, user, "четыре", 4000)),
+		makeRawUpdate(5, makeMessage(5, chat, user, "пять", 5000)),
+	})
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error { return nil })
+
+	state.mu.Lock()
+	calls := state.saveCursorCalls
+	cursor := state.cursors[telegramStateKey]
+	state.mu.Unlock()
+
+	if calls != 1 {
+		t.Errorf("SaveCursor must be called 1 time, got %d", calls)
+	}
+	if cursor == nil {
+		t.Fatal("cursor must be saved")
+	}
+	if cursor.MessageID != "5" {
+		t.Errorf("cursor: want %q, got %q", "5", cursor.MessageID)
+	}
+}
+
+// TestWatch_BatchCursorStopsAtFirstFalse verifies that when the third update in a batch
+// causes processRawUpdate to return false (forward buffer append error), the cursor is
+// saved at the second update and further updates in the batch are not processed.
+func TestWatch_BatchCursorStopsAtFirstFalse(t *testing.T) {
+	const ownerID int64 = 12345
+	const groupID int64 = -100
+
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	buf := newMockForwardBuffer()
+	buf.appendErr = errors.New("db error")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+
+	groupChat := makeChat(groupID, "Чат")
+	regularUser := makeUser(1, "u", "", "")
+	ownerUser := makeUser(ownerID, "owner", "Owner", "")
+	privateChat := makePrivateChat(ownerID)
+
+	// Forwarded private message: triggers handlePrivateDMForBuffer, Append fails, returns false.
+	fwdMsg := &tgbotapi.Message{
+		MessageID:   3,
+		Chat:        privateChat,
+		From:        ownerUser,
+		Text:        "Завтра пришлю слайды",
+		Date:        1700001000,
+		ForwardFrom: ownerUser,
+		ForwardDate: 1700000000,
+	}
+
+	// All 5 updates in one batch.
+	bot.setUpdates([]rawUpdate{
+		makeRawUpdate(1, makeMessage(1, groupChat, regularUser, "раз", 1000)),
+		makeRawUpdate(2, makeMessage(2, groupChat, regularUser, "два", 2000)),
+		makeRawUpdate(3, fwdMsg),
+		makeRawUpdate(4, makeMessage(4, groupChat, regularUser, "четыре", 4000)),
+		makeRawUpdate(5, makeMessage(5, groupChat, regularUser, "пять", 5000)),
+	})
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	var handlerCount int
+	w := newTelegramChannel(bot, TelegramChannelConfig{
+		OwnerIDs:      []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer: buf,
+		ForwardSignal: sigCh,
+	}, state, nil, nil, HistoryConfig{})
+
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
+		handlerCount++
+		return nil
+	})
+
+	state.mu.Lock()
+	calls := state.saveCursorCalls
+	cursor := state.cursors[telegramStateKey]
+	state.mu.Unlock()
+
+	if calls != 1 {
+		t.Errorf("SaveCursor must be called 1 time, got %d", calls)
+	}
+	if cursor == nil {
+		t.Fatal("cursor must be saved")
+	}
+	// Cursor stops at update 2 (before the failing update 3).
+	if cursor.MessageID != "2" {
+		t.Errorf("cursor: want %q (last good update), got %q", "2", cursor.MessageID)
+	}
+	// Only updates 1 and 2 processed (update 3 failed, 4 and 5 not reached).
+	if handlerCount != 2 {
+		t.Errorf("handler call count: want 2, got %d", handlerCount)
+	}
+}
+
+// TestWatch_HandlerErrorStillSavesCursor verifies that a handler error does not block
+// cursor advancement — under the at-least-once semantics, handler errors are logged but
+// the update is considered processed and the cursor advances.
+func TestWatch_HandlerErrorStillSavesCursor(t *testing.T) {
+	const groupID int64 = -100
+	bot := newMockBot(0)
+	state := newMockStateStore()
+
+	chat := makeChat(groupID, "Чат")
+	user := makeUser(1, "u", "", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	bot.cancelFn = cancel
+	bot.setUpdates([]rawUpdate{makeRawUpdate(7, makeMessage(1, chat, user, "тест", 1000))})
+
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
+		return errors.New("pipeline error")
+	})
+
+	state.mu.Lock()
+	cursor := state.cursors[telegramStateKey]
+	state.mu.Unlock()
+
+	if cursor == nil {
+		t.Fatal("cursor must be saved even when handler returns error")
+	}
+	if cursor.MessageID != "7" {
+		t.Errorf("cursor: want %q, got %q", "7", cursor.MessageID)
+	}
+}
+
+// TestForwardSignal_BlocksUntilCapacity verifies that handlePrivateDMForBuffer blocks
+// when the ForwardSignal channel is full, and succeeds once capacity is available.
+func TestForwardSignal_BlocksUntilCapacity(t *testing.T) {
+	const ownerID int64 = 12345
+
+	buf := newMockForwardBuffer()
+	buf.hasLast = true
+	buf.lastTime = time.Unix(1700000000, 0)
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	// Fill the channel so it has no capacity.
+	sigCh <- model.ForwardDispatchSignal{}
+
+	// Drain the channel after 50ms to free capacity.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		<-sigCh
+	}()
+
+	w := newTelegramChannel(newMockBot(0), TelegramChannelConfig{
+		OwnerIDs:             []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer:        buf,
+		ForwardSignal:        sigCh,
+		ForwardSignalTimeout: 500 * time.Millisecond,
+	}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	m := makeMessage(21, makePrivateChat(ownerID), makeUser(ownerID, "owner", "", ""), "обработай", 1700003000)
+	consumed, ok := w.handlePrivateDMForBuffer(context.Background(), m)
+
+	if !consumed {
+		t.Error("want consumed=true")
+	}
+	if !ok {
+		t.Error("want ok=true — signal was eventually sent after capacity freed")
+	}
+	select {
+	case sig := <-sigCh:
+		if sig.ChatID != strconv.FormatInt(ownerID, 10) {
+			t.Errorf("signal ChatID: want %q, got %q", strconv.FormatInt(ownerID, 10), sig.ChatID)
+		}
+	default:
+		t.Error("signal should be in the channel after successful send")
+	}
+}
+
+// TestForwardSignal_TimeoutLogsAndReturnsFalse verifies that when the ForwardSignal channel
+// remains full until the timeout expires, handlePrivateDMForBuffer returns (true, false),
+// signalling that the cursor must not advance and the trigger will be retried.
+func TestForwardSignal_TimeoutLogsAndReturnsFalse(t *testing.T) {
+	const ownerID int64 = 12345
+
+	buf := newMockForwardBuffer()
+	buf.hasLast = true
+	buf.lastTime = time.Unix(1700000000, 0)
+
+	sigCh := make(chan model.ForwardDispatchSignal, 1)
+	// Fill the channel — nobody will drain it.
+	sigCh <- model.ForwardDispatchSignal{}
+
+	w := newTelegramChannel(newMockBot(0), TelegramChannelConfig{
+		OwnerIDs:             []string{strconv.FormatInt(ownerID, 10)},
+		ForwardBuffer:        buf,
+		ForwardSignal:        sigCh,
+		ForwardSignalTimeout: 30 * time.Millisecond,
+	}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	m := makeMessage(22, makePrivateChat(ownerID), makeUser(ownerID, "owner", "", ""), "обработай", 1700003000)
+	consumed, ok := w.handlePrivateDMForBuffer(context.Background(), m)
+
+	if !consumed {
+		t.Error("want consumed=true — message was intercepted as a trigger")
+	}
+	if ok {
+		t.Error("want ok=false — timeout means cursor must not advance, trigger retried on restart")
+	}
+}
+
+// --- VoiceEnqueueFn tests ---
+
+// TestWatch_VoiceDM_EnqueueFnCalled verifies that when VoiceEnqueueFn is set,
+// a voice DM is routed to the enqueue function (not inline transcription),
+// and the handler is NOT called during the Watch loop.
+func TestWatch_VoiceDM_EnqueueFnCalled(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{}
+
+	var enqueued []model.VoiceJob
+	enqueueFn := func(_ context.Context, job model.VoiceJob) error {
+		enqueued = append(enqueued, job)
+		return nil
+	}
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:       []string{"12345"},
+		Transcriber:    tr,
+		Localizer:      makeTestLocalizer(t, "ru"),
+		DownloadFileFn: func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+		VoiceEnqueueFn: enqueueFn,
+	}
+	tgMsg := makeVoiceMessage(5, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "voice_file_1", 15, 1700001000)
+
+	received, _ := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called when VoiceEnqueueFn is set, got %d messages", len(received))
+	}
+	if len(enqueued) != 1 {
+		t.Fatalf("VoiceEnqueueFn must be called once, got %d", len(enqueued))
+	}
+	if enqueued[0].ChatID != ownerID {
+		t.Errorf("enqueued ChatID: want %d, got %d", ownerID, enqueued[0].ChatID)
+	}
+	if enqueued[0].MessageID != 5 {
+		t.Errorf("enqueued MessageID: want 5, got %d", enqueued[0].MessageID)
+	}
+	if enqueued[0].FileID != "voice_file_1" {
+		t.Errorf("enqueued FileID: want %q, got %q", "voice_file_1", enqueued[0].FileID)
+	}
+	if enqueued[0].MimeType != "audio/ogg" {
+		t.Errorf("enqueued MimeType: want %q, got %q", "audio/ogg", enqueued[0].MimeType)
+	}
+	if enqueued[0].Duration != 15*time.Second {
+		t.Errorf("enqueued Duration: want 15s, got %v", enqueued[0].Duration)
+	}
+
+	// Inline transcriber must NOT be called — transcription is async.
+	tr.mu.Lock()
+	calls := tr.calls
+	tr.mu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("inline Transcriber must NOT be called when VoiceEnqueueFn is set, got %d calls", len(calls))
+	}
+}
+
+// TestWatch_VoiceDM_EnqueueFn_TooLong verifies that the duration check fires synchronously
+// even when VoiceEnqueueFn is set: the user gets an immediate reply and nothing is enqueued.
+func TestWatch_VoiceDM_EnqueueFn_TooLong(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{}
+	var enqueued []model.VoiceJob
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:         []string{"12345"},
+		Transcriber:      tr,
+		MaxVoiceDuration: 30 * time.Second,
+		Localizer:        makeTestLocalizer(t, "ru"),
+		DownloadFileFn:   func(_ context.Context, _ string) ([]byte, error) { return []byte("data"), nil },
+		VoiceEnqueueFn: func(_ context.Context, job model.VoiceJob) error {
+			enqueued = append(enqueued, job)
+			return nil
+		},
+	}
+	// 60s > 30s limit
+	tgMsg := makeVoiceMessage(6, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "voice_long", 60, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called for too-long voice, got %d messages", len(received))
+	}
+	if len(enqueued) != 0 {
+		t.Errorf("VoiceEnqueueFn must NOT be called for too-long voice, got %d calls", len(enqueued))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with too_long reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Голосовое слишком длинное (лимит 30s)"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_EnqueueFn_Error verifies that when VoiceEnqueueFn returns an
+// error, the bot sends a "voice.error" reply and the pipeline handler is not called.
+func TestWatch_VoiceDM_EnqueueFn_Error(t *testing.T) {
+	const ownerID int64 = 12345
+
+	tr := &mockTranscriber{}
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:    []string{"12345"},
+		Transcriber: tr,
+		Localizer:   makeTestLocalizer(t, "ru"),
+		VoiceEnqueueFn: func(_ context.Context, _ model.VoiceJob) error {
+			return errors.New("db full")
+		},
+	}
+	tgMsg := makeVoiceMessage(8, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "voice_err", 10, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called when enqueue fails, got %d messages", len(received))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with error reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Не удалось распознать голос, попробуй ещё раз"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
+	}
+}
+
+// TestWatch_VoiceDM_EnqueueFn_NilTranscriber verifies that when Transcriber is nil
+// the "voice.disabled" reply fires synchronously even with VoiceEnqueueFn set,
+// and nothing is enqueued.
+func TestWatch_VoiceDM_EnqueueFn_NilTranscriber(t *testing.T) {
+	const ownerID int64 = 12345
+
+	var enqueued []model.VoiceJob
+
+	cfg := TelegramChannelConfig{
+		OwnerIDs:    []string{"12345"},
+		Transcriber: nil,
+		Localizer:   makeTestLocalizer(t, "ru"),
+		VoiceEnqueueFn: func(_ context.Context, job model.VoiceJob) error {
+			enqueued = append(enqueued, job)
+			return nil
+		},
+	}
+	tgMsg := makeVoiceMessage(7, makePrivateChat(ownerID), &tgbotapi.User{ID: ownerID}, "voice_no_tr", 10, 0)
+
+	received, sendCalled := watchVoice(t, cfg, tgMsg)
+
+	if len(received) != 0 {
+		t.Errorf("handler must NOT be called, got %d messages", len(received))
+	}
+	if len(enqueued) != 0 {
+		t.Errorf("VoiceEnqueueFn must NOT be called when Transcriber is nil, got %d calls", len(enqueued))
+	}
+	if len(sendCalled) != 1 {
+		t.Fatalf("bot.Send must be called once with disabled reply, got %d", len(sendCalled))
+	}
+	msg, ok := sendCalled[0].(tgbotapi.MessageConfig)
+	if !ok {
+		t.Fatal("sent message is not a MessageConfig")
+	}
+	want := "Распознавание голоса не настроено"
+	if msg.Text != want {
+		t.Errorf("reply text: want %q, got %q", want, msg.Text)
 	}
 }

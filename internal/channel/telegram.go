@@ -4,6 +4,7 @@ package channel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -110,6 +111,12 @@ type TelegramChannelConfig struct {
 	// DeleteForwardsAfterExtract controls whether the bot deletes forwarded messages
 	// and the trigger message from the DM after successful task extraction.
 	DeleteForwardsAfterExtract bool
+	// ForwardSignalTimeout is how long to wait for the ForwardSignal channel to accept
+	// a dispatch signal before giving up. 0 defaults to 5 seconds.
+	ForwardSignalTimeout time.Duration
+	// VoiceEnqueueFn enqueues a voice transcription job for asynchronous processing.
+	// When nil, voice messages are transcribed synchronously (legacy behavior).
+	VoiceEnqueueFn func(ctx context.Context, job model.VoiceJob) error
 }
 
 // guardMessages holds language-specific guard UI strings.
@@ -161,6 +168,9 @@ type TelegramChannel struct {
 	botID     int64
 	pending   map[int64]*pendingApproval
 	pendingMu sync.Mutex
+	// sleeper is called on getUpdates errors to pause before the next retry.
+	// Default: context-aware sleep using time.After. Override in tests.
+	sleeper func(context.Context, time.Duration) error
 }
 
 // telegramStateKey is the default cursor key (single account with no ID).
@@ -234,6 +244,9 @@ func newTelegramChannel(bot botAPI, cfg TelegramChannelConfig, state model.State
 	if cfg.WelcomeMessage == "" {
 		cfg.WelcomeMessage = guardMsgs(cfg.Language).welcome
 	}
+	if cfg.ForwardSignalTimeout == 0 {
+		cfg.ForwardSignalTimeout = 5 * time.Second
+	}
 	return &TelegramChannel{
 		bot:        bot,
 		cfg:        cfg,
@@ -244,6 +257,18 @@ func newTelegramChannel(bot botAPI, cfg TelegramChannelConfig, state model.State
 		historyCfg: historyCfg,
 		botID:      botID,
 		pending:    make(map[int64]*pendingApproval),
+		sleeper:    contextSleep,
+	}
+}
+
+// contextSleep pauses for d unless the context is cancelled first.
+// Returns ctx.Err() if the context is cancelled, nil otherwise.
+func contextSleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -251,6 +276,12 @@ func newTelegramChannel(bot botAPI, cfg TelegramChannelConfig, state model.State
 // In "monitor" mode, starts from the last saved update_id + 1.
 // In "backfill" mode, starts from offset 0 (all unprocessed updates).
 // Blocks until the context is cancelled.
+//
+// Cursor is saved once after each batch, at the last update where processing
+// fully succeeded. If processing stops early (processRawUpdate returns false),
+// the cursor is saved at the preceding update so the failed update is retried
+// after a restart. Delivery guarantee: at-least-once. Idempotency is provided
+// by the pipeline layer.
 func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Context, model.Message) error) error {
 	w.recoverPendingFromStore(ctx)
 
@@ -272,6 +303,7 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 		allowedUpdates = string(b)
 	}
 
+	backoff := time.Second
 	for {
 		select {
 		case <-ctx.Done():
@@ -292,9 +324,22 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			slog.ErrorContext(ctx, "fetching updates", "error", err)
+			wait := backoff
+			var tgErr *tgbotapi.Error
+			if errors.As(err, &tgErr) && tgErr.RetryAfter > 0 {
+				wait = time.Duration(tgErr.RetryAfter) * time.Second
+			}
+			slog.ErrorContext(ctx, "fetching updates", "error", err, "wait", wait)
+			if slErr := w.sleeper(ctx, wait); slErr != nil {
+				return slErr
+			}
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
 			continue
 		}
+		backoff = time.Second
 
 		var updates []rawUpdate
 		if err := json.Unmarshal(resp.Result, &updates); err != nil {
@@ -302,25 +347,30 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 			continue
 		}
 
+		lastGoodUpdateID := -1
 		for _, upd := range updates {
+			if ok := w.processRawUpdate(ctx, upd, handler); !ok {
+				break
+			}
 			offset = upd.UpdateID + 1
-			w.processRawUpdate(ctx, upd, handler)
+			lastGoodUpdateID = upd.UpdateID
+		}
+		if lastGoodUpdateID >= 0 {
+			if err := w.saveUpdateCursor(ctx, lastGoodUpdateID); err != nil {
+				slog.Error("saving batch cursor", "error", err, "update_id", lastGoodUpdateID)
+			}
 		}
 	}
 }
 
 // processRawUpdate handles one rawUpdate: guard events, confirmations, and regular messages.
-func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, handler func(context.Context, model.Message) error) {
-	saveCursor := func() {
-		if err := w.saveUpdateCursor(ctx, upd.UpdateID); err != nil {
-			slog.Error("saving cursor", "error", err, "update_id", upd.UpdateID)
-		}
-	}
-
+// Returns true when the update was fully handled and the batch cursor may advance past it.
+// Returns false when processing failed in a way that requires a retry — the Watch loop
+// stops advancing the cursor so the update is replayed after a restart.
+func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, handler func(context.Context, model.Message) error) bool {
 	if upd.MyChatMember != nil {
 		w.handleJoin(ctx, upd.MyChatMember)
-		saveCursor()
-		return
+		return true
 	}
 
 	if upd.MessageReaction != nil {
@@ -344,8 +394,7 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 			slog.InfoContext(ctx, "guard: reaction confirmation accepted", "chat_id", r.Chat.ID)
 			w.confirmChat(ctx, r.Chat.ID)
 		}
-		saveCursor()
-		return
+		return true
 	}
 
 	var tgMsg *tgbotapi.Message
@@ -356,8 +405,7 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 		tgMsg = upd.EditedMessage
 	}
 	if tgMsg == nil {
-		saveCursor()
-		return
+		return true
 	}
 
 	chatID := tgMsg.Chat.ID
@@ -369,31 +417,33 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 		if w.isReplyConfirmation(tgMsg) {
 			w.confirmChat(ctx, chatID)
 		}
-		saveCursor()
-		return
+		return true
 	}
 
 	// Forward batch: intercept private messages before normal conversion so that
 	// forwarded 1:1 messages are routed to the buffer and triggers are dispatched.
 	if tgMsg.Chat.Type == "private" && w.cfg.ForwardBuffer != nil {
-		if w.handlePrivateDMForBuffer(ctx, tgMsg, upd.UpdateID) {
-			return
+		consumed, ok := w.handlePrivateDMForBuffer(ctx, tgMsg)
+		if consumed {
+			return ok
 		}
 	}
 
 	msg, converted := w.convertMessage(tgMsg)
 	if !converted {
-		saveCursor()
-		return
+		return true
 	}
 
 	// Voice handling: transcribe voice/audio DM messages before pipeline processing.
 	// Voice messages in group chats are not transcribed.
 	if msg.Kind == model.MessageKindDM && (tgMsg.Voice != nil || tgMsg.Audio != nil) {
+		if w.cfg.VoiceEnqueueFn != nil {
+			w.enqueueVoice(ctx, tgMsg)
+			return true
+		}
 		text, ok := w.transcribeVoice(ctx, tgMsg)
 		if !ok {
-			saveCursor()
-			return
+			return true
 		}
 		msg.Text = text
 	}
@@ -433,9 +483,8 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 
 	if err := handler(ctx, msg); err != nil {
 		slog.Error("message processing failed", "error", err, "update_id", upd.UpdateID)
-	} else if err := w.saveUpdateCursor(ctx, upd.UpdateID); err != nil {
-		slog.Error("saving cursor", "error", err, "update_id", upd.UpdateID)
 	}
+	return true
 }
 
 // FetchHistory fetches available message history via Bot API getUpdates.
@@ -808,6 +857,98 @@ func (w *TelegramChannel) transcribeVoice(ctx context.Context, tgMsg *tgbotapi.M
 	return text, true
 }
 
+// enqueueVoice performs synchronous pre-flight checks (duration limit, transcriber
+// availability) and enqueues the voice job via cfg.VoiceEnqueueFn for async processing.
+// Replies to the user when a check fails or enqueueing errors.
+func (w *TelegramChannel) enqueueVoice(ctx context.Context, m *tgbotapi.Message) {
+	chatID := m.Chat.ID
+
+	var fileID string
+	var duration int
+	var mimeType string
+	if m.Voice != nil {
+		fileID = m.Voice.FileID
+		duration = m.Voice.Duration
+		mimeType = "audio/ogg"
+	} else if m.Audio != nil {
+		fileID = m.Audio.FileID
+		duration = m.Audio.Duration
+		mimeType = m.Audio.MimeType
+		if mimeType == "" {
+			mimeType = "audio/ogg"
+		}
+	}
+
+	d := time.Duration(duration) * time.Second
+
+	if w.cfg.MaxVoiceDuration > 0 && d > w.cfg.MaxVoiceDuration {
+		w.replyVoiceI18n(ctx, chatID, "voice.too_long", map[string]string{"Limit": w.cfg.MaxVoiceDuration.String()})
+		return
+	}
+
+	if w.cfg.Transcriber == nil {
+		w.replyVoiceI18n(ctx, chatID, "voice.disabled", nil)
+		return
+	}
+
+	job := model.VoiceJob{
+		ChatID:     chatID,
+		MessageID:  m.MessageID,
+		FileID:     fileID,
+		MimeType:   mimeType,
+		Duration:   d,
+		ReceivedAt: time.Unix(int64(m.Date), 0),
+	}
+	if err := w.cfg.VoiceEnqueueFn(ctx, job); err != nil {
+		slog.ErrorContext(ctx, "voice: failed to enqueue", "chat_id", chatID, "err", err)
+		w.replyVoiceI18n(ctx, chatID, "voice.error", nil)
+	}
+}
+
+// BuildVoiceMessage constructs a model.Message for the given VoiceJob and transcribed text.
+// Used by the async voice transcription worker to feed the pipeline handler.
+func (w *TelegramChannel) BuildVoiceMessage(job model.VoiceJob, text string) model.Message {
+	chatID := job.ChatID
+	msg := model.Message{
+		ID: strconv.Itoa(job.MessageID),
+		Source: model.Source{
+			Kind:      "telegram",
+			ID:        "dm",
+			Name:      "DM",
+			AccountID: w.cfg.ID,
+		},
+		Author:    strconv.FormatInt(chatID, 10),
+		Timestamp: job.ReceivedAt,
+		Text:      text,
+		Kind:      model.MessageKindDM,
+		ReplyFn:   w.buildReplyFn(chatID, "dm"),
+	}
+	if w.history != nil {
+		msg.HistoryFn = func(ctx context.Context) ([]model.HistoryEntry, error) {
+			return w.history.RecentActivity(ctx, "dm", w.historyCfg.SilenceGap, w.historyCfg.FallbackLimit)
+		}
+	}
+	return msg
+}
+
+// ReplyVoiceError sends a "voice.error" i18n reply to the given chat.
+// Used by the async voice worker when a job is permanently dropped.
+func (w *TelegramChannel) ReplyVoiceError(ctx context.Context, chatID int64) {
+	w.replyVoiceI18n(ctx, chatID, "voice.error", nil)
+}
+
+// ReplyVoiceEmpty sends a "voice.empty" i18n reply to the given chat.
+// Used by the async voice worker when transcription produces no text.
+func (w *TelegramChannel) ReplyVoiceEmpty(ctx context.Context, chatID int64) {
+	w.replyVoiceI18n(ctx, chatID, "voice.empty", nil)
+}
+
+// DownloadFileFn returns the configured file download function.
+// Used by the async voice worker to download audio files.
+func (w *TelegramChannel) DownloadFileFn() func(context.Context, string) ([]byte, error) {
+	return w.cfg.DownloadFileFn
+}
+
 func (w *TelegramChannel) saveUpdateCursor(ctx context.Context, updateID int) error {
 	return w.state.SaveCursor(ctx, w.stateKey(), model.Cursor{
 		MessageID: strconv.Itoa(updateID),
@@ -1009,15 +1150,18 @@ func isForwardFromUser(m *tgbotapi.Message) bool {
 }
 
 // handlePrivateDMForBuffer intercepts private messages when the forward buffer is enabled.
-// It returns true when the message was fully consumed (appended to buffer or sent as a
-// dispatch trigger), so that processRawUpdate can skip the normal pipeline path.
-func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbotapi.Message, updateID int) bool {
+// Returns (consumed=true, ok=true) when the message was fully handled and the cursor may advance.
+// Returns (consumed=true, ok=false) when the message was intercepted but an error prevents
+// cursor advancement — the update will be retried after a restart.
+// Returns (consumed=false, ok=true) when the message was not intercepted and should proceed
+// through the normal pipeline path.
+func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbotapi.Message) (consumed, ok bool) {
 	if m.From == nil {
-		return false
+		return false, true
 	}
 	authorID := strconv.FormatInt(m.From.ID, 10)
-	if _, ok := w.ownerIDs[authorID]; !ok {
-		return false
+	if _, isOwner := w.ownerIDs[authorID]; !isOwner {
+		return false, true
 	}
 	chatIDStr := strconv.FormatInt(m.Chat.ID, 10)
 
@@ -1025,11 +1169,9 @@ func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbot
 		entry := w.buildForwardEntry(m, chatIDStr)
 		if err := w.cfg.ForwardBuffer.Append(ctx, entry); err != nil {
 			slog.WarnContext(ctx, "appending to forward buffer", "error", err, "chat_id", chatIDStr)
+			return true, false // consumed but failed — cursor should not advance (retry on restart)
 		}
-		if err := w.saveUpdateCursor(ctx, updateID); err != nil {
-			slog.Error("saving cursor after forward append", "error", err, "update_id", updateID)
-		}
-		return true
+		return true, true
 	}
 
 	// Regular (non-forward) DM: if the buffer is non-empty, this message is a trigger.
@@ -1050,19 +1192,30 @@ func (w *TelegramChannel) handlePrivateDMForBuffer(ctx context.Context, m *tgbot
 			if w.cfg.DeleteForwardsAfterExtract {
 				sig.DeleteFn = w.BuildDeleteFn(chatID)
 			}
+			// Try non-blocking first so we succeed even if ctx is already cancelled
+			// (ctx may be cancelled between batch fetch and update processing on shutdown).
 			select {
 			case w.cfg.ForwardSignal <- sig:
+				return true, true
 			default:
-				slog.WarnContext(ctx, "forward signal channel full, dropping trigger", "chat_id", chatIDStr)
 			}
-			if err := w.saveUpdateCursor(ctx, updateID); err != nil {
-				slog.Error("saving cursor after forward trigger", "error", err, "update_id", updateID)
+			// Channel is full: block until capacity frees, ctx is cancelled, or timeout fires.
+			ctxSend, cancelSend := context.WithTimeout(context.Background(), w.cfg.ForwardSignalTimeout)
+			defer cancelSend()
+			select {
+			case w.cfg.ForwardSignal <- sig:
+				return true, true
+			case <-ctx.Done():
+				return true, false
+			case <-ctxSend.Done():
+				slog.ErrorContext(ctx, "forward signal send timed out — trigger will be retried after restart",
+					"chat_id", chatIDStr)
+				return true, false
 			}
-			return true
 		}
 	}
 
-	return false
+	return false, true
 }
 
 // buildForwardEntry constructs a ForwardEntry from a forwarded Telegram message.

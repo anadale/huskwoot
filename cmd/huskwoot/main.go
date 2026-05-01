@@ -163,6 +163,13 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		slog.Info("transcriber configured", "provider", transcriber.Name())
 	}
 
+	var voiceEnqueueFn func(context.Context, model.VoiceJob) error
+	var voiceQueue *storage.SQLiteVoiceQueue
+	if transcriber != nil && cfg.Channels.Telegram != nil {
+		voiceQueue = storage.NewSQLiteVoiceQueue(db)
+		voiceEnqueueFn = voiceQueue.Enqueue
+	}
+
 	forwardEnabled := cfg.Channels.Telegram != nil && cfg.Channels.Telegram.ForwardBatchTimeout > 0
 
 	var forwardBuffer model.ForwardBuffer
@@ -187,7 +194,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	guardStore := storage.NewSQLiteGuardStore(db)
 	telegramBot, tgChannel, tgChannels, notifiers, err := buildTelegramComponents(
 		cfg, stateStore, guardStore, hist, transcriber, cfg.Transcriber.MaxDuration,
-		forwardBuffer, forwardSignalCh,
+		forwardBuffer, forwardSignalCh, voiceEnqueueFn,
 	)
 	if err != nil {
 		return err
@@ -317,6 +324,25 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	if voiceQueue != nil && tgChannel != nil {
+		voiceWorker := transcribe.NewWorker(transcribe.WorkerDeps{
+			Queue:        voiceQueue,
+			Transcriber:  transcriber,
+			DownloadFn:   tgChannel.DownloadFileFn(),
+			Handler:      watchHandler,
+			BuildMessage: tgChannel.BuildVoiceMessage,
+			OnDrop:       tgChannel.ReplyVoiceError,
+			OnEmpty:      tgChannel.ReplyVoiceEmpty,
+			Logger:       logger,
+		})
+		go func() {
+			if err := voiceWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Error("voice worker exited with error", "error", err)
+			}
+		}()
+		logger.Info("voice transcription worker started", "transcriber", transcriber.Name())
 	}
 
 	if forwardEnabled && tgChannel != nil {
@@ -662,6 +688,7 @@ func buildTelegramComponents(
 	maxVoiceDuration time.Duration,
 	forwardBuffer model.ForwardBuffer,
 	forwardSignal chan<- model.ForwardDispatchSignal,
+	voiceEnqueueFn func(context.Context, model.VoiceJob) error,
 ) (*tgbotapi.BotAPI, *channel.TelegramChannel, []model.Channel, []model.Notifier, error) {
 	if cfg.Channels.Telegram == nil {
 		return nil, nil, nil, nil, nil
@@ -693,6 +720,7 @@ func buildTelegramComponents(
 		ForwardBuffer:              forwardBuffer,
 		ForwardSignal:              forwardSignal,
 		DeleteForwardsAfterExtract: tgCfg.DeleteForwardsAfterExtract,
+		VoiceEnqueueFn:             voiceEnqueueFn,
 	}, stateStore, guardStore, hist, channel.HistoryConfig{})
 
 	return bot, tgChannel, []model.Channel{tgChannel}, nil, nil

@@ -255,6 +255,22 @@ type ForwardBuffer interface {
 	ListPendingChats(ctx context.Context, before time.Time) ([]string, error)
 }
 
+// VoiceQueue persists voice transcription jobs between receipt and async processing.
+// Enqueue is idempotent — repeated calls with the same (ChatID, MessageID) are no-ops.
+type VoiceQueue interface {
+	// Enqueue inserts a job into the queue. Duplicate (ChatID, MessageID) pairs are ignored.
+	Enqueue(ctx context.Context, job VoiceJob) error
+	// Claim returns the first job whose next_attempt_at <= now. Returns nil, nil
+	// when the queue is empty or no job is due yet. The job remains in the queue
+	// until the caller calls Complete or Reschedule.
+	Claim(ctx context.Context, now time.Time) (*VoiceJob, error)
+	// Complete permanently removes a job (successful processing or final drop).
+	Complete(ctx context.Context, id int64) error
+	// Reschedule increments attempts, records the last error, and sets the next
+	// attempt time. Used for retryable failures.
+	Reschedule(ctx context.Context, id int64, nextAt time.Time, lastErr string) error
+}
+
 // Transcriber converts a voice/audio recording to plain text.
 // Implementations live in internal/transcribe (WhisperCPP, Yandex).
 type Transcriber interface {

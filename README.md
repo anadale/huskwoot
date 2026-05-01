@@ -55,7 +55,7 @@ delete_forwards_after_extract = false   # clean up forwarded messages after extr
 
 ### Voice Messages in Telegram DM
 
-Send a voice message directly to your bot and it will be transcribed and processed by the DM agent — no typing required. Transcription happens synchronously before the message reaches the agent pipeline; the agent sees plain text and responds normally.
+Send a voice message directly to your bot and it will be transcribed and processed by the DM agent — no typing required. Transcription runs asynchronously in the background; the bot replies once processing completes and automatically retries on transient failures.
 
 Voice messages are supported only in direct messages (DM). Group and @mention voice messages are not transcribed.
 

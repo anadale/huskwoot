@@ -31,7 +31,7 @@ internal/push/                — PushQueue, Dispatcher, Templates, RelayClient
 internal/pushproto/           — shared DTOs and HMAC helpers (instance ↔ relay)
 internal/relay/               — push relay: Store, HMACMiddleware, APNs/FCM adapters, Server
 internal/pairing/             — SQLitePairingStore, Broadcaster, TelegramSender
-internal/transcribe/          — Transcriber implementations (WhisperCPP subprocess, Yandex SpeechKit)
+internal/transcribe/          — Transcriber implementations (WhisperCPP subprocess, Yandex SpeechKit) + async Worker
 api/openapi.yaml              — OpenAPI 3.1, source of truth for the REST API
 ```
 
@@ -58,6 +58,8 @@ Channel.Watch() → Message{Kind, ReactFn, ReplyFn, HistoryFn}
             Classifier.Classify → Skip | Promise
             Promise → Extractor.Extract → TaskService.CreateTasks → notifiers
 ```
+
+DM voice/audio messages bypass the pipeline inline path: `TelegramChannel` enqueues them to `voice_queue` immediately (cursor saved, no transcription in the polling goroutine). `transcribe.Worker` claims jobs asynchronously, downloads the file, transcribes it, and feeds the result back through `Pipeline.Process(MessageKindDM)` via `BuildVoiceMessage`.
 
 Configuration commands (e.g. binding a group chat to a project) are handled through the agent: mention the bot or reply to it (`MessageKindGroupDirect`) and the agent's `set_project` tool performs the binding.
 
@@ -95,6 +97,10 @@ TelegramChannel.handleDirectMessage(m)
   │    IsSelfAuthored = (ForwardFrom.ID == cfg.User.TelegramUserID)
   │    NOT written to SQLiteHistory; NOT sent to pipeline
   │
+  ├─ voice/audio DM → VoiceEnqueueFn(VoiceJob) → voice_queue (async)
+  │    pre-flight: MaxDuration check, Transcriber nil check (sync replies on failure)
+  │    cursor saved; transcribe.Worker picks up later → Pipeline.Process(DM)
+  │
   ├─ regular DM + buffer non-empty → ForwardDispatcher.Submit(signal)
   │    trigger message NOT written to SQLiteHistory; NOT sent to ChatService
   │
@@ -120,6 +126,14 @@ Pipeline `processForwardBatch`:
 
 Transactional invariant: "tasks + buffer clear" are atomic. On crash between commit and Telegram delete, tasks are saved and forwards remain in DM (acceptable). Sweeper handles restart recovery.
 
+### TelegramChannel.Watch internals
+
+**Cursor contract (at-least-once):** The update cursor is saved once per batch after the full batch is processed. If `processRawUpdate` returns `false` for update N, the cursor advances only to update N−1. This ensures at-least-once delivery: on crash mid-batch, updates from that batch are redelivered on restart. Pipeline idempotency absorbs duplicates.
+
+**Backoff on getUpdates errors:** Starts at 1 second, doubles on each consecutive error up to 30 seconds max (`1s → 2s → 4s … 30s`). If the Telegram API returns `RetryAfter`, that duration is used directly. Resets to 1 second on the first successful response.
+
+**ForwardSignal delivery:** `handlePrivateDMForBuffer` blocks for up to `ForwardSignalTimeout` (default 5 seconds) when sending to `ForwardDispatcher`. On timeout, logs `slog.Error` and returns `false`, which prevents the cursor from advancing past that update — the trigger is redelivered on restart.
+
 ### Classifiers
 
 - `SimpleClassifier` (Batch) — `promise` or `skip`
@@ -144,6 +158,7 @@ Stores:
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
 - `push.SQLitePushQueue` — push job queue. Table `push_queue`. `ON DELETE CASCADE` on `event_seq` (retention deletes pending jobs together with events).
 - `storage.SQLiteForwardBuffer` — accumulates forwarded Telegram messages pending extraction. Table `forward_buffer` with `UNIQUE(chat_id, message_id)` for idempotency. Methods: `Append` (INSERT OR IGNORE), `LastReceivedAt`, `LoadBatch` (ordered by `original_date ASC`), `DeleteBatchTx` (tx-aware), `ListPendingChats(before time.Time)` (chats where `MAX(received_at) < before`).
+- `storage.SQLiteVoiceQueue` — pending voice transcription jobs. Table `voice_queue` with `UNIQUE(chat_id, message_id)` for idempotency. Methods: `Enqueue` (INSERT OR IGNORE), `Claim(now)` (next job whose `next_attempt_at <= now`, nil if empty), `Complete` (DELETE on success), `Reschedule(nextAt, lastErr)` (UPDATE attempts++ on failure). `transcribe.Worker` applies backoff 30s → 2m → 10m and drops after 4th attempt.
 
 Human-readable task reference: `<slug>#<number>` (method `Task.DisplayID()`).
 
@@ -289,7 +304,7 @@ delete_forwards_after_extract = false   # delete forwarded messages + trigger fr
 
 ### `[transcriber]`
 
-Voice messages are transcribed only in Telegram **DM** (`MessageKindDM`). Group and GroupDirect voice messages are not transcribed. When `provider = ""` (or the section is absent), the bot replies with `voice.disabled` i18n message and does not crash.
+Voice messages in Telegram **DM** (`MessageKindDM`) are enqueued to `voice_queue` and transcribed asynchronously by `transcribe.Worker`. Group and GroupDirect voice messages are not transcribed. When `provider = ""` (or the section is absent), the bot replies with `voice.disabled` i18n message synchronously (no enqueue) and does not crash. Pre-flight checks (duration limit, provider availability) run synchronously in `TelegramChannel` before enqueue — failures reply immediately without entering the queue.
 
 ```toml
 [transcriber]
