@@ -107,6 +107,7 @@
   "voice.error": "Failed to transcribe voice, please try again",
   "voice.empty": "Couldn't make out the voice, please repeat",
   "voice.too_long": "Voice message is too long (limit {{.Limit}})",
+  "chat.empty_message": "I only understand text and voice — please send your message in words",
   "forward.extracted_tasks": {
     "one": "Extracted {{.Count}} task to project «{{.Project}}»:\n{{.Tasks}}",
     "other": "Extracted {{.Count}} tasks to project «{{.Project}}»:\n{{.Tasks}}"

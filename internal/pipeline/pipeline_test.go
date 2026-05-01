@@ -422,6 +422,78 @@ func TestProcess_DM_EmptyReply_ReactDoneCalledToCleanPending(t *testing.T) {
 	}
 }
 
+func TestProcess_DM_EmptyText_DoesNotCallChatService(t *testing.T) {
+	chat := &mockChatService{reply: model.ChatReply{Text: "не должно вызваться"}}
+	cfg := testConfig()
+	cfg.Chat = chat
+	p := New(cfg)
+
+	var replySent string
+	msg := testDMMsg("owner-123")
+	msg.Text = "   "
+	msg.ReplyFn = func(_ context.Context, text string) error {
+		replySent = text
+		return nil
+	}
+
+	if err := p.Process(context.Background(), msg); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	if chat.calls != 0 {
+		t.Errorf("ChatService must not be called for empty text, called %d times", chat.calls)
+	}
+	if replySent == "" {
+		t.Error("ReplyFn must be called with empty-message hint")
+	}
+}
+
+func TestProcess_DM_EmptyText_NoReactionsSet(t *testing.T) {
+	chat := &mockChatService{reply: model.ChatReply{Text: "ok"}}
+	tracker := &reactTracker{}
+	cfg := testConfig()
+	cfg.Chat = chat
+	p := New(cfg)
+
+	msg := testDMMsg("owner-123")
+	msg.Text = ""
+	msg.ReactFn = tracker.fn
+
+	if err := p.Process(context.Background(), msg); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	if len(tracker.emojis) != 0 {
+		t.Errorf("no reactions expected for empty-text shortcut, got %v", tracker.emojis)
+	}
+}
+
+func TestProcess_GroupDirect_EmptyText_DoesNotCallChatService(t *testing.T) {
+	chat := &mockChatService{reply: model.ChatReply{Text: "не должно вызваться"}}
+	cfg := testConfig()
+	cfg.Chat = chat
+	p := New(cfg)
+
+	var replySent string
+	msg := testGroupDirectMsg("owner-123")
+	msg.Text = ""
+	msg.ReplyFn = func(_ context.Context, text string) error {
+		replySent = text
+		return nil
+	}
+
+	if err := p.Process(context.Background(), msg); err != nil {
+		t.Fatalf("Process returned error: %v", err)
+	}
+
+	if chat.calls != 0 {
+		t.Errorf("ChatService must not be called for empty text, called %d times", chat.calls)
+	}
+	if replySent == "" {
+		t.Error("ReplyFn must be called with empty-message hint")
+	}
+}
+
 // --- Tests: DM/GroupDirect routing — reactions ---
 
 func TestProcess_DM_ReactPendingThenDone(t *testing.T) {

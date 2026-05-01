@@ -183,6 +183,20 @@ func (p *Pipeline) processChat(ctx context.Context, msg model.Message) error {
 		return nil
 	}
 
+	// AI providers reject empty user content with HTTP 400, so short-circuit on
+	// non-textual messages (sticker, media without caption, etc.) and reply with
+	// a localized hint instead of calling the agent.
+	if strings.TrimSpace(msg.Text) == "" {
+		p.logger.DebugContext(ctx, "chat message has empty text, replying with hint",
+			"msg_id", msg.ID, "kind", msg.Kind)
+		if msg.ReplyFn != nil {
+			if err := msg.ReplyFn(ctx, p.localizeMsg("chat.empty_message", nil)); err != nil {
+				p.logger.WarnContext(ctx, "error sending empty-message reply", "msg_id", msg.ID, "error", err)
+			}
+		}
+		return nil
+	}
+
 	p.reactPending(ctx, msg)
 
 	reply, err := p.chat.HandleMessage(ctx, msg)

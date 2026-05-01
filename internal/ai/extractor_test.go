@@ -354,6 +354,84 @@ func TestTaskExtractor_ReactionMessage(t *testing.T) {
 	}
 }
 
+// TestTaskExtractor_ReplyTo_NonReaction_IncludedInPrompt verifies that when a
+// regular (non-reaction) message has ReplyTo set, the parent message text and
+// author appear in the user prompt. Without this, replies to a captioned media
+// or to another user's message lose the goal context (e.g. owner answers
+// "I'll do it by May 6" to "add description in quest" — the goal must reach
+// the model).
+func TestTaskExtractor_ReplyTo_NonReaction_IncludedInPrompt(t *testing.T) {
+	resp := `[{"summary":"задача","deadline":null,"confidence":0.9}]`
+	mock := &mockCompleter{response: resp}
+	e := newTestExtractor(t, mock)
+
+	msg := model.Message{
+		ID:         "msg7",
+		Author:     "user123",
+		AuthorName: "Григорий",
+		Text:       "добавлю до 6 мая",
+		Timestamp:  fixedNow,
+		Source:     model.Source{Kind: "telegram", ID: "chat1"},
+		ReplyTo: &model.Message{
+			Author:     "elmira",
+			AuthorName: "Elmira",
+			Text:       "@Anadale привет! добавьте на беке description в quest?",
+		},
+	}
+
+	if _, err := e.Extract(context.Background(), msg, nil); err != nil {
+		t.Fatalf("Extract() returned error: %v", err)
+	}
+
+	if !strings.Contains(mock.lastUser, "Elmira") {
+		t.Errorf("user prompt must contain ReplyTo author name, prompt:\n%s", mock.lastUser)
+	}
+	if !strings.Contains(mock.lastUser, "description в quest") {
+		t.Errorf("user prompt must contain ReplyTo text, prompt:\n%s", mock.lastUser)
+	}
+	if !strings.Contains(mock.lastUser, "добавлю до 6 мая") {
+		t.Errorf("user prompt must contain message text, prompt:\n%s", mock.lastUser)
+	}
+}
+
+// TestTaskExtractor_ReplyTo_Reaction_NotDuplicated verifies that for reaction
+// messages the ReplyTo block is rendered only once (inside the reaction line)
+// and the non-reaction "В ответ на …" block is NOT added. Otherwise the model
+// would see the parent text twice.
+func TestTaskExtractor_ReplyTo_Reaction_NotDuplicated(t *testing.T) {
+	resp := `[{"summary":"задача","deadline":null,"confidence":0.9}]`
+	mock := &mockCompleter{response: resp}
+	e := newTestExtractor(t, mock)
+
+	msg := model.Message{
+		ID:         "msg8",
+		Author:     "user123",
+		AuthorName: "Григорий",
+		Timestamp:  fixedNow,
+		Source:     model.Source{Kind: "telegram", ID: "chat1"},
+		ReplyTo: &model.Message{
+			Author:     "other",
+			AuthorName: "Другой",
+			Text:       "Напишешь отчёт?",
+		},
+		Reaction: &model.Reaction{Emoji: "👍", UserID: "user123"},
+	}
+
+	if _, err := e.Extract(context.Background(), msg, nil); err != nil {
+		t.Fatalf("Extract() returned error: %v", err)
+	}
+
+	if strings.Contains(mock.lastUser, "В ответ на") {
+		t.Errorf("reaction prompt must not include the non-reaction reply block, prompt:\n%s", mock.lastUser)
+	}
+	if !strings.Contains(mock.lastUser, "Реакция 👍") {
+		t.Errorf("reaction prompt must contain reaction line, prompt:\n%s", mock.lastUser)
+	}
+	if !strings.Contains(mock.lastUser, "Напишешь отчёт?") {
+		t.Errorf("reaction prompt must reference parent text via reaction line, prompt:\n%s", mock.lastUser)
+	}
+}
+
 // TestParseDeadline verifies parseDeadline via TaskExtractor.
 // Indirect testing — via Extract with various deadlines in the model response.
 func TestParseDeadline_Variants(t *testing.T) {

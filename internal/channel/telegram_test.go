@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 
 	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
@@ -596,6 +596,82 @@ func TestConvertMessage_DM_OwnerPrivateChat(t *testing.T) {
 	}
 	if got.Text != "опубликую бекенд сегодня" {
 		t.Errorf("Text: want %q, got %q", "опубликую бекенд сегодня", got.Text)
+	}
+}
+
+// TestConvertMessage_DM_CaptionFallback verifies that when m.Text is empty
+// (e.g. photo/document with caption), the caption is used as the message body.
+func TestConvertMessage_DM_CaptionFallback(t *testing.T) {
+	owner := makeUser(12345, "gregoryn", "Григорий", "")
+	chat := makePrivateChat(12345)
+	msg := makeMessage(1, chat, owner, "", 1700000000)
+	msg.Caption = "сделаю до вечера"
+
+	w := newTelegramChannel(newMockBot(0), TelegramChannelConfig{
+		OwnerIDs: []string{"12345"},
+	}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	got, ok := w.convertUpdate(makeUpdate(1, msg))
+
+	if !ok {
+		t.Fatal("want ok=true for owner DM with caption")
+	}
+	if got.Text != "сделаю до вечера" {
+		t.Errorf("Text: want caption fallback %q, got %q", "сделаю до вечера", got.Text)
+	}
+}
+
+// TestConvertMessage_Group_CaptionFallback verifies caption fallback for group messages.
+func TestConvertMessage_Group_CaptionFallback(t *testing.T) {
+	const groupID int64 = -1001234567890
+	chat := makeChat(groupID, "Рабочий чат")
+	chat.Type = "supergroup"
+	user := makeUser(100, "gregoryn", "Григорий", "")
+	msg := makeMessage(42, chat, user, "", 1700000000)
+	msg.Caption = "пришлю отчёт завтра"
+
+	w := newTelegramChannel(newMockBot(0), TelegramChannelConfig{}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	got, ok := w.convertUpdate(makeUpdate(1, msg))
+
+	if !ok {
+		t.Fatal("want ok=true for group message with caption")
+	}
+	if got.Text != "пришлю отчёт завтра" {
+		t.Errorf("Text: want caption fallback %q, got %q", "пришлю отчёт завтра", got.Text)
+	}
+}
+
+// TestConvertMessage_Group_ReplyTo_CaptionFallback verifies that when a group
+// message replies to a media message (photo/video/document) with caption, the
+// caption is exposed as ReplyTo.Text. Without this, the AI classifier and
+// extractor lose the original promise context (the goal/target stays in
+// the caption while the user's reply is just an agreement like "да").
+func TestConvertMessage_Group_ReplyTo_CaptionFallback(t *testing.T) {
+	const groupID int64 = -1001234567890
+	chat := makeChat(groupID, "Рабочий чат")
+	chat.Type = "supergroup"
+
+	colleague := makeUser(200, "colleague", "Коллега", "")
+	origMsg := makeMessage(10, chat, colleague, "", 1699000000)
+	origMsg.Caption = "Сделай отчёт до завтра"
+
+	owner := makeUser(100, "gregoryn", "Григорий", "")
+	replyMsg := makeMessage(11, chat, owner, "да", 1699001000)
+	replyMsg.ReplyToMessage = origMsg
+
+	w := newTelegramChannel(newMockBot(0), TelegramChannelConfig{}, newMockStateStore(), nil, nil, HistoryConfig{})
+
+	got, ok := w.convertUpdate(makeUpdate(1, replyMsg))
+
+	if !ok {
+		t.Fatal("want ok=true for group reply with caption parent")
+	}
+	if got.ReplyTo == nil {
+		t.Fatal("ReplyTo: want non-nil, got nil")
+	}
+	if got.ReplyTo.Text != "Сделай отчёт до завтра" {
+		t.Errorf("ReplyTo.Text: want caption fallback %q, got %q", "Сделай отчёт до завтра", got.ReplyTo.Text)
 	}
 }
 

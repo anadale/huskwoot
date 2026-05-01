@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode/utf16"
 
-	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	goI18n "github.com/nicksnyder/go-i18n/v2/i18n"
 
 	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
@@ -512,7 +512,7 @@ func (w *TelegramChannel) convertMessage(m *tgbotapi.Message) (model.Message, bo
 			AccountID: w.cfg.ID,
 		},
 		Timestamp: time.Unix(int64(m.Date), 0),
-		Text:      m.Text,
+		Text:      messageBodyText(m),
 		Kind:      kind,
 	}
 
@@ -570,7 +570,7 @@ func (w *TelegramChannel) convertDMMessage(m *tgbotapi.Message) (model.Message, 
 		Author:     authorID,
 		AuthorName: buildDisplayName(m.From),
 		Timestamp:  time.Unix(int64(m.Date), 0),
-		Text:       m.Text,
+		Text:       messageBodyText(m),
 		Kind:       model.MessageKindDM,
 	}
 
@@ -610,7 +610,7 @@ func (w *TelegramChannel) convertReplyMessage(m *tgbotapi.Message) model.Message
 			AccountID: w.cfg.ID,
 		},
 		Timestamp: time.Unix(int64(m.Date), 0),
-		Text:      m.Text,
+		Text:      messageBodyText(m),
 	}
 	if m.From != nil {
 		msg.Author = strconv.FormatInt(m.From.ID, 10)
@@ -650,6 +650,16 @@ func (w *TelegramChannel) isBotDirected(m *tgbotapi.Message) bool {
 	}
 
 	return false
+}
+
+// messageBodyText returns the textual body of a Telegram message: m.Text for
+// plain text messages, or m.Caption for media (photo, video, document, etc.)
+// when Text is empty. Returns an empty string for media without a caption.
+func messageBodyText(m *tgbotapi.Message) string {
+	if m.Text != "" {
+		return m.Text
+	}
+	return m.Caption
 }
 
 // buildDisplayName builds the display name for a user.
@@ -1085,11 +1095,6 @@ func (w *TelegramChannel) buildForwardEntry(m *tgbotapi.Message, chatID string) 
 		_, isSelf = w.ownerIDs[forwardFromID]
 	}
 
-	text := m.Text
-	if text == "" {
-		text = m.Caption
-	}
-
 	return model.ForwardEntry{
 		ChatID:          chatID,
 		MessageID:       strconv.Itoa(m.MessageID),
@@ -1098,7 +1103,7 @@ func (w *TelegramChannel) buildForwardEntry(m *tgbotapi.Message, chatID string) 
 		IsSelfAuthored:  isSelf,
 		OriginalDate:    time.Unix(int64(m.ForwardDate), 0),
 		ReceivedAt:      time.Unix(int64(m.Date), 0),
-		Text:            text,
+		Text:            messageBodyText(m),
 	}
 }
 

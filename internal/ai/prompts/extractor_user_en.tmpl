@@ -3,7 +3,8 @@
 {{end}}
 
 {{end}}Text for analysis:
-{{if .Reaction}}Reaction {{.Reaction.Emoji}}{{if .ReplyTo}} to "{{.ReplyTo.Text}}"{{end}}{{else}}{{if .Subject}}Subject: {{.Subject}}
+{{if .Reaction}}Reaction {{.Reaction.Emoji}}{{if .ReplyTo}} to "{{.ReplyTo.Text}}"{{end}}{{else}}{{if .ReplyTo}}In reply to a message from {{.ReplyTo.AuthorName}}: "{{.ReplyTo.Text}}"
+{{end}}{{if .Subject}}Subject: {{.Subject}}
 {{end}}{{.Text}}{{end}}
 
 Current date and time: {{.Now}}

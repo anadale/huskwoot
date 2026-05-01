@@ -2,7 +2,8 @@
 {{range .History}}[{{.Timestamp.Format "2006-01-02 15:04"}}] {{.AuthorName}}: {{.Text}}
 {{end}}
 {{end}}Текст для анализа:
-{{if .Reaction}}Реакция {{.Reaction.Emoji}}{{if .ReplyTo}} на "{{.ReplyTo.Text}}"{{end}}{{else}}{{if .Subject}}Тема: {{.Subject}}
+{{if .Reaction}}Реакция {{.Reaction.Emoji}}{{if .ReplyTo}} на "{{.ReplyTo.Text}}"{{end}}{{else}}{{if .ReplyTo}}В ответ на сообщение от {{.ReplyTo.AuthorName}}: "{{.ReplyTo.Text}}"
+{{end}}{{if .Subject}}Тема: {{.Subject}}
 {{end}}{{.Text}}{{end}}
 
 Текущая дата и время: {{.Now}}
