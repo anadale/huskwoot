@@ -1538,3 +1538,95 @@ func TestUpdateTaskTxRollback(t *testing.T) {
 		t.Errorf("after Rollback Status = %q, want %q", got.Status, "open")
 	}
 }
+
+// TestDeleteClosedOlderThan verifies that only done/cancelled tasks
+// closed before the cutoff are removed; open tasks and recently closed
+// tasks are preserved.
+func TestDeleteClosedOlderThan(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	old := now.Add(-30 * 24 * time.Hour)
+	recent := now.Add(-1 * time.Hour)
+
+	openTask := newTask(store.DefaultProjectID(), "открытая")
+	if err := createTaskHelper(t, db, store, openTask); err != nil {
+		t.Fatalf("CreateTask open: %v", err)
+	}
+
+	doneOld := newTask(store.DefaultProjectID(), "давно завершённая")
+	if err := createTaskHelper(t, db, store, doneOld); err != nil {
+		t.Fatalf("CreateTask doneOld: %v", err)
+	}
+	statusDone := "done"
+	if err := updateTaskHelper(t, db, store, doneOld.ID, model.TaskUpdate{
+		Status: &statusDone, ClosedAt: ptrToPtrTime(old),
+	}); err != nil {
+		t.Fatalf("UpdateTask doneOld: %v", err)
+	}
+
+	cancelledOld := newTask(store.DefaultProjectID(), "давно отменённая")
+	if err := createTaskHelper(t, db, store, cancelledOld); err != nil {
+		t.Fatalf("CreateTask cancelledOld: %v", err)
+	}
+	statusCancelled := "cancelled"
+	if err := updateTaskHelper(t, db, store, cancelledOld.ID, model.TaskUpdate{
+		Status: &statusCancelled, ClosedAt: ptrToPtrTime(old),
+	}); err != nil {
+		t.Fatalf("UpdateTask cancelledOld: %v", err)
+	}
+
+	doneRecent := newTask(store.DefaultProjectID(), "недавно завершённая")
+	if err := createTaskHelper(t, db, store, doneRecent); err != nil {
+		t.Fatalf("CreateTask doneRecent: %v", err)
+	}
+	if err := updateTaskHelper(t, db, store, doneRecent.ID, model.TaskUpdate{
+		Status: &statusDone, ClosedAt: ptrToPtrTime(recent),
+	}); err != nil {
+		t.Fatalf("UpdateTask doneRecent: %v", err)
+	}
+
+	cutoff := now.Add(-14 * 24 * time.Hour)
+	deleted, err := store.DeleteClosedOlderThan(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("DeleteClosedOlderThan: %v", err)
+	}
+	if deleted != 2 {
+		t.Errorf("deleted = %d, want 2", deleted)
+	}
+
+	if got, _ := store.GetTask(ctx, openTask.ID); got == nil {
+		t.Error("open task was deleted, must remain")
+	}
+	if got, _ := store.GetTask(ctx, doneRecent.ID); got == nil {
+		t.Error("recently closed task was deleted, must remain")
+	}
+	if got, _ := store.GetTask(ctx, doneOld.ID); got != nil {
+		t.Error("old done task was not deleted")
+	}
+	if got, _ := store.GetTask(ctx, cancelledOld.ID); got != nil {
+		t.Error("old cancelled task was not deleted")
+	}
+}
+
+// TestDeleteClosedOlderThan_EmptyTable returns zero with no error
+// when the tasks table contains no closed tasks.
+func TestDeleteClosedOlderThan_EmptyTable(t *testing.T) {
+	store, _ := newTaskStore(t)
+
+	deleted, err := store.DeleteClosedOlderThan(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("DeleteClosedOlderThan: %v", err)
+	}
+	if deleted != 0 {
+		t.Errorf("deleted = %d, want 0", deleted)
+	}
+}
+
+// ptrToPtrTime returns a non-nil **time.Time wrapping the given time,
+// for use with model.TaskUpdate.ClosedAt (a pointer-to-pointer field).
+func ptrToPtrTime(t time.Time) **time.Time {
+	tp := &t
+	return &tp
+}

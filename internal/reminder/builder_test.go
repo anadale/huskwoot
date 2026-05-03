@@ -70,6 +70,9 @@ func (m *mockTaskStore) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ 
 func (m *mockTaskStore) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
 	return []string{}, nil
 }
+func (m *mockTaskStore) DeleteClosedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
 
 // --- helpers ---
 

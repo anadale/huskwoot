@@ -424,23 +424,30 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	})
 
 	retentionRunner := events.NewRunner(events.RunnerConfig{
-		Events:          eventStore,
-		Queue:           pushQueue,
-		Pairing:         pairingStore,
-		Devices:         deviceStore,
-		Revoker:         relayClient,
-		VoiceChecker:    voiceQueue,
-		UploadsDir:      uploadsDir,
-		EventRetention:  cfg.API.EventsRetention,
-		DeviceInactive:  cfg.Devices.InactiveThreshold,
-		DeviceRetention: cfg.Devices.RetentionPeriod,
-		Logger:          logger,
+		Events:              eventStore,
+		Queue:               pushQueue,
+		Pairing:             pairingStore,
+		Devices:             deviceStore,
+		Revoker:             relayClient,
+		VoiceChecker:        voiceQueue,
+		UploadsDir:          uploadsDir,
+		EventRetention:      cfg.API.EventsRetention,
+		DeviceInactive:      cfg.Devices.InactiveThreshold,
+		DeviceRetention:     cfg.Devices.RetentionPeriod,
+		Tasks:               taskStore,
+		TaskClosedRetention: cfg.Tasks.ClosedRetention,
+		TaskCleanupHour:     cfg.Tasks.CleanupHour,
+		TaskCleanupMinute:   cfg.Tasks.CleanupMinute,
+		TaskCleanupTZ:       loc,
+		Logger:              logger,
 	})
 	go retentionRunner.Run(ctx)
 	logger.Info("retention runner active",
 		"events_retention", cfg.API.EventsRetention,
 		"device_inactive", cfg.Devices.InactiveThreshold,
 		"device_retention", cfg.Devices.RetentionPeriod,
+		"task_closed_retention", cfg.Tasks.ClosedRetention,
+		"task_cleanup_time", cfg.Tasks.CleanupTime,
 	)
 
 	if cfg.Push.Enabled() {

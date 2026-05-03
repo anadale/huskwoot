@@ -220,6 +220,9 @@ func (m *mockTaskStoreForTasks) RemoveProjectAliasTx(_ context.Context, _ *sql.T
 func (m *mockTaskStoreForTasks) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
 	return []string{}, nil
 }
+func (m *mockTaskStoreForTasks) DeleteClosedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
 
 // mockEventStore is a mock of model.EventStore.
 type mockEventStore struct {

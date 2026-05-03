@@ -627,6 +627,27 @@ func (s *SQLiteTaskStore) MoveTaskTx(ctx context.Context, tx *sql.Tx, taskID, ne
 	return nil
 }
 
+// DeleteClosedOlderThan deletes tasks with status "done" or "cancelled"
+// whose closed_at is strictly before cutoff. Returns the number of deleted rows.
+// Tasks without closed_at are skipped — their close time is unknown.
+func (s *SQLiteTaskStore) DeleteClosedOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM tasks
+		 WHERE status IN ('done', 'cancelled')
+		   AND closed_at IS NOT NULL
+		   AND closed_at < ?`,
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("deleting closed tasks older than %s: %w", cutoff.Format(time.RFC3339), err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("checking deleted tasks count: %w", err)
+	}
+	return n, nil
+}
+
 // nullableTime converts *time.Time to *string for SQLite storage.
 func nullableTime(t *time.Time) *string {
 	if t == nil {

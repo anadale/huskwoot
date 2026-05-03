@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/usecase"
@@ -137,6 +138,9 @@ func (m *mockTaskStoreForProjects) ListAliasesForProject(_ context.Context, proj
 		}
 	}
 	return []string{}, nil
+}
+func (m *mockTaskStoreForProjects) DeleteClosedOlderThan(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
 }
 
 type mockMetaStoreForProjects struct {

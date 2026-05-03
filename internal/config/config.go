@@ -239,6 +239,24 @@ func (p PushConfig) Enabled() bool {
 	return p.RelayURL != "" && p.InstanceID != "" && p.InstanceSecret != ""
 }
 
+// TasksConfig describes retention windows and schedule for the closed-task
+// cleanup. The cleanup runs at most once per day at CleanupTime in the user
+// timezone (DateTime.Timezone).
+type TasksConfig struct {
+	// ClosedRetentionRaw is the period after closed_at before a done/cancelled
+	// task is physically deleted. Go duration string (e.g. "336h" = 14 days).
+	// Default: 336h. "0" or "0s" disables the cleanup.
+	ClosedRetentionRaw string `toml:"closed_retention"`
+	// ClosedRetention is the parsed value.
+	ClosedRetention time.Duration `toml:"-"`
+	// CleanupTime is the local time-of-day in "HH:MM" format at which the
+	// daily cleanup runs (in the DateTime.Timezone). Default: "04:00".
+	CleanupTime string `toml:"cleanup_time"`
+	// CleanupHour and CleanupMinute are the parsed components of CleanupTime.
+	CleanupHour   int `toml:"-"`
+	CleanupMinute int `toml:"-"`
+}
+
 // DevicesConfig describes retention windows for client devices.
 type DevicesConfig struct {
 	// InactiveThresholdRaw is the idle period after which a device is auto-revoked.
@@ -314,6 +332,7 @@ type Config struct {
 	API         APIConfig         `toml:"api"`
 	Push        PushConfig        `toml:"push"`
 	Devices     DevicesConfig     `toml:"devices"`
+	Tasks       TasksConfig       `toml:"tasks"`
 	Transcriber TranscriberConfig `toml:"transcriber"`
 }
 
@@ -508,9 +527,49 @@ func (c *Config) validate() error {
 		return err
 	}
 
+	if err := c.validateTasks(); err != nil {
+		return err
+	}
+
 	if err := c.validateTranscriber(); err != nil {
 		return err
 	}
+
+	return nil
+}
+
+// defaultTaskClosedRetention is the default retention period for done/cancelled tasks.
+const defaultTaskClosedRetention = 14 * 24 * time.Hour
+
+// defaultTaskCleanupTime is the default daily cleanup time-of-day.
+const defaultTaskCleanupTime = "04:00"
+
+// validateTasks validates and normalizes the [tasks] section.
+func (c *Config) validateTasks() error {
+	t := &c.Tasks
+
+	if t.ClosedRetentionRaw == "" {
+		t.ClosedRetention = defaultTaskClosedRetention
+	} else {
+		d, err := time.ParseDuration(t.ClosedRetentionRaw)
+		if err != nil {
+			return fmt.Errorf("tasks.closed_retention %q: %w", t.ClosedRetentionRaw, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("tasks.closed_retention must be non-negative, got %v", d)
+		}
+		t.ClosedRetention = d
+	}
+
+	if t.CleanupTime == "" {
+		t.CleanupTime = defaultTaskCleanupTime
+	}
+	h, m, err := parseHHMM(t.CleanupTime)
+	if err != nil {
+		return fmt.Errorf("tasks.cleanup_time %q: %w", t.CleanupTime, err)
+	}
+	t.CleanupHour = h
+	t.CleanupMinute = m
 
 	return nil
 }
