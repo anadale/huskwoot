@@ -294,11 +294,11 @@ retry_max_attempts  = 4
 
 ```toml
 [devices]
-inactive_threshold = "720h"   # 30 дней без активности → auto-revoke
-retention_period   = "2160h"  # 90 дней после revoke → физическое удаление
+inactive_threshold = "720h"   # 30 days without activity → auto-revoke
+retention_period   = "2160h"  # 90 days after revoke → physical delete
 ```
 
-Retention runner каждый час (`events.Runner.Tick`) перебирает `DeviceStore.ListInactive(now - inactive_threshold)` и для каждой записи делает `Revoke` + `RelayClient.DeleteRegistration`. Ошибка relay логируется, но не прерывает локальный revoke. Отдельно вызывается `DeleteRevokedOlderThan(now - retention_period)` для физического удаления из таблицы `devices`. Значение `0` в любой из настроек отключает соответствующий sweep; в обычном режиме работы используются дефолты 30 / 90 дней.
+The retention runner runs every hour (`events.Runner.Tick`): it iterates `DeviceStore.ListInactive(now - inactive_threshold)` and for each entry calls `Revoke` + `RelayClient.DeleteRegistration`. Relay errors are logged but do not abort the local revoke. Separately, `DeleteRevokedOlderThan(now - retention_period)` is invoked to physically delete rows from the `devices` table. A value of `0` in either setting disables the corresponding sweep; the default operating values are 30 / 90 days.
 
 ### `[tasks]`
 
