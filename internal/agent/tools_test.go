@@ -182,6 +182,10 @@ func (m *mockTaskService) GetTaskByRef(_ context.Context, _ string, _ int) (*mod
 	return m.getTaskByRefResult, m.getTaskByRefErr
 }
 
+func (m *mockTaskService) PurgeClosedOlderThan(_ context.Context, _ time.Time) (int, error) {
+	return 0, nil
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // mockProjectService
 

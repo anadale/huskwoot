@@ -139,8 +139,11 @@ func (m *mockTaskStoreForProjects) ListAliasesForProject(_ context.Context, proj
 	}
 	return []string{}, nil
 }
-func (m *mockTaskStoreForProjects) DeleteClosedOlderThan(_ context.Context, _ time.Time) (int64, error) {
-	return 0, nil
+func (m *mockTaskStoreForProjects) ListClosedOlderThan(_ context.Context, _ time.Time) ([]model.Task, error) {
+	return nil, nil
+}
+func (m *mockTaskStoreForProjects) DeleteTaskTx(_ context.Context, _ *sql.Tx, _ string) error {
+	return nil
 }
 
 type mockMetaStoreForProjects struct {

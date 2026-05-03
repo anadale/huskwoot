@@ -220,8 +220,21 @@ func (m *mockTaskStoreForTasks) RemoveProjectAliasTx(_ context.Context, _ *sql.T
 func (m *mockTaskStoreForTasks) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
 	return []string{}, nil
 }
-func (m *mockTaskStoreForTasks) DeleteClosedOlderThan(_ context.Context, _ time.Time) (int64, error) {
-	return 0, nil
+func (m *mockTaskStoreForTasks) ListClosedOlderThan(_ context.Context, cutoff time.Time) ([]model.Task, error) {
+	var out []model.Task
+	for _, t := range m.tasks {
+		if (t.Status != "done" && t.Status != "cancelled") || t.ClosedAt == nil {
+			continue
+		}
+		if t.ClosedAt.Before(cutoff) {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+func (m *mockTaskStoreForTasks) DeleteTaskTx(_ context.Context, _ *sql.Tx, id string) error {
+	delete(m.tasks, id)
+	return nil
 }
 
 // mockEventStore is a mock of model.EventStore.
@@ -899,6 +912,112 @@ func TestTaskService_UpdateTask_NoChanges_DoesNotEmitEvent(t *testing.T) {
 	_, changed := parseTaskPayload(t, evs[0].Payload)
 	if len(changed) != 0 {
 		t.Fatalf("changedFields=%v, want [] (no real changes)", changed)
+	}
+}
+
+func TestTaskService_PurgeClosedOlderThan_DeletesAndEmitsEvents(t *testing.T) {
+	f := newTestFixture(t)
+	now := time.Now().UTC()
+	old1 := now.Add(-30 * 24 * time.Hour)
+	old2 := now.Add(-20 * 24 * time.Hour)
+	recent := now.Add(-time.Hour)
+
+	f.tasks.tasks["old-done"] = &model.Task{
+		ID: "old-done", ProjectID: "inbox-uuid", ProjectSlug: "inbox",
+		Number: 1, Status: "done", Summary: "давнее", ClosedAt: &old1,
+	}
+	f.tasks.tasks["old-cancelled"] = &model.Task{
+		ID: "old-cancelled", ProjectID: "inbox-uuid", ProjectSlug: "inbox",
+		Number: 2, Status: "cancelled", Summary: "отменённое", ClosedAt: &old2,
+	}
+	f.tasks.tasks["recent-done"] = &model.Task{
+		ID: "recent-done", ProjectID: "inbox-uuid", ProjectSlug: "inbox",
+		Number: 3, Status: "done", Summary: "свежее", ClosedAt: &recent,
+	}
+	f.tasks.tasks["open-task"] = &model.Task{
+		ID: "open-task", ProjectID: "inbox-uuid", ProjectSlug: "inbox",
+		Number: 4, Status: "open", Summary: "открытое",
+	}
+
+	f.devices.activeIDs = []string{"device-A", "device-B"}
+	f.broker.active["device-A"] = true // device-B inactive → enqueued
+
+	cutoff := now.Add(-14 * 24 * time.Hour)
+	deleted, err := f.svc.PurgeClosedOlderThan(context.Background(), cutoff)
+	if err != nil {
+		t.Fatalf("PurgeClosedOlderThan: %v", err)
+	}
+	if deleted != 2 {
+		t.Fatalf("deleted=%d, want 2", deleted)
+	}
+
+	if _, ok := f.tasks.tasks["old-done"]; ok {
+		t.Errorf("old-done not removed from store")
+	}
+	if _, ok := f.tasks.tasks["old-cancelled"]; ok {
+		t.Errorf("old-cancelled not removed from store")
+	}
+	if _, ok := f.tasks.tasks["recent-done"]; !ok {
+		t.Errorf("recent-done was removed, must remain")
+	}
+	if _, ok := f.tasks.tasks["open-task"]; !ok {
+		t.Errorf("open-task was removed, must remain")
+	}
+
+	evs := f.events.recorded()
+	if len(evs) != 2 {
+		t.Fatalf("events=%d, want 2", len(evs))
+	}
+	for _, ev := range evs {
+		if ev.Kind != model.EventTaskDeleted {
+			t.Errorf("event kind=%q, want %q", ev.Kind, model.EventTaskDeleted)
+		}
+		taskData, _ := parseTaskPayload(t, ev.Payload)
+		if len(taskData) == 0 {
+			t.Errorf("event %s: task payload is empty", ev.Kind)
+		}
+	}
+
+	notified := f.broker.notifiedEvents()
+	if len(notified) != 2 {
+		t.Fatalf("broker notified %d events, want 2 (clients must learn about deletion via SSE)", len(notified))
+	}
+
+	// device-B is inactive → expect 2 push enqueues (one per deleted task).
+	enq := f.queue.snapshot()
+	var bCount int
+	for _, e := range enq {
+		if e.DeviceID == "device-B" {
+			bCount++
+		}
+	}
+	if bCount != 2 {
+		t.Errorf("push enqueued for inactive device-B = %d, want 2", bCount)
+	}
+}
+
+func TestTaskService_PurgeClosedOlderThan_NoMatches(t *testing.T) {
+	f := newTestFixture(t)
+	now := time.Now().UTC()
+	recent := now.Add(-time.Hour)
+	f.tasks.tasks["recent-done"] = &model.Task{
+		ID: "recent-done", ProjectID: "inbox-uuid", ProjectSlug: "inbox",
+		Number: 1, Status: "done", Summary: "свежее", ClosedAt: &recent,
+	}
+
+	cutoff := now.Add(-14 * 24 * time.Hour)
+	deleted, err := f.svc.PurgeClosedOlderThan(context.Background(), cutoff)
+	if err != nil {
+		t.Fatalf("PurgeClosedOlderThan: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted=%d, want 0", deleted)
+	}
+	if len(f.events.recorded()) != 0 {
+		t.Errorf("events recorded when nothing to delete")
+	}
+	if len(f.broker.notifiedEvents()) != 0 {
+		t.Errorf("broker notified when nothing to delete")
 	}
 }
 

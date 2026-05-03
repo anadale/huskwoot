@@ -350,6 +350,54 @@ func (s *taskService) updateAndEmit(ctx context.Context, id string, upd model.Ta
 	return task, nil
 }
 
+// PurgeClosedOlderThan deletes done/cancelled tasks whose closed_at is strictly
+// before cutoff and emits a task_deleted event for each one. Reads snapshots
+// before deletion (so the event payload carries the deleted task), then
+// performs delete + event-insert + push-enqueue inside a single transaction.
+// Broker is notified after commit.
+func (s *taskService) PurgeClosedOlderThan(ctx context.Context, cutoff time.Time) (int, error) {
+	tasks, err := s.tasks.ListClosedOlderThan(ctx, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("список устаревших задач: %w", err)
+	}
+	if len(tasks) == 0 {
+		return 0, nil
+	}
+
+	activeIDs, err := s.devices.ListActiveIDs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("список активных устройств: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("открытие транзакции: %w", err)
+	}
+	defer tx.Rollback()
+
+	pendingEvents := make([]model.Event, 0, len(tasks))
+	for i := range tasks {
+		t := &tasks[i]
+		if err := s.tasks.DeleteTaskTx(ctx, tx, t.ID); err != nil {
+			return 0, fmt.Errorf("удаление задачи %s: %w", t.ID, err)
+		}
+		ev, err := s.recordEvent(ctx, tx, model.EventTaskDeleted, t.ID, wrapTaskPayload(t, nil), activeIDs)
+		if err != nil {
+			return 0, err
+		}
+		pendingEvents = append(pendingEvents, ev)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit транзакции: %w", err)
+	}
+
+	for _, ev := range pendingEvents {
+		s.broker.Notify(ev)
+	}
+	return len(pendingEvents), nil
+}
+
 // recordEvent serialises the payload, inserts the event, enqueues it for
 // inactive devices, and returns the event with its assigned seq.
 func (s *taskService) recordEvent(

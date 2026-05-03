@@ -434,7 +434,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		EventRetention:      cfg.API.EventsRetention,
 		DeviceInactive:      cfg.Devices.InactiveThreshold,
 		DeviceRetention:     cfg.Devices.RetentionPeriod,
-		Tasks:               taskStore,
+		TaskCleanup:         taskSvc.PurgeClosedOlderThan,
 		TaskClosedRetention: cfg.Tasks.ClosedRetention,
 		TaskCleanupHour:     cfg.Tasks.CleanupHour,
 		TaskCleanupMinute:   cfg.Tasks.CleanupMinute,

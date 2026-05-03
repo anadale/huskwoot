@@ -1539,10 +1539,10 @@ func TestUpdateTaskTxRollback(t *testing.T) {
 	}
 }
 
-// TestDeleteClosedOlderThan verifies that only done/cancelled tasks
-// closed before the cutoff are removed; open tasks and recently closed
-// tasks are preserved.
-func TestDeleteClosedOlderThan(t *testing.T) {
+// TestListClosedOlderThan verifies that only done/cancelled tasks closed
+// before the cutoff are listed; open tasks and recently closed tasks are
+// excluded.
+func TestListClosedOlderThan(t *testing.T) {
 	store, db := newTaskStore(t)
 	ctx := context.Background()
 
@@ -1588,12 +1588,31 @@ func TestDeleteClosedOlderThan(t *testing.T) {
 	}
 
 	cutoff := now.Add(-14 * 24 * time.Hour)
-	deleted, err := store.DeleteClosedOlderThan(ctx, cutoff)
+	listed, err := store.ListClosedOlderThan(ctx, cutoff)
 	if err != nil {
-		t.Fatalf("DeleteClosedOlderThan: %v", err)
+		t.Fatalf("ListClosedOlderThan: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("deleted = %d, want 2", deleted)
+	if len(listed) != 2 {
+		t.Fatalf("listed %d tasks, want 2", len(listed))
+	}
+
+	gotIDs := map[string]bool{listed[0].ID: true, listed[1].ID: true}
+	if !gotIDs[doneOld.ID] {
+		t.Errorf("doneOld %s not listed", doneOld.ID)
+	}
+	if !gotIDs[cancelledOld.ID] {
+		t.Errorf("cancelledOld %s not listed", cancelledOld.ID)
+	}
+
+	if err := withTx(t, db, func(tx *sql.Tx) error {
+		for _, task := range listed {
+			if err := store.DeleteTaskTx(ctx, tx, task.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("DeleteTaskTx: %v", err)
 	}
 
 	if got, _ := store.GetTask(ctx, openTask.ID); got == nil {
@@ -1610,17 +1629,17 @@ func TestDeleteClosedOlderThan(t *testing.T) {
 	}
 }
 
-// TestDeleteClosedOlderThan_EmptyTable returns zero with no error
+// TestListClosedOlderThan_EmptyTable returns an empty slice with no error
 // when the tasks table contains no closed tasks.
-func TestDeleteClosedOlderThan_EmptyTable(t *testing.T) {
+func TestListClosedOlderThan_EmptyTable(t *testing.T) {
 	store, _ := newTaskStore(t)
 
-	deleted, err := store.DeleteClosedOlderThan(context.Background(), time.Now().UTC())
+	listed, err := store.ListClosedOlderThan(context.Background(), time.Now().UTC())
 	if err != nil {
-		t.Fatalf("DeleteClosedOlderThan: %v", err)
+		t.Fatalf("ListClosedOlderThan: %v", err)
 	}
-	if deleted != 0 {
-		t.Errorf("deleted = %d, want 0", deleted)
+	if len(listed) != 0 {
+		t.Errorf("listed %d tasks, want 0", len(listed))
 	}
 }
 

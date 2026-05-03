@@ -63,8 +63,11 @@ type RunnerConfig struct {
 	// DeviceRetention is the time after which a revoked device is physically
 	// deleted from the store. Zero disables the physical deletion sweep.
 	DeviceRetention time.Duration
-	// Tasks is the task store; nil disables closed-task cleanup.
-	Tasks model.TaskStore
+	// TaskCleanup deletes closed tasks older than cutoff and returns the number
+	// of tasks deleted. Implemented by TaskService.PurgeClosedOlderThan; the
+	// runner uses a function so the events package does not depend on the
+	// use-case layer. nil disables the closed-task cleanup.
+	TaskCleanup func(ctx context.Context, cutoff time.Time) (int, error)
 	// TaskClosedRetention is the period after closed_at before a done/cancelled
 	// task is physically deleted. Zero or negative disables the cleanup.
 	TaskClosedRetention time.Duration
@@ -93,7 +96,7 @@ type Runner struct {
 	eventRetention      time.Duration
 	deviceInactive      time.Duration
 	deviceRetention     time.Duration
-	tasks               model.TaskStore
+	taskCleanup         func(ctx context.Context, cutoff time.Time) (int, error)
 	taskClosedRetention time.Duration
 	taskCleanupHour     int
 	taskCleanupMinute   int
@@ -124,7 +127,7 @@ func NewRunner(cfg RunnerConfig) *Runner {
 		eventRetention:      cfg.EventRetention,
 		deviceInactive:      cfg.DeviceInactive,
 		deviceRetention:     cfg.DeviceRetention,
-		tasks:               cfg.Tasks,
+		taskCleanup:         cfg.TaskCleanup,
 		taskClosedRetention: cfg.TaskClosedRetention,
 		taskCleanupHour:     cfg.TaskCleanupHour,
 		taskCleanupMinute:   cfg.TaskCleanupMinute,
@@ -189,7 +192,7 @@ func (r *Runner) Tick(ctx context.Context, now time.Time) error {
 // scheduled time-of-day has been reached. The next-fire time is recomputed
 // after each successful trigger so the sweep runs at most once per local day.
 func (r *Runner) sweepClosedTasks(ctx context.Context, now time.Time) {
-	if r.tasks == nil || r.taskClosedRetention <= 0 {
+	if r.taskCleanup == nil || r.taskClosedRetention <= 0 {
 		return
 	}
 	if r.nextTaskCleanup.IsZero() {
@@ -201,7 +204,7 @@ func (r *Runner) sweepClosedTasks(ctx context.Context, now time.Time) {
 	}
 
 	cutoff := now.Add(-r.taskClosedRetention)
-	n, err := r.tasks.DeleteClosedOlderThan(ctx, cutoff)
+	n, err := r.taskCleanup(ctx, cutoff)
 	if err != nil {
 		r.logger.Warn("tasks: closed cleanup", "error", err)
 	} else if n > 0 {

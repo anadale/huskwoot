@@ -526,30 +526,29 @@ func TestRetentionRunStopsOnContextCancel(t *testing.T) {
 	}
 }
 
-// stubTaskStore implements model.TaskStore for task-cleanup tests.
-type stubTaskStore struct {
-	model.TaskStore
+// stubTaskCleanup is a TaskCleanup function stub for task-cleanup tests.
+type stubTaskCleanup struct {
 	calls    atomic.Int32
 	lastCut  time.Time
-	returned int64
+	returned int
 	err      error
 }
 
-func (s *stubTaskStore) DeleteClosedOlderThan(_ context.Context, cutoff time.Time) (int64, error) {
+func (s *stubTaskCleanup) Cleanup(_ context.Context, cutoff time.Time) (int, error) {
 	s.calls.Add(1)
 	s.lastCut = cutoff
 	return s.returned, s.err
 }
 
 func TestRetentionRunner_TaskCleanupSkipsBeforeScheduledTime(t *testing.T) {
-	tasks := &stubTaskStore{returned: 5}
+	tasks := &stubTaskCleanup{returned: 5}
 	tz := time.UTC
 	now := time.Date(2026, 4, 19, 2, 0, 0, 0, tz) // 02:00, before 04:00
 
 	runner := events.NewRunner(events.RunnerConfig{
 		Events:              &stubEventStore{},
 		Queue:               &stubPushQueue{},
-		Tasks:               tasks,
+		TaskCleanup:         tasks.Cleanup,
 		TaskClosedRetention: 14 * 24 * time.Hour,
 		TaskCleanupHour:     4,
 		TaskCleanupMinute:   0,
@@ -562,12 +561,12 @@ func TestRetentionRunner_TaskCleanupSkipsBeforeScheduledTime(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 	if tasks.calls.Load() != 0 {
-		t.Fatalf("DeleteClosedOlderThan called on first tick before scheduled time, want 0")
+		t.Fatalf("TaskCleanup called on first tick before scheduled time, want 0")
 	}
 }
 
 func TestRetentionRunner_TaskCleanupRunsAtScheduledTime(t *testing.T) {
-	tasks := &stubTaskStore{returned: 7}
+	tasks := &stubTaskCleanup{returned: 7}
 	tz := time.UTC
 	retention := 14 * 24 * time.Hour
 	startup := time.Date(2026, 4, 19, 2, 0, 0, 0, tz)
@@ -576,7 +575,7 @@ func TestRetentionRunner_TaskCleanupRunsAtScheduledTime(t *testing.T) {
 	runner := events.NewRunner(events.RunnerConfig{
 		Events:              &stubEventStore{},
 		Queue:               &stubPushQueue{},
-		Tasks:               tasks,
+		TaskCleanup:         tasks.Cleanup,
 		TaskClosedRetention: retention,
 		TaskCleanupHour:     4,
 		TaskCleanupMinute:   0,
@@ -598,7 +597,7 @@ func TestRetentionRunner_TaskCleanupRunsAtScheduledTime(t *testing.T) {
 		t.Fatalf("Tick afterSlot: %v", err)
 	}
 	if tasks.calls.Load() != 1 {
-		t.Fatalf("DeleteClosedOlderThan called %d times, want 1", tasks.calls.Load())
+		t.Fatalf("TaskCleanup called %d times, want 1", tasks.calls.Load())
 	}
 	expected := afterSlot.Add(-retention)
 	if !tasks.lastCut.Equal(expected) {
@@ -625,14 +624,14 @@ func TestRetentionRunner_TaskCleanupRunsAtScheduledTime(t *testing.T) {
 }
 
 func TestRetentionRunner_TaskCleanupDisabledWhenZeroRetention(t *testing.T) {
-	tasks := &stubTaskStore{}
+	tasks := &stubTaskCleanup{}
 	tz := time.UTC
 	now := time.Date(2026, 4, 19, 4, 30, 0, 0, tz)
 
 	runner := events.NewRunner(events.RunnerConfig{
 		Events:              &stubEventStore{},
 		Queue:               &stubPushQueue{},
-		Tasks:               tasks,
+		TaskCleanup:         tasks.Cleanup,
 		TaskClosedRetention: 0,
 		TaskCleanupHour:     4,
 		TaskCleanupTZ:       tz,
@@ -644,12 +643,12 @@ func TestRetentionRunner_TaskCleanupDisabledWhenZeroRetention(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 	if tasks.calls.Load() != 0 {
-		t.Fatalf("DeleteClosedOlderThan called when retention is 0, want 0")
+		t.Fatalf("TaskCleanup called when retention is 0, want 0")
 	}
 }
 
 func TestRetentionRunner_TaskCleanupErrorDoesNotCrash(t *testing.T) {
-	tasks := &stubTaskStore{err: errors.New("disk full")}
+	tasks := &stubTaskCleanup{err: errors.New("disk full")}
 	tz := time.UTC
 	startup := time.Date(2026, 4, 19, 2, 0, 0, 0, tz)
 	afterSlot := time.Date(2026, 4, 19, 4, 30, 0, 0, tz)
@@ -657,7 +656,7 @@ func TestRetentionRunner_TaskCleanupErrorDoesNotCrash(t *testing.T) {
 	runner := events.NewRunner(events.RunnerConfig{
 		Events:              &stubEventStore{},
 		Queue:               &stubPushQueue{},
-		Tasks:               tasks,
+		TaskCleanup:         tasks.Cleanup,
 		TaskClosedRetention: 14 * 24 * time.Hour,
 		TaskCleanupHour:     4,
 		TaskCleanupTZ:       tz,
@@ -670,7 +669,7 @@ func TestRetentionRunner_TaskCleanupErrorDoesNotCrash(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 	if tasks.calls.Load() != 1 {
-		t.Fatalf("DeleteClosedOlderThan calls = %d, want 1", tasks.calls.Load())
+		t.Fatalf("TaskCleanup calls = %d, want 1", tasks.calls.Load())
 	}
 }
 

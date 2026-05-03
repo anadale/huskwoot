@@ -133,10 +133,15 @@ type TaskStore interface {
 	// ListAliasesForProject returns the aliases for a project sorted lexicographically.
 	// Returns an empty slice when the project has no aliases.
 	ListAliasesForProject(ctx context.Context, projectID string) ([]string, error)
-	// DeleteClosedOlderThan deletes tasks with status "done" or "cancelled"
-	// whose closed_at is strictly before cutoff. Returns the number of deleted rows.
-	// Used by the retention runner to bound the size of the tasks table.
-	DeleteClosedOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+	// ListClosedOlderThan returns full snapshots of tasks with status
+	// "done"/"cancelled" whose closed_at is strictly before cutoff. Used by the
+	// retention purge so the use-case can emit task_deleted events with the
+	// task payload before deleting the rows.
+	ListClosedOlderThan(ctx context.Context, cutoff time.Time) ([]Task, error)
+	// DeleteTaskTx physically deletes a task row by id within the given
+	// transaction. Returns nil even when no row matches — callers pre-validate
+	// existence via the corresponding read.
+	DeleteTaskTx(ctx context.Context, tx *sql.Tx, id string) error
 }
 
 // SummaryDeliverer delivers a task digest to a single channel (Telegram, email, ...).
