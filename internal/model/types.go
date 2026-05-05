@@ -158,6 +158,10 @@ type Message struct {
 	HistoryFn func(ctx context.Context) ([]HistoryEntry, error)
 	// ForwardBatch carries the forward batch payload; non-nil only when Kind == MessageKindForwardBatch.
 	ForwardBatch *ForwardBatchPayload
+	// ProjectHint is an optional project context hint from the client. When non-nil, the agent
+	// uses it as the default project for new tasks if the message does not explicitly name another.
+	// Set only for client voice jobs that include a projectId in the request metadata.
+	ProjectHint *Project
 }
 
 // Task describes a task extracted from a user promise.

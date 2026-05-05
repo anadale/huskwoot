@@ -75,15 +75,30 @@ type Config struct {
 	Relay push.RelayClient
 	// DateTime holds date/time configuration served at GET /v1/datetime/config.
 	DateTime config.DateTimeConfig
+	// VoiceQueue is the voice job queue for POST /v1/chat/voice. If nil, the route is not mounted.
+	VoiceQueue model.VoiceQueue
+	// UploadsDir is the base directory for client audio file storage.
+	UploadsDir string
+	// VoiceMaxBytes is the max audio upload size in bytes (default 10 MiB).
+	VoiceMaxBytes int64
+	// VoiceDuration is the max allowed audio duration (default: no limit).
+	VoiceDuration time.Duration
+	// Transcriber is the speech-to-text backend. Used by Task 9b to return 503 when nil.
+	Transcriber model.Transcriber
+	// TaskStore is the task/project store used by POST /v1/chat/voice to validate projectId.
+	TaskStore model.TaskStore
+	// VoiceRateLimit is the per-device rate limit for POST /v1/chat/voice, per minute. 0 → default 10.
+	VoiceRateLimit int
 }
 
 // Server wraps http.Server and a chi router.
 type Server struct {
-	cfg        Config
-	logger     *slog.Logger
-	db         *sql.DB
-	handler    http.Handler
-	pairingHdl *pairingHandler
+	cfg          Config
+	logger       *slog.Logger
+	db           *sql.DB
+	handler      http.Handler
+	pairingHdl   *pairingHandler
+	chatVoiceHdl *chatVoiceHandler
 }
 
 // New builds the server with applied middleware and base endpoints.
@@ -182,9 +197,14 @@ func (s *Server) routes() http.Handler {
 			}
 
 			if s.cfg.Chat != nil {
-				ch := newChatHandler(s.cfg.Chat, s.cfg.History, s.cfg.ChatTimeout, s.logger)
+				ch := newChatHandler(s.cfg.Chat, s.cfg.History, s.cfg.DB, s.cfg.Events, s.cfg.Broker, s.cfg.ChatTimeout, s.logger)
 				v1.Post("/chat", ch.post)
 				v1.Get("/chat/history", ch.getHistory)
+			}
+
+			if s.cfg.VoiceQueue != nil {
+				s.chatVoiceHdl = newChatVoiceHandler(s.cfg.VoiceQueue, s.cfg.UploadsDir, s.cfg.VoiceMaxBytes, s.cfg.VoiceDuration, s.cfg.TaskStore, s.cfg.Transcriber, newVoiceRateLimiter(s.cfg.VoiceRateLimit), s.logger)
+				v1.With(s.chatVoiceHdl.rateLimitMiddleware).Post("/chat/voice", s.chatVoiceHdl.post)
 			}
 
 			if s.cfg.Events != nil && s.cfg.Broker != nil {
@@ -249,6 +269,9 @@ func (s *Server) Run(ctx context.Context) error {
 
 	if s.pairingHdl != nil {
 		go s.pairingHdl.limiter.Sweep(ctx, time.Hour)
+	}
+	if s.chatVoiceHdl != nil {
+		go s.chatVoiceHdl.rateLimiter.Sweep(ctx, time.Hour)
 	}
 
 	errCh := make(chan error, 1)

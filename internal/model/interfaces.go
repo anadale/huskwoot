@@ -39,6 +39,11 @@ type History interface {
 	// Add adds a record to the history for the given source channel.
 	Add(ctx context.Context, source string, entry HistoryEntry) error
 
+	// AddTx inserts a record within the caller-owned transaction and returns
+	// the generated messageID (UUID v4). The caller is responsible for commit/rollback.
+	// TTL and MaxMessages cleanup are NOT performed — use Add for standalone writes.
+	AddTx(ctx context.Context, tx *sql.Tx, source string, entry HistoryEntry) (messageID string, err error)
+
 	// Recent returns the last limit records from the given source channel.
 	Recent(ctx context.Context, source string, limit int) ([]HistoryEntry, error)
 
@@ -253,6 +258,22 @@ type ForwardBuffer interface {
 	DeleteBatchTx(ctx context.Context, tx *sql.Tx, chatID string) error
 	// ListPendingChats returns chat IDs whose MAX(received_at) is strictly before the given threshold.
 	ListPendingChats(ctx context.Context, before time.Time) ([]string, error)
+}
+
+// VoiceConsumer handles the result of voice transcription for a specific source kind.
+// Consume is called on success; Fail is called when the job is permanently dropped
+// (max attempts reached) or when transcription produces an empty result (cause = ErrEmptyTranscript).
+type VoiceConsumer interface {
+	Consume(ctx context.Context, job VoiceJob, transcript string) error
+	Fail(ctx context.Context, job VoiceJob, cause error)
+}
+
+// VoiceDownloader downloads the raw audio bytes for a voice job.
+// Returns []byte for direct use with Transcriber.AudioInput.Data.
+// The caller limits the read to voice_max_bytes via MaxBytesReader before passing data here;
+// implementations may impose their own limit as well.
+type VoiceDownloader interface {
+	Download(ctx context.Context, job VoiceJob) ([]byte, error)
 }
 
 // VoiceQueue persists voice transcription jobs between receipt and async processing.

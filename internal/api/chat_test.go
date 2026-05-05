@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,6 +380,255 @@ type chatHistoryEntryDTO struct {
 	AuthorName string    `json:"authorName"`
 	Text       string    `json:"text"`
 	Timestamp  time.Time `json:"timestamp"`
+}
+
+// ---- chat_message_created SSE event tests ----
+
+// fakeBroker is a minimal mock for model.Broker that records Notify calls.
+type fakeBroker struct {
+	mu     sync.Mutex
+	events []model.Event
+}
+
+func (b *fakeBroker) Subscribe(_ string) (<-chan model.Event, func()) {
+	ch := make(chan model.Event, 1)
+	return ch, func() {}
+}
+
+func (b *fakeBroker) IsActive(_ string) bool { return false }
+
+func (b *fakeBroker) Notify(ev model.Event) {
+	b.mu.Lock()
+	b.events = append(b.events, ev)
+	b.mu.Unlock()
+}
+
+func (b *fakeBroker) notified() []model.Event {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]model.Event, len(b.events))
+	copy(out, b.events)
+	return out
+}
+
+// chatEventHarness extends chatTestHarness with a real EventStore and mock Broker.
+type chatEventHarness struct {
+	*chatTestHarness
+	eventStore *events.SQLiteEventStore
+	broker     *fakeBroker
+}
+
+func newChatEventHarness(t *testing.T, chat *fakeChatService) *chatEventHarness {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := storage.OpenDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("OpenDB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	history := storage.NewSQLiteHistory(db, storage.SQLiteHistoryOptions{})
+	eventStore := events.NewSQLiteEventStore(db)
+	broker := &fakeBroker{}
+
+	token := "chat-event-token"
+	device := createTestDevice(t, db, "test-event-device", token)
+
+	cfg := api.Config{
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DB:      db,
+		Devices: devices.NewSQLiteDeviceStore(db),
+		Chat:    chat,
+		History: history,
+		Events:  eventStore,
+		Broker:  broker,
+		Owner:   api.OwnerInfo{UserName: "Oliver"},
+	}
+	srv := api.New(cfg)
+
+	base := &chatTestHarness{
+		t:       t,
+		db:      db,
+		server:  srv,
+		token:   token,
+		device:  device,
+		chat:    chat,
+		history: history,
+		cfg:     cfg,
+	}
+	return &chatEventHarness{
+		chatTestHarness: base,
+		eventStore:      eventStore,
+		broker:          broker,
+	}
+}
+
+func TestPostChatEmitsChatMessageCreatedEvents(t *testing.T) {
+	chat := &fakeChatService{reply: model.ChatReply{Text: "ответ агента"}}
+	h := newChatEventHarness(t, chat)
+
+	rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "привет"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	evs, err := h.eventStore.SinceSeq(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("SinceSeq: %v", err)
+	}
+
+	chatEvs := make([]model.Event, 0, 2)
+	for _, ev := range evs {
+		if ev.Kind == model.EventChatMessageCreated {
+			chatEvs = append(chatEvs, ev)
+		}
+	}
+	if len(chatEvs) != 2 {
+		t.Fatalf("want 2 chat_message_created events, got %d", len(chatEvs))
+	}
+
+	var userPayload struct {
+		MessageID string `json:"messageId"`
+		Source    struct {
+			Kind string `json:"kind"`
+			ID   string `json:"id"`
+		} `json:"source"`
+		Role      string    `json:"role"`
+		Text      string    `json:"text"`
+		CreatedAt time.Time `json:"createdAt"`
+		AudioJobID string   `json:"audioJobId,omitempty"`
+	}
+	if err := json.Unmarshal(chatEvs[0].Payload, &userPayload); err != nil {
+		t.Fatalf("unmarshal user event: %v", err)
+	}
+	if userPayload.Role != "user" {
+		t.Fatalf("first event role=%q, want user", userPayload.Role)
+	}
+	if userPayload.Text != "привет" {
+		t.Fatalf("first event text=%q", userPayload.Text)
+	}
+	if userPayload.Source.Kind != "client" {
+		t.Fatalf("source.kind=%q, want client", userPayload.Source.Kind)
+	}
+	if userPayload.Source.ID != h.device.ID {
+		t.Fatalf("source.id=%q, want %q", userPayload.Source.ID, h.device.ID)
+	}
+	if userPayload.MessageID == "" {
+		t.Fatal("user event messageId is empty")
+	}
+	if userPayload.AudioJobID != "" {
+		t.Fatalf("user text event must not have audioJobId, got %q", userPayload.AudioJobID)
+	}
+
+	var agentPayload struct {
+		Role string `json:"role"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(chatEvs[1].Payload, &agentPayload); err != nil {
+		t.Fatalf("unmarshal agent event: %v", err)
+	}
+	if agentPayload.Role != "agent" {
+		t.Fatalf("second event role=%q, want agent", agentPayload.Role)
+	}
+	if agentPayload.Text != "ответ агента" {
+		t.Fatalf("second event text=%q", agentPayload.Text)
+	}
+}
+
+func TestPostChatBrokerNotifiedTwice(t *testing.T) {
+	chat := &fakeChatService{reply: model.ChatReply{Text: "пинг"}}
+	h := newChatEventHarness(t, chat)
+
+	rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "понг"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	notified := h.broker.notified()
+	count := 0
+	for _, ev := range notified {
+		if ev.Kind == model.EventChatMessageCreated {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("broker notified %d chat_message_created events, want 2", count)
+	}
+}
+
+func TestPostChatHTTPResponseUnchangedWithEvents(t *testing.T) {
+	chat := &fakeChatService{reply: model.ChatReply{
+		Text:            "ответ",
+		TasksTouched:    []string{"t-1"},
+		ProjectsTouched: []string{"p-1"},
+	}}
+	h := newChatEventHarness(t, chat)
+
+	rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "запрос"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Reply           string   `json:"reply"`
+		TasksTouched    []string `json:"tasksTouched"`
+		ProjectsTouched []string `json:"projectsTouched"`
+	}
+	decodeJSONResp(t, rec.Body, &resp)
+	if resp.Reply != "ответ" {
+		t.Fatalf("reply=%q", resp.Reply)
+	}
+	if len(resp.TasksTouched) != 1 || resp.TasksTouched[0] != "t-1" {
+		t.Fatalf("tasksTouched=%v", resp.TasksTouched)
+	}
+	if len(resp.ProjectsTouched) != 1 || resp.ProjectsTouched[0] != "p-1" {
+		t.Fatalf("projectsTouched=%v", resp.ProjectsTouched)
+	}
+}
+
+func TestPostChatAgentErrorPreservesUserEvent(t *testing.T) {
+	chat := &fakeChatService{err: errors.New("агент сломан")}
+	h := newChatEventHarness(t, chat)
+
+	rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "привет"}, nil)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", rec.Code)
+	}
+
+	evs, err := h.eventStore.SinceSeq(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("SinceSeq: %v", err)
+	}
+
+	chatEvs := make([]model.Event, 0)
+	for _, ev := range evs {
+		if ev.Kind == model.EventChatMessageCreated {
+			chatEvs = append(chatEvs, ev)
+		}
+	}
+	if len(chatEvs) != 1 {
+		t.Fatalf("want 1 chat_message_created (user only) on agent error, got %d", len(chatEvs))
+	}
+	var payload struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(chatEvs[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if payload.Role != "user" {
+		t.Fatalf("event role=%q, want user", payload.Role)
+	}
+
+	// Broker must have been notified exactly once (user event only).
+	notified := h.broker.notified()
+	count := 0
+	for _, ev := range notified {
+		if ev.Kind == model.EventChatMessageCreated {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("broker notified %d times, want 1 (user only)", count)
+	}
 }
 
 // TestChatEndpointsUnavailableIfServiceNotConfigured — a guard test: when

@@ -542,6 +542,82 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+  /v1/chat/voice:
+    post:
+      tags: [chat]
+      summary: Submit a voice message to the agent (async)
+      description: |
+        Accepts a multipart upload containing audio and metadata. The server
+        saves the file to disk, enqueues a transcription job, and returns 202
+        immediately. The transcription result and agent reply are delivered via
+        the /v1/events SSE stream as two consecutive `chat_message_created`
+        events (role=user for the transcript, role=agent for the reply).
+        On transcription failure a `voice_failed` event is emitted instead.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [audio, metadata]
+              properties:
+                audio:
+                  type: string
+                  format: binary
+                  description: Raw audio bytes. Content-Type must match metadata.mimeType.
+                metadata:
+                  $ref: "#/components/schemas/VoiceChatMetadata"
+      responses:
+        "202":
+          description: Voice job accepted; result will arrive via /v1/events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceJobCreatedResponse"
+        "400":
+          description: |
+            Input validation error. Codes: `invalid_audio` (missing audio part),
+            `invalid_metadata` (missing or malformed metadata JSON, or mimeType mismatch),
+            `duration_too_long` (durationMs exceeds server max_duration),
+            `project_not_found` (projectId UUID does not exist).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Audio file exceeds the server-configured voice_max_bytes limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          description: mimeType is not in the accepted list (audio/ogg;codecs=opus, audio/mp4, audio/webm;codecs=opus).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Per-device rate limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal server error (e.g. failure to write upload file or enqueue the job).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Transcription provider is not configured (transcriber.provider is empty).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /v1/events:
     get:
       tags: [events]
@@ -552,6 +628,9 @@ paths:
         periodic keepalive comments. If the client has fallen behind the retention
         window, the server sends a `reset` event with the current last_seq and
         closes the channel — the client must perform a cold re-sync via /v1/sync/snapshot.
+
+        Event kinds: `task_created`, `task_completed`, `task_updated`, `task_moved`,
+        `task_reopened`, `project_updated`, `chat_message_created`, `voice_failed`.
       parameters:
         - in: header
           name: Last-Event-ID
@@ -886,12 +965,19 @@ components:
                 - alias_conflicts_with_name
                 - alias_limit_reached
                 - alias_forbidden_for_inbox
+                - invalid_audio
+                - invalid_metadata
+                - duration_too_long
+                - project_not_found
+                - audio_too_large
+                - unsupported_media_type
+                - transcriber_disabled
             message:
               type: string
               description: Human-readable error message.
     Me:
       type: object
-      required: [deviceId, ownerName, version]
+      required: [deviceId, ownerName, version, voiceEnabled]
       properties:
         deviceId:
           type: string
@@ -904,6 +990,12 @@ components:
         version:
           type: string
           description: API version (see info.version).
+        voiceEnabled:
+          type: boolean
+          description: |
+            True when the server has a transcription provider configured
+            (transcriber.provider != ""). Clients should hide the voice
+            recording button when false.
     Project:
       type: object
       required: [id, slug, name, description, aliases, taskCounter, createdAt]
@@ -1187,6 +1279,99 @@ components:
           type: string
           nullable: true
           description: Bearer token for authorization (only when status=confirmed; shown once).
+    VoiceChatMetadata:
+      type: object
+      required: [durationMs, mimeType]
+      properties:
+        durationMs:
+          type: integer
+          minimum: 0
+          description: Duration of the audio recording in milliseconds.
+          example: 3500
+        mimeType:
+          type: string
+          description: |
+            MIME type of the audio file. Must match the Content-Type of the
+            audio part and be one of the accepted types.
+          enum:
+            - "audio/ogg;codecs=opus"
+            - "audio/mp4"
+            - "audio/webm;codecs=opus"
+        projectId:
+          type: string
+          format: uuid
+          description: |
+            Optional project context hint. When the client is displaying a specific
+            project screen, pass its UUID so the agent uses it as the default for
+            new tasks. Server validates the project exists; unknown UUID → 400.
+    VoiceJobCreatedResponse:
+      type: object
+      required: [jobId, createdAt]
+      properties:
+        jobId:
+          type: string
+          format: uuid
+          description: Stable UUID for correlating SSE events (audioJobId / voice_failed.jobId).
+        createdAt:
+          type: string
+          format: date-time
+          description: Server-side timestamp when the job was enqueued.
+    ChatMessageCreatedEvent:
+      type: object
+      required: [messageId, source, role, text, createdAt]
+      description: |
+        SSE event emitted for every agent interaction: text chat (POST /v1/chat)
+        and voice chat (POST /v1/chat/voice). Two events are emitted per turn:
+        role=user (transcript or typed text) followed by role=agent (agent reply).
+      properties:
+        messageId:
+          type: string
+          format: uuid
+          description: Stable UUID of the message row in the history store.
+        source:
+          type: object
+          required: [kind, id]
+          properties:
+            kind:
+              type: string
+              enum: [client]
+              description: Source kind; currently always "client" for HTTP-originated messages.
+            id:
+              type: string
+              format: uuid
+              description: Device UUID of the originating client.
+        role:
+          type: string
+          enum: [user, agent]
+        text:
+          type: string
+          description: Message text (transcript for voice, typed text for chat).
+        audioJobId:
+          type: string
+          format: uuid
+          description: Present only when the message originated from a voice job (POST /v1/chat/voice).
+        createdAt:
+          type: string
+          format: date-time
+    VoiceFailedEvent:
+      type: object
+      required: [jobId, code, message]
+      description: SSE event emitted when a voice transcription job fails after all retry attempts.
+      properties:
+        jobId:
+          type: string
+          format: uuid
+          description: The jobId returned by POST /v1/chat/voice.
+        code:
+          type: string
+          enum:
+            - transcription_failed
+            - invalid_audio
+            - agent_failed
+          description: Machine-readable failure reason.
+        message:
+          type: string
+          description: Human-readable description of the failure (locale-aware).
     SyncSnapshot:
       type: object
       required: [projects, openTasks, lastSeq]

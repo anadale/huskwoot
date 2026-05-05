@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -10,14 +11,20 @@ import (
 	"github.com/anadale/huskwoot/internal/storage"
 )
 
-func newTestHistory(t *testing.T, opts storage.SQLiteHistoryOptions) *storage.SQLiteHistory {
+func newTestHistoryDB(t *testing.T, opts storage.SQLiteHistoryOptions) (*storage.SQLiteHistory, *sql.DB) {
 	t.Helper()
 	db, err := storage.OpenDB(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("OpenDB: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return storage.NewSQLiteHistory(db, opts)
+	return storage.NewSQLiteHistory(db, opts), db
+}
+
+func newTestHistory(t *testing.T, opts storage.SQLiteHistoryOptions) *storage.SQLiteHistory {
+	t.Helper()
+	h, _ := newTestHistoryDB(t, opts)
+	return h
 }
 
 func makeEntry(author, text string, ts time.Time) model.HistoryEntry {
@@ -275,5 +282,126 @@ func TestSQLiteHistory_MaxMessages_IndependentPerSource(t *testing.T) {
 		if len(got) != 2 {
 			t.Errorf("source %s: want 2 entries, got %d", src, len(got))
 		}
+	}
+}
+
+func TestSQLiteHistory_AddTx_CommitVisibleViaRecent(t *testing.T) {
+	ctx := context.Background()
+	h, db := newTestHistoryDB(t, storage.SQLiteHistoryOptions{})
+
+	now := time.Now().UTC().Truncate(time.Second)
+	entry := makeEntry("Alice", "транзакционное сообщение", now)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+
+	msgID, err := h.AddTx(ctx, tx, "chat1", entry)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("AddTx: %v", err)
+	}
+	if msgID == "" {
+		tx.Rollback()
+		t.Fatal("AddTx: пустой messageID")
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	got, err := h.Recent(ctx, "chat1", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(got))
+	}
+	if got[0].Text != entry.Text {
+		t.Errorf("text: got %q, want %q", got[0].Text, entry.Text)
+	}
+
+	// Проверяем что message_id в БД совпадает с возвращённым.
+	var storedID string
+	if err := db.QueryRowContext(ctx, `SELECT message_id FROM messages WHERE source_id = ?`, "chat1").Scan(&storedID); err != nil {
+		t.Fatalf("SELECT message_id: %v", err)
+	}
+	if storedID != msgID {
+		t.Errorf("stored message_id %q != returned %q", storedID, msgID)
+	}
+}
+
+func TestSQLiteHistory_AddTx_RollbackNotVisible(t *testing.T) {
+	ctx := context.Background()
+	h, db := newTestHistoryDB(t, storage.SQLiteHistoryOptions{})
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+
+	if _, err := h.AddTx(ctx, tx, "chat1", makeEntry("Bob", "откатится", time.Now())); err != nil {
+		tx.Rollback()
+		t.Fatalf("AddTx: %v", err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	got, err := h.Recent(ctx, "chat1", 10)
+	if err != nil {
+		t.Fatalf("Recent: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("после Rollback хотим 0 записей, получили %d", len(got))
+	}
+}
+
+func TestSQLiteHistory_Add_FillsMessageID(t *testing.T) {
+	ctx := context.Background()
+	h, db := newTestHistoryDB(t, storage.SQLiteHistoryOptions{})
+
+	if err := h.Add(ctx, "chat1", makeEntry("Carol", "через Add", time.Now())); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	var msgID string
+	if err := db.QueryRowContext(ctx, `SELECT message_id FROM messages WHERE source_id = ?`, "chat1").Scan(&msgID); err != nil {
+		t.Fatalf("SELECT message_id: %v", err)
+	}
+	if msgID == "" {
+		t.Error("Add должен заполнять message_id")
+	}
+}
+
+func TestSQLiteHistory_AddTx_TwoCalls_DifferentMessageIDs(t *testing.T) {
+	ctx := context.Background()
+	h, db := newTestHistoryDB(t, storage.SQLiteHistoryOptions{})
+
+	now := time.Now().UTC().Truncate(time.Second)
+
+	tx1, _ := db.BeginTx(ctx, nil)
+	id1, err := h.AddTx(ctx, tx1, "chat1", makeEntry("u", "первое", now))
+	if err != nil {
+		tx1.Rollback()
+		t.Fatalf("AddTx 1: %v", err)
+	}
+	tx1.Commit()
+
+	tx2, _ := db.BeginTx(ctx, nil)
+	id2, err := h.AddTx(ctx, tx2, "chat1", makeEntry("u", "второе", now.Add(time.Second)))
+	if err != nil {
+		tx2.Rollback()
+		t.Fatalf("AddTx 2: %v", err)
+	}
+	tx2.Commit()
+
+	if id1 == id2 {
+		t.Errorf("два вызова AddTx вернули одинаковый messageID: %q", id1)
+	}
+	if id1 == "" || id2 == "" {
+		t.Error("messageID не должен быть пустым")
 	}
 }

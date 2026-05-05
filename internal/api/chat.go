@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -51,12 +53,28 @@ type chatHistoryResponse struct {
 	Entries []chatHistoryEntry `json:"entries"`
 }
 
+// chatMessageCreatedPayload is the JSON payload for chat_message_created events.
+type chatMessageCreatedPayload struct {
+	MessageID  string `json:"messageId"`
+	Source     struct {
+		Kind string `json:"kind"`
+		ID   string `json:"id"`
+	} `json:"source"`
+	Role       string     `json:"role"`
+	Text       string     `json:"text"`
+	AudioJobID string     `json:"audioJobId,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+}
+
 // chatHandler handles POST /v1/chat and GET /v1/chat/history. Client messages
 // are written to the History store under a separate source "client:<device_id>"
 // so they do not mix with the owner's Telegram DMs.
 type chatHandler struct {
 	service     model.ChatService
 	history     model.History
+	db          *sql.DB
+	events      model.EventStore
+	broker      model.Broker
 	chatTimeout time.Duration
 	logger      *slog.Logger
 	// now provides the current time for history entries; a field for
@@ -65,19 +83,32 @@ type chatHandler struct {
 }
 
 // newChatHandler is the constructor with safe defaults.
-func newChatHandler(service model.ChatService, history model.History, chatTimeout time.Duration, logger *slog.Logger) *chatHandler {
+func newChatHandler(service model.ChatService, history model.History, db *sql.DB, events model.EventStore, broker model.Broker, chatTimeout time.Duration, logger *slog.Logger) *chatHandler {
 	return &chatHandler{
 		service:     service,
 		history:     history,
+		db:          db,
+		events:      events,
+		broker:      broker,
 		chatTimeout: chatTimeout,
 		logger:      logger,
 		now:         time.Now,
 	}
 }
 
-// post handles POST /v1/chat: writes the user message to history, calls
-// ChatService.HandleMessage with a timeout, and writes the agent reply back
-// to history. The response is returned synchronously.
+// post handles POST /v1/chat.
+//
+// Two-transaction pattern:
+//
+//	tx1 → History.AddTx(user) + EventStore.Insert(chat_message_created) → commit → Broker.Notify
+//	ChatService.HandleMessage
+//	tx2 → History.AddTx(agent) + EventStore.Insert(chat_message_created) → commit → Broker.Notify
+//
+// Between tx1 and tx2 there is a window where SSE subscribers see the user message
+// but not yet the agent reply. Contract: clients wait ~2 minutes for the agent event
+// and treat a missing agent event as a request failure (no auto-retry). On a server
+// crash between the two commits the user message remains in history as an orphan —
+// this is acceptable semantics ("message sent, reply lost").
 func (h *chatHandler) post(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
 	if err := decodeJSON(r.Body, &req); err != nil {
@@ -114,9 +145,18 @@ func (h *chatHandler) post(w http.ResponseWriter, r *http.Request) {
 		Text:       text,
 		Timestamp:  now,
 	}
+
+	// tx1: persist user message + emit chat_message_created(user)
 	if h.history != nil {
-		if err := h.history.Add(ctx, sourceID, userEntry); err != nil {
+		_, ev, err := h.insertChatEvent(ctx, sourceID, deviceID, "user", text, now, "")
+		if err != nil {
 			h.logError(r.Context(), "history add user", err)
+			// fall back to non-transactional write
+			if addErr := h.history.Add(ctx, sourceID, userEntry); addErr != nil {
+				h.logError(r.Context(), "history add user fallback", addErr)
+			}
+		} else if h.broker != nil && ev.Kind != "" {
+			h.broker.Notify(ev)
 		}
 	}
 
@@ -150,14 +190,23 @@ func (h *chatHandler) post(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// tx2: persist agent reply + emit chat_message_created(agent)
 	if h.history != nil && reply.Text != "" {
-		agentEntry := model.HistoryEntry{
-			AuthorName: "agent",
-			Text:       reply.Text,
-			Timestamp:  h.now().UTC(),
-		}
-		if err := h.history.Add(r.Context(), sourceID, agentEntry); err != nil {
+		agentNow := h.now().UTC()
+		_, ev, err := h.insertChatEvent(r.Context(), sourceID, deviceID, "agent", reply.Text, agentNow, "")
+		if err != nil {
 			h.logError(r.Context(), "history add agent", err)
+			// fall back to non-transactional write
+			agentEntry := model.HistoryEntry{
+				AuthorName: "agent",
+				Text:       reply.Text,
+				Timestamp:  agentNow,
+			}
+			if addErr := h.history.Add(r.Context(), sourceID, agentEntry); addErr != nil {
+				h.logError(r.Context(), "history add agent fallback", addErr)
+			}
+		} else if h.broker != nil && ev.Kind != "" {
+			h.broker.Notify(ev)
 		}
 	}
 
@@ -166,6 +215,84 @@ func (h *chatHandler) post(w http.ResponseWriter, r *http.Request) {
 		TasksTouched:    reply.TasksTouched,
 		ProjectsTouched: reply.ProjectsTouched,
 	})
+}
+
+// insertChatEvent writes a history entry + chat_message_created event in a single transaction.
+// Returns the generated messageID and the saved event (with Seq filled in).
+// audioJobID is set only for voice-originated messages.
+func (h *chatHandler) insertChatEvent(ctx context.Context, sourceID, deviceID, role, text string, ts time.Time, audioJobID string) (messageID string, ev model.Event, err error) {
+	if h.db == nil || h.events == nil {
+		// No DB/events — fall back to plain history write only.
+		err = h.history.Add(ctx, sourceID, model.HistoryEntry{
+			AuthorName: authorNameForRole(role, deviceID),
+			Text:       text,
+			Timestamp:  ts,
+		})
+		return "", model.Event{}, err
+	}
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", model.Event{}, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	msgID, err := h.history.AddTx(ctx, tx, sourceID, model.HistoryEntry{
+		AuthorName: authorNameForRole(role, deviceID),
+		Text:       text,
+		Timestamp:  ts,
+	})
+	if err != nil {
+		return "", model.Event{}, err
+	}
+
+	payload := chatMessageCreatedPayload{
+		MessageID: msgID,
+		Role:      role,
+		Text:      text,
+		CreatedAt: ts,
+	}
+	payload.Source.Kind = chatSourceKind
+	payload.Source.ID = deviceID
+	if audioJobID != "" {
+		payload.AudioJobID = audioJobID
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", model.Event{}, err
+	}
+
+	seq, err := h.events.Insert(ctx, tx, model.Event{
+		Kind:      model.EventChatMessageCreated,
+		EntityID:  deviceID,
+		Payload:   payloadBytes,
+		CreatedAt: ts,
+	})
+	if err != nil {
+		return "", model.Event{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", model.Event{}, err
+	}
+
+	ev = model.Event{
+		Seq:       seq,
+		Kind:      model.EventChatMessageCreated,
+		EntityID:  deviceID,
+		Payload:   payloadBytes,
+		CreatedAt: ts,
+	}
+	return msgID, ev, nil
+}
+
+// authorNameForRole returns the AuthorName for a history entry based on role.
+func authorNameForRole(role, deviceID string) string {
+	if role == "agent" {
+		return "agent"
+	}
+	return deviceID
 }
 
 // getHistory handles GET /v1/chat/history: returns the most recent client chat

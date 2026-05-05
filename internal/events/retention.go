@@ -2,11 +2,18 @@ package events
 
 import (
 	"context"
+	"io/fs"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/anadale/huskwoot/internal/model"
 )
+
+// orphanVoiceAge is the minimum file age before a voice upload without an active
+// voice_queue row is considered an orphan and eligible for removal.
+const orphanVoiceAge = 24 * time.Hour
 
 // defaultRetentionInterval is how often the retention cleanup runs.
 const defaultRetentionInterval = time.Hour
@@ -22,6 +29,13 @@ type RegistrationRevoker interface {
 	DeleteRegistration(ctx context.Context, deviceID string) error
 }
 
+// VoiceOrphanChecker checks whether a client voice upload still has an active
+// job in the voice queue. Used by the orphan-file sweep in the retention runner.
+// The concrete implementation is storage.SQLiteVoiceQueue.HasClientPayload.
+type VoiceOrphanChecker interface {
+	HasClientPayload(ctx context.Context, payload string) (bool, error)
+}
+
 // RunnerConfig groups the dependencies and retention windows of the Runner.
 type RunnerConfig struct {
 	// Events is the event store; required.
@@ -35,6 +49,12 @@ type RunnerConfig struct {
 	// Revoker is used to notify the push relay when a stale device is auto-revoked.
 	// nil is treated as a no-op; events retention does not block on relay errors.
 	Revoker RegistrationRevoker
+	// VoiceChecker checks whether a client voice upload file still has an active
+	// voice_queue row. When nil or UploadsDir is empty, the orphan-file sweep is skipped.
+	VoiceChecker VoiceOrphanChecker
+	// UploadsDir is the root directory for client voice uploads.
+	// Empty string disables the orphan-file sweep.
+	UploadsDir string
 	// EventRetention is the retention horizon for events and delivered push jobs.
 	EventRetention time.Duration
 	// DeviceInactive is the idle period after which a non-revoked device is
@@ -48,13 +68,16 @@ type RunnerConfig struct {
 }
 
 // Runner periodically deletes stale domain events, delivered push jobs,
-// expired pairing requests and revokes / deletes inactive devices.
+// expired pairing requests, revokes / deletes inactive devices, and sweeps
+// orphaned voice upload files.
 type Runner struct {
 	events          model.EventStore
 	queue           model.PushQueue
 	pairing         model.PairingStore
 	devices         model.DeviceStore
 	revoker         RegistrationRevoker
+	voiceChecker    VoiceOrphanChecker
+	uploadsDir      string
 	eventRetention  time.Duration
 	deviceInactive  time.Duration
 	deviceRetention time.Duration
@@ -74,6 +97,8 @@ func NewRunner(cfg RunnerConfig) *Runner {
 		pairing:         cfg.Pairing,
 		devices:         cfg.Devices,
 		revoker:         cfg.Revoker,
+		voiceChecker:    cfg.VoiceChecker,
+		uploadsDir:      cfg.UploadsDir,
 		eventRetention:  cfg.EventRetention,
 		deviceInactive:  cfg.DeviceInactive,
 		deviceRetention: cfg.DeviceRetention,
@@ -118,6 +143,7 @@ func (r *Runner) Tick(ctx context.Context, now time.Time) error {
 	}
 
 	r.sweepDevices(ctx, now)
+	r.sweepOrphanVoiceUploads(ctx, now)
 
 	cutoff := now.Add(-r.eventRetention)
 
@@ -181,4 +207,65 @@ func lastActivity(d model.Device) time.Time {
 		return *d.LastSeenAt
 	}
 	return d.CreatedAt
+}
+
+// sweepOrphanVoiceUploads removes client voice upload files that are older than
+// orphanVoiceAge and have no corresponding row in voice_queue. Empty subdirectories
+// left after file removal are also cleaned up. Errors are logged as warnings and
+// never block other retention steps.
+func (r *Runner) sweepOrphanVoiceUploads(ctx context.Context, now time.Time) {
+	if r.uploadsDir == "" || r.voiceChecker == nil {
+		return
+	}
+
+	cutoff := now.Add(-orphanVoiceAge)
+	var dirs []string
+
+	_ = filepath.WalkDir(r.uploadsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			r.logger.Warn("voice uploads sweep: walk error", "path", path, "error", err)
+			return nil
+		}
+		if d.IsDir() {
+			if path != r.uploadsDir {
+				dirs = append(dirs, path)
+			}
+			return nil
+		}
+
+		info, statErr := d.Info()
+		if statErr != nil {
+			r.logger.Warn("voice uploads sweep: stat", "path", path, "error", statErr)
+			return nil
+		}
+		if !info.ModTime().Before(cutoff) {
+			return nil
+		}
+
+		rel, relErr := filepath.Rel(r.uploadsDir, path)
+		if relErr != nil {
+			r.logger.Warn("voice uploads sweep: rel path", "path", path, "error", relErr)
+			return nil
+		}
+
+		has, hasErr := r.voiceChecker.HasClientPayload(ctx, rel)
+		if hasErr != nil {
+			r.logger.Warn("voice uploads sweep: check payload", "payload", rel, "error", hasErr)
+			return nil
+		}
+		if has {
+			return nil
+		}
+
+		if rmErr := os.Remove(path); rmErr != nil {
+			r.logger.Warn("voice uploads sweep: remove orphan", "path", path, "error", rmErr)
+		}
+		return nil
+	})
+
+	// Remove empty subdirectories. Walking produces dirs in lexical order,
+	// so reversing gives innermost-first which is the correct removal order.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		_ = os.Remove(dirs[i]) // no-op on non-empty dirs
+	}
 }

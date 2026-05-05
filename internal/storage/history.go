@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/anadale/huskwoot/internal/model"
 )
 
@@ -28,6 +30,24 @@ func NewSQLiteHistory(db *sql.DB, opts SQLiteHistoryOptions) *SQLiteHistory {
 	return &SQLiteHistory{db: db, opts: opts}
 }
 
+// AddTx inserts a history record within the caller-owned transaction.
+// Returns the generated messageID (UUID v4). TTL and MaxMessages cleanup
+// are not performed — use Add for standalone writes that need cleanup.
+func (h *SQLiteHistory) AddTx(ctx context.Context, tx *sql.Tx, source string, entry model.HistoryEntry) (string, error) {
+	msgID := uuid.New().String()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages (source_id, author_name, text, timestamp, message_id) VALUES (?, ?, ?, ?, ?)`,
+		source,
+		entry.AuthorName,
+		entry.Text,
+		entry.Timestamp.Unix(),
+		msgID,
+	); err != nil {
+		return "", fmt.Errorf("adding history entry for %q: %w", source, err)
+	}
+	return msgID, nil
+}
+
 // Add adds a record to the history for the given source.
 // After insertion, removes stale (TTL) and excess (MaxMessages) records.
 // All operations run in a single transaction for consistency.
@@ -38,14 +58,8 @@ func (h *SQLiteHistory) Add(ctx context.Context, source string, entry model.Hist
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO messages (source_id, author_name, text, timestamp) VALUES (?, ?, ?, ?)`,
-		source,
-		entry.AuthorName,
-		entry.Text,
-		entry.Timestamp.Unix(),
-	); err != nil {
-		return fmt.Errorf("adding history entry for %q: %w", source, err)
+	if _, err := h.AddTx(ctx, tx, source, entry); err != nil {
+		return err
 	}
 
 	if h.opts.TTL > 0 {

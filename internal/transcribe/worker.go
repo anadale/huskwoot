@@ -2,12 +2,22 @@ package transcribe
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/anadale/huskwoot/internal/model"
 )
+
+// ErrEmptyTranscript is passed to VoiceConsumer.Fail when transcription succeeds
+// but produces no text after trimming whitespace.
+var ErrEmptyTranscript = errors.New("empty transcript")
+
+// ErrUnsupportedFormat is returned by a Transcriber when the audio MIME type is not
+// supported by the backend. The worker drops the job immediately on this error
+// instead of retrying — the format will not change between attempts.
+var ErrUnsupportedFormat = errors.New("unsupported audio format")
 
 // voiceBackoff defines the wait intervals between retry attempts for voice transcription.
 // After attempt N (0-based), the worker waits voiceBackoff[min(N, len-1)] before retrying.
@@ -17,19 +27,14 @@ var voiceBackoff = []time.Duration{
 	10 * time.Minute,
 }
 
-// WorkerDeps holds dependencies for the voice transcription worker.
-type WorkerDeps struct {
-	Queue        model.VoiceQueue
-	Transcriber  model.Transcriber
-	DownloadFn   func(ctx context.Context, fileID string) ([]byte, error)
-	Handler      func(ctx context.Context, msg model.Message) error
-	BuildMessage func(job model.VoiceJob, text string) model.Message
-	// OnDrop is called when a job is permanently dropped (max attempts reached).
-	// Typically sends a "voice.error" reply to the user. May be nil.
-	OnDrop func(ctx context.Context, chatID int64)
-	// OnEmpty is called when transcription produces an empty result.
-	// Typically sends a "voice.empty" reply to the user. May be nil.
-	OnEmpty  func(ctx context.Context, chatID int64)
+// WorkerConfig holds dependencies for the voice transcription worker.
+type WorkerConfig struct {
+	Queue       model.VoiceQueue
+	Transcriber model.Transcriber
+	// Downloaders maps source_kind → VoiceDownloader. Jobs with unknown source_kind are dropped.
+	Downloaders map[string]model.VoiceDownloader
+	// Consumers maps source_kind → VoiceConsumer. Jobs with unknown source_kind are dropped.
+	Consumers   map[string]model.VoiceConsumer
 	Interval    time.Duration
 	MaxAttempts int
 	Clock       func() time.Time
@@ -37,48 +42,44 @@ type WorkerDeps struct {
 }
 
 // Worker polls voice_queue and transcribes voice messages asynchronously.
-// On success: calls Handler with the transcribed model.Message, then Complete.
-// On error: Reschedule with exponential backoff; after MaxAttempts: OnDrop + Complete.
+// On success: calls Consumer.Consume, then Complete.
+// On empty transcript: calls Consumer.Fail(ErrEmptyTranscript), then Complete.
+// On transient error: Reschedule with exponential backoff.
+// On final failure (MaxAttempts reached): Consumer.Fail, then Complete.
 type Worker struct {
-	queue        model.VoiceQueue
-	transcriber  model.Transcriber
-	downloadFn   func(ctx context.Context, fileID string) ([]byte, error)
-	handler      func(ctx context.Context, msg model.Message) error
-	buildMessage func(job model.VoiceJob, text string) model.Message
-	onDrop       func(ctx context.Context, chatID int64)
-	onEmpty      func(ctx context.Context, chatID int64)
-	interval     time.Duration
-	maxAttempts  int
-	clock        func() time.Time
-	logger       *slog.Logger
+	queue       model.VoiceQueue
+	transcriber model.Transcriber
+	downloaders map[string]model.VoiceDownloader
+	consumers   map[string]model.VoiceConsumer
+	interval    time.Duration
+	maxAttempts int
+	clock       func() time.Time
+	logger      *slog.Logger
 }
 
-// NewWorker creates a Worker with the given dependencies.
-func NewWorker(deps WorkerDeps) *Worker {
-	if deps.Clock == nil {
-		deps.Clock = time.Now
+// NewWorker creates a Worker with the given configuration.
+func NewWorker(cfg WorkerConfig) *Worker {
+	if cfg.Clock == nil {
+		cfg.Clock = time.Now
 	}
-	if deps.Interval <= 0 {
-		deps.Interval = 5 * time.Second
+	if cfg.Interval <= 0 {
+		cfg.Interval = 5 * time.Second
 	}
-	if deps.MaxAttempts <= 0 {
-		deps.MaxAttempts = 4
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = 4
 	}
-	if deps.Logger == nil {
-		deps.Logger = slog.Default()
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
 	}
 	return &Worker{
-		queue:        deps.Queue,
-		transcriber:  deps.Transcriber,
-		downloadFn:   deps.DownloadFn,
-		handler:      deps.Handler,
-		buildMessage: deps.BuildMessage,
-		onDrop:       deps.OnDrop,
-		onEmpty:      deps.OnEmpty,
-		interval:     deps.Interval,
-		maxAttempts:  deps.MaxAttempts,
-		clock:        deps.Clock,
-		logger:       deps.Logger,
+		queue:       cfg.Queue,
+		transcriber: cfg.Transcriber,
+		downloaders: cfg.Downloaders,
+		consumers:   cfg.Consumers,
+		interval:    cfg.Interval,
+		maxAttempts: cfg.MaxAttempts,
+		clock:       cfg.Clock,
+		logger:      cfg.Logger,
 	}
 }
 
@@ -107,10 +108,25 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) processOne(ctx context.Context, job model.VoiceJob) {
-	data, err := w.downloadFn(ctx, job.FileID)
+	downloader, ok := w.downloaders[job.SourceKind]
+	if !ok {
+		w.logger.ErrorContext(ctx, "voice: unknown source kind, dropping job",
+			"kind", job.SourceKind, "job_id", job.ID)
+		w.completeJob(ctx, job.ID)
+		return
+	}
+	consumer, ok := w.consumers[job.SourceKind]
+	if !ok {
+		w.logger.ErrorContext(ctx, "voice: no consumer for source kind, dropping job",
+			"kind", job.SourceKind, "job_id", job.ID)
+		w.completeJob(ctx, job.ID)
+		return
+	}
+
+	data, err := downloader.Download(ctx, job)
 	if err != nil {
-		w.logger.ErrorContext(ctx, "voice: download failed", "job_id", job.ID, "chat_id", job.ChatID, "err", err)
-		w.rescheduleOrDrop(ctx, job, err.Error())
+		w.logger.ErrorContext(ctx, "voice: download failed", "job_id", job.ID, "kind", job.SourceKind, "err", err)
+		w.rescheduleOrDrop(ctx, job, consumer, err)
 		return
 	}
 
@@ -120,46 +136,47 @@ func (w *Worker) processOne(ctx context.Context, job model.VoiceJob) {
 		Duration: job.Duration,
 	})
 	if err != nil {
-		w.logger.ErrorContext(ctx, "voice: transcription failed", "job_id", job.ID, "chat_id", job.ChatID,
+		w.logger.ErrorContext(ctx, "voice: transcription failed", "job_id", job.ID,
 			"transcriber", w.transcriber.Name(), "err", err)
-		w.rescheduleOrDrop(ctx, job, err.Error())
+		if errors.Is(err, ErrUnsupportedFormat) {
+			consumer.Fail(ctx, job, err)
+			w.completeJob(ctx, job.ID)
+			return
+		}
+		w.rescheduleOrDrop(ctx, job, consumer, err)
 		return
 	}
 
 	text = strings.TrimSpace(text)
 	if text == "" {
-		w.logger.InfoContext(ctx, "voice: empty transcription result", "job_id", job.ID, "chat_id", job.ChatID)
-		if w.onEmpty != nil {
-			w.onEmpty(ctx, job.ChatID)
-		}
+		w.logger.InfoContext(ctx, "voice: empty transcription result", "job_id", job.ID)
+		consumer.Fail(ctx, job, ErrEmptyTranscript)
 		w.completeJob(ctx, job.ID)
 		return
 	}
 
-	msg := w.buildMessage(job, text)
-	if err := w.handler(ctx, msg); err != nil {
-		w.logger.ErrorContext(ctx, "voice: handler failed", "job_id", job.ID, "err", err)
-		w.rescheduleOrDrop(ctx, job, err.Error())
+	if err := consumer.Consume(ctx, job, text); err != nil {
+		w.logger.ErrorContext(ctx, "voice: consumer failed", "job_id", job.ID, "err", err)
+		w.rescheduleOrDrop(ctx, job, consumer, err)
 		return
 	}
 	w.completeJob(ctx, job.ID)
 }
 
-func (w *Worker) rescheduleOrDrop(ctx context.Context, job model.VoiceJob, errText string) {
+func (w *Worker) rescheduleOrDrop(ctx context.Context, job model.VoiceJob, consumer model.VoiceConsumer, cause error) {
 	attempts := job.Attempts + 1
 	if attempts >= w.maxAttempts {
 		w.logger.WarnContext(ctx, "voice: max attempts reached, dropping job",
-			"job_id", job.ID, "chat_id", job.ChatID, "attempts", attempts)
-		if w.onDrop != nil {
-			w.onDrop(ctx, job.ChatID)
-		}
+			"job_id", job.ID, "kind", job.SourceKind, "attempts", attempts)
+		consumer.Fail(ctx, job, cause)
 		w.completeJob(ctx, job.ID)
 		return
 	}
 	next := voiceNextAttempt(attempts, w.clock())
-	if err := w.queue.Reschedule(ctx, job.ID, next, errText); err != nil {
+	if err := w.queue.Reschedule(ctx, job.ID, next, cause.Error()); err != nil {
 		w.logger.WarnContext(ctx, "voice: failed to reschedule job, dropping to prevent spin",
 			"job_id", job.ID, "err", err)
+		consumer.Fail(ctx, job, cause)
 		w.completeJob(ctx, job.ID)
 	}
 }

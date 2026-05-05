@@ -29,6 +29,10 @@ const (
 	EventReminderSummary EventKind = "reminder_summary"
 	// EventReset — the client must perform a cold resync (fell behind the retention window).
 	EventReset EventKind = "reset"
+	// EventChatMessageCreated — a chat message was created (user or agent) in a client session.
+	EventChatMessageCreated EventKind = "chat_message_created"
+	// EventVoiceFailed — async voice transcription permanently failed.
+	EventVoiceFailed EventKind = "voice_failed"
 )
 
 // Event describes a single event published by the domain model.

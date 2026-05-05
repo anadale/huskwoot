@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -548,6 +550,164 @@ func TestRetentionRunner_DeletesExpiredPairings(t *testing.T) {
 	expected := now.Add(-time.Hour)
 	if !pairingStub.lastCut.Equal(expected) {
 		t.Fatalf("cutoff pairing = %v, want %v", pairingStub.lastCut, expected)
+	}
+}
+
+// stubVoiceOrphanChecker implements events.VoiceOrphanChecker for testing.
+type stubVoiceOrphanChecker struct {
+	mu            sync.Mutex
+	knownPayloads map[string]struct{}
+	calls         []string
+}
+
+func newStubChecker(payloads ...string) *stubVoiceOrphanChecker {
+	known := make(map[string]struct{}, len(payloads))
+	for _, p := range payloads {
+		known[p] = struct{}{}
+	}
+	return &stubVoiceOrphanChecker{knownPayloads: known}
+}
+
+func (c *stubVoiceOrphanChecker) HasClientPayload(_ context.Context, payload string) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, payload)
+	_, ok := c.knownPayloads[payload]
+	return ok, nil
+}
+
+// makeOldFile creates a file at path with mtime set to age in the past.
+func makeOldFile(t *testing.T, path string, age time.Duration) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("audio data"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	old := time.Now().Add(-age)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+}
+
+func TestRetentionRunner_OrphanVoiceSweep_DeletesOrphanKeepsRegistered(t *testing.T) {
+	dir := t.TempDir()
+	// Orphan file in 2026/04 — will be deleted; its dir will become empty and also be removed.
+	orphanRel := filepath.Join("2026", "04", "orphan.ogg")
+	orphanAbs := filepath.Join(dir, orphanRel)
+	// Registered file in 2026/05 — must stay.
+	registeredRel := filepath.Join("2026", "05", "registered.ogg")
+	registeredAbs := filepath.Join(dir, registeredRel)
+
+	makeOldFile(t, orphanAbs, 48*time.Hour)
+	makeOldFile(t, registeredAbs, 48*time.Hour)
+
+	checker := newStubChecker(registeredRel)
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         &stubEventStore{},
+		Queue:          &stubPushQueue{},
+		EventRetention: time.Hour,
+		VoiceChecker:   checker,
+		UploadsDir:     dir,
+		Logger:         silentLogger(),
+	})
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// Registered file must survive.
+	if _, err := os.Stat(registeredAbs); err != nil {
+		t.Errorf("registered file deleted unexpectedly: %v", err)
+	}
+	// Orphan file must be gone.
+	if _, err := os.Stat(orphanAbs); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("orphan file not deleted (stat=%v)", err)
+	}
+	// The now-empty dir that held the orphan must be removed.
+	orphanDir := filepath.Join(dir, "2026", "04")
+	if _, err := os.Stat(orphanDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("empty orphan dir not removed (stat=%v)", err)
+	}
+	// The dir that still holds the registered file must remain.
+	registeredDir := filepath.Join(dir, "2026", "05")
+	if _, err := os.Stat(registeredDir); err != nil {
+		t.Errorf("non-empty dir was removed: %v", err)
+	}
+}
+
+func TestRetentionRunner_OrphanVoiceSweep_SkipsYoungFiles(t *testing.T) {
+	dir := t.TempDir()
+	youngRel := filepath.Join("2026", "05", "young.ogg")
+	youngAbs := filepath.Join(dir, youngRel)
+	makeOldFile(t, youngAbs, 1*time.Hour) // only 1 hour old, threshold is 24 h
+
+	checker := newStubChecker() // no registered payloads
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         &stubEventStore{},
+		Queue:          &stubPushQueue{},
+		EventRetention: time.Hour,
+		VoiceChecker:   checker,
+		UploadsDir:     dir,
+		Logger:         silentLogger(),
+	})
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if _, err := os.Stat(youngAbs); err != nil {
+		t.Errorf("young file was incorrectly deleted: %v", err)
+	}
+}
+
+func TestRetentionRunner_OrphanVoiceSweep_WalkErrorContinuesOtherSteps(t *testing.T) {
+	// Non-existent uploads_dir causes a walk error; other retention steps must still run.
+	nonExistentDir := filepath.Join(t.TempDir(), "does-not-exist")
+
+	eventsStub := &stubEventStore{}
+	queueStub := &stubPushQueue{}
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         eventsStub,
+		Queue:          queueStub,
+		EventRetention: time.Hour,
+		VoiceChecker:   newStubChecker(),
+		UploadsDir:     nonExistentDir,
+		Logger:         silentLogger(),
+	})
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	if eventsStub.calls.Load() != 1 {
+		t.Errorf("events cleanup was skipped after walk error: calls=%d, want 1", eventsStub.calls.Load())
+	}
+	if queueStub.calls.Load() != 1 {
+		t.Errorf("push_queue cleanup was skipped after walk error: calls=%d, want 1", queueStub.calls.Load())
+	}
+}
+
+func TestRetentionRunner_OrphanVoiceSweep_NoopWhenDirEmpty(t *testing.T) {
+	checker := newStubChecker()
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:         &stubEventStore{},
+		Queue:          &stubPushQueue{},
+		EventRetention: time.Hour,
+		VoiceChecker:   checker,
+		UploadsDir:     "", // disabled
+		Logger:         silentLogger(),
+	})
+	if err := runner.Tick(context.Background(), time.Now().UTC()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	checker.mu.Lock()
+	defer checker.mu.Unlock()
+	if len(checker.calls) != 0 {
+		t.Errorf("HasClientPayload called %d times, want 0 when UploadsDir is empty", len(checker.calls))
 	}
 }
 

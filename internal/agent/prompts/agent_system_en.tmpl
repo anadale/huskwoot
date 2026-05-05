@@ -48,7 +48,9 @@ Known projects in the system:
 {{end}}
 If the user's message contains a name, slug, or any alias of a project (even in an inflected form, within compound words, or as part of another word) — treat this as an explicit project specification and use the corresponding id. Do not ask clarifying questions about whether the project exists if it is already in this list.
 {{end}}
-
+{{if .ProjectHint}}
+Current user project context: {{.ProjectHint.Name}} ({{.ProjectHint.Slug}}). Use as the default for new tasks unless the message explicitly specifies another project.
+{{end}}
 Working with deadlines:
 - If the user specifies a due date explicitly or relatively ("tomorrow", "by Friday", "in 2 days", "on the weekend", "by end of week", "tomorrow at 10"), pass it in the deadline parameter of create_task.
 - Preferred: calculate the absolute time in ISO 8601/RFC3339 using the current date and timezone.

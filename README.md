@@ -113,6 +113,8 @@ Digests are sent only on working days (`weekdays`). Missed slots on restart are 
 
 Huskwoot exposes a REST API for mobile clients — projects, tasks, SSE event stream, and a secure device pairing flow via Telegram DM. Push notifications are delivered through an optional `huskwoot-push-relay` service.
 
+Mobile clients can send voice recordings via `POST /v1/chat/voice` (multipart upload). The server transcribes the audio asynchronously and delivers the transcript and the agent's reply as `chat_message_created` SSE events. The `GET /v1/me` response includes a `voiceEnabled` flag indicating whether transcription is configured.
+
 ---
 
 ## Deployment
@@ -286,6 +288,8 @@ cors_allowed_origins = []
 pairing_link_ttl            = "5m"
 pairing_status_long_poll    = "60s"
 rate_limit_pair_per_hour    = 5
+voice_max_bytes             = "10MiB"  # MaxBytesReader limit for POST /v1/chat/voice (default: 10MiB)
+voice_rate_limit_per_minute = 10       # per-device rate limit for POST /v1/chat/voice (default: 10; negative → startup error)
 ```
 
 **Device pairing:** a client sends `POST /v1/pair/request`. The owner receives a Telegram DM with a confirmation link. After approval, the client receives a bearer token for all subsequent API calls.
@@ -332,12 +336,13 @@ Both values use Go duration format; the `"d"` suffix is not supported (use `"720
 
 ### `[transcriber]`
 
-Configures voice message transcription for Telegram DM. Voice messages in groups and @mention chats are not transcribed regardless of this setting. When the section is absent or `provider = ""`, the bot replies with a "not configured" message on any voice input and continues to operate normally.
+Configures voice message transcription for Telegram DM and for `POST /v1/chat/voice` from HTTP API clients. Voice messages in groups and @mention chats are not transcribed regardless of this setting. When the section is absent or `provider = ""`, the bot replies with a "not configured" message on any Telegram voice input and the API returns `503` on voice upload attempts.
 
 ```toml
 [transcriber]
 provider     = "whisper"   # "" | "whisper" | "yandex"; empty = disabled
 max_duration = "5m"        # reject voice messages longer than this (default: 5m)
+uploads_dir  = ""          # directory for HTTP API voice uploads; default: <config-dir>/voice_uploads (created on startup)
 ```
 
 Provider-specific subsections (`[transcriber.whisper]`, `[transcriber.yandex]`) hold the credentials and runtime options. Step-by-step setup — installing whisper.cpp, picking and downloading a GGML model, creating a Yandex Cloud service account and API key, plus troubleshooting tips — is covered in a dedicated guide:

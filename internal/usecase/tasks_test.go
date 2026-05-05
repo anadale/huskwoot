@@ -36,12 +36,13 @@ type mockTaskStoreForTasks struct {
 	tasks      map[string]*model.Task
 	counter    int
 
-	createTaskErr error
-	updateTaskErr error
-	moveTaskErr   error
-	getTaskErr    error
-	getProjectErr error
-	listTasksErr  error
+	createTaskErr    error
+	updateTaskErr    error
+	moveTaskErr      error
+	getTaskErr       error
+	getProjectErr    error
+	listTasksErr     error
+	getProjectCalls  int
 
 	createCalled int
 	updateCalled int
@@ -74,6 +75,7 @@ func (m *mockTaskStoreForTasks) UpdateProjectTx(_ context.Context, _ *sql.Tx, _ 
 }
 
 func (m *mockTaskStoreForTasks) GetProject(_ context.Context, id string) (*model.Project, error) {
+	m.getProjectCalls++
 	if m.getProjectErr != nil {
 		return nil, m.getProjectErr
 	}

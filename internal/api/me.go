@@ -11,6 +11,7 @@ type meResponse struct {
 	OwnerName      string `json:"ownerName"`
 	TelegramUserID int64  `json:"telegramUserId,omitempty"`
 	Version        string `json:"version"`
+	VoiceEnabled   bool   `json:"voiceEnabled"`
 }
 
 // getMe returns the current device identity and instance metadata.
@@ -21,6 +22,7 @@ func (s *Server) getMe(w http.ResponseWriter, r *http.Request) {
 		OwnerName:      s.cfg.Owner.UserName,
 		TelegramUserID: s.cfg.Owner.TelegramUserID,
 		Version:        Version,
+		VoiceEnabled:   s.cfg.Transcriber != nil,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

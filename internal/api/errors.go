@@ -25,6 +25,14 @@ const (
 	ErrorCodeAliasConflictsWithName = "alias_conflicts_with_name"
 	ErrorCodeAliasLimitReached      = "alias_limit_reached"
 	ErrorCodeAliasForbiddenForInbox = "alias_forbidden_for_inbox"
+
+	ErrorCodeInvalidAudio        = "invalid_audio"
+	ErrorCodeInvalidMetadata     = "invalid_metadata"
+	ErrorCodeDurationTooLong     = "duration_too_long"
+	ErrorCodeProjectNotFound     = "project_not_found"
+	ErrorCodeAudioTooLarge       = "audio_too_large"
+	ErrorCodeUnsupportedMedia    = "unsupported_media_type"
+	ErrorCodeTranscriberDisabled = "transcriber_disabled"
 )
 
 // ErrorResponse wraps the error body. The format `{"error": {"code": "...", "message": "..."}}`

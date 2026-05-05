@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"container/list"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -57,6 +58,7 @@ func IdempotencyMiddleware(cfg IdempotencyConfig) func(http.Handler) http.Handle
 						return
 					}
 					if entry.response != nil {
+						_, _ = io.Copy(io.Discard, r.Body)
 						writeCachedResponse(w, entry.response)
 						return
 					}

@@ -188,6 +188,9 @@ func newFullServer(t *testing.T) *api.Server {
 		Events:         eventStore,
 		Broker:         broker,
 		PairingService: &mockPairingService{},
+		VoiceQueue:     storage.NewSQLiteVoiceQueue(db),
+		UploadsDir:     t.TempDir(),
+		TaskStore:      sqliteTasks,
 	})
 }
 

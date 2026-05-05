@@ -344,6 +344,448 @@ func TestMigrationsCreatesForwardBufferTable(t *testing.T) {
 	}
 }
 
+// TestMigration012UpPreservesTelegramData verifies that existing telegram rows
+// are correctly migrated: source_kind='telegram', payload=file_id, chat_id/message_id
+// preserved, device_id/client_job_id/project_id are NULL.
+func TestMigration012UpPreservesTelegramData(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 11); err != nil {
+		t.Fatalf("UpTo 11: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(`INSERT INTO voice_queue(chat_id, message_id, file_id, mime_type, duration_ms, received_at, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		100, 200, "file-abc", "audio/ogg", 5000, now, now); err != nil {
+		t.Fatalf("insert telegram job 1: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO voice_queue(chat_id, message_id, file_id, mime_type, duration_ms, received_at, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		100, 201, "file-xyz", "audio/mp4", 10000, now, now); err != nil {
+		t.Fatalf("insert telegram job 2: %v", err)
+	}
+
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT source_kind, payload, chat_id, message_id, device_id, client_job_id, project_id FROM voice_queue ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	type jobRow struct {
+		sourceKind  string
+		payload     string
+		chatID      int64
+		messageID   int64
+		deviceID    sql.NullString
+		clientJobID sql.NullString
+		projectID   sql.NullString
+	}
+	var got []jobRow
+	for rows.Next() {
+		var r jobRow
+		if err := rows.Scan(&r.sourceKind, &r.payload, &r.chatID, &r.messageID, &r.deviceID, &r.clientJobID, &r.projectID); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, r)
+	}
+	rows.Close()
+
+	if len(got) != 2 {
+		t.Fatalf("want 2 rows after migration, got %d", len(got))
+	}
+	for i, r := range got {
+		if r.sourceKind != "telegram" {
+			t.Errorf("row %d: source_kind=%q, want 'telegram'", i, r.sourceKind)
+		}
+		if r.deviceID.Valid {
+			t.Errorf("row %d: device_id should be NULL, got %q", i, r.deviceID.String)
+		}
+		if r.clientJobID.Valid {
+			t.Errorf("row %d: client_job_id should be NULL, got %q", i, r.clientJobID.String)
+		}
+		if r.projectID.Valid {
+			t.Errorf("row %d: project_id should be NULL, got %q", i, r.projectID.String)
+		}
+	}
+	if got[0].payload != "file-abc" || got[0].chatID != 100 || got[0].messageID != 200 {
+		t.Errorf("row 0: payload=%q chat_id=%d message_id=%d, want file-abc/100/200", got[0].payload, got[0].chatID, got[0].messageID)
+	}
+	if got[1].payload != "file-xyz" || got[1].chatID != 100 || got[1].messageID != 201 {
+		t.Errorf("row 1: payload=%q chat_id=%d message_id=%d, want file-xyz/100/201", got[1].payload, got[1].chatID, got[1].messageID)
+	}
+}
+
+// TestMigration012ClientJobNullableFields verifies a client job can be inserted
+// with NULL chat_id, message_id, project_id and the values are read back correctly.
+func TestMigration012ClientJobNullableFields(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, device_id, client_job_id, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+		"client", "2026/05/abc.ogg", "audio/ogg", 5000, now, now, "dev-1", "job-uuid-1",
+	); err != nil {
+		t.Fatalf("insert client job: %v", err)
+	}
+
+	var sourceKind, payload, deviceID, clientJobID string
+	var projectID sql.NullString
+	var chatID, messageID sql.NullInt64
+	err = db.QueryRow(`SELECT source_kind, payload, device_id, client_job_id, project_id, chat_id, message_id FROM voice_queue WHERE source_kind='client'`).
+		Scan(&sourceKind, &payload, &deviceID, &clientJobID, &projectID, &chatID, &messageID)
+	if err != nil {
+		t.Fatalf("scan client job: %v", err)
+	}
+	if sourceKind != "client" {
+		t.Errorf("source_kind=%q, want 'client'", sourceKind)
+	}
+	if payload != "2026/05/abc.ogg" {
+		t.Errorf("payload=%q, want '2026/05/abc.ogg'", payload)
+	}
+	if deviceID != "dev-1" {
+		t.Errorf("device_id=%q, want 'dev-1'", deviceID)
+	}
+	if clientJobID != "job-uuid-1" {
+		t.Errorf("client_job_id=%q, want 'job-uuid-1'", clientJobID)
+	}
+	if projectID.Valid {
+		t.Errorf("project_id should be NULL, got %q", projectID.String)
+	}
+	if chatID.Valid {
+		t.Errorf("chat_id should be NULL for client job, got %d", chatID.Int64)
+	}
+	if messageID.Valid {
+		t.Errorf("message_id should be NULL for client job, got %d", messageID.Int64)
+	}
+}
+
+// TestMigration012ClientJobProjectID verifies that project_id is stored and read back correctly.
+func TestMigration012ClientJobProjectID(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	projectUUID := "550e8400-e29b-41d4-a716-446655440000"
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, device_id, client_job_id, project_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"client", "2026/05/xyz.ogg", "audio/ogg", 3000, now, now, "dev-2", "job-uuid-2", projectUUID,
+	); err != nil {
+		t.Fatalf("insert client job with project_id: %v", err)
+	}
+
+	var gotProjectID sql.NullString
+	if err := db.QueryRow(`SELECT project_id FROM voice_queue WHERE client_job_id='job-uuid-2'`).Scan(&gotProjectID); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !gotProjectID.Valid {
+		t.Fatal("project_id should not be NULL")
+	}
+	if gotProjectID.String != projectUUID {
+		t.Errorf("project_id=%q, want %q", gotProjectID.String, projectUUID)
+	}
+}
+
+// TestMigration012TelegramDedupInsertOrIgnore verifies the partial unique index on
+// (chat_id, message_id) WHERE source_kind='telegram': a duplicate INSERT OR IGNORE is a noop.
+func TestMigration012TelegramDedupInsertOrIgnore(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, chat_id, message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"telegram", "file-id-1", "audio/ogg", 5000, now, now, 111, 222,
+	); err != nil {
+		t.Fatalf("insert first telegram job: %v", err)
+	}
+
+	if _, err := db.Exec(
+		`INSERT OR IGNORE INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, chat_id, message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"telegram", "file-id-2", "audio/ogg", 5000, now, now, 111, 222,
+	); err != nil {
+		t.Fatalf("INSERT OR IGNORE should not error: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM voice_queue`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("want 1 row after dedup INSERT OR IGNORE, got %d", count)
+	}
+}
+
+// TestMigration012ClientJobIDUnique verifies that duplicate client_job_id is rejected.
+func TestMigration012ClientJobIDUnique(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, device_id, client_job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"client", "2026/05/a.ogg", "audio/ogg", 5000, now, now, "dev-1", "unique-job-id",
+	); err != nil {
+		t.Fatalf("insert first: %v", err)
+	}
+
+	_, err = db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, device_id, client_job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"client", "2026/05/b.ogg", "audio/ogg", 5000, now, now, "dev-1", "unique-job-id",
+	)
+	if err == nil {
+		t.Fatal("expected UNIQUE constraint violation for duplicate client_job_id")
+	}
+}
+
+// TestMigration012DownPreservesTelegramDropsClient verifies the Down migration:
+// telegram rows are preserved (payload maps back to file_id), client rows are silently dropped.
+func TestMigration012DownPreservesTelegramDropsClient(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("opening DB: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, chat_id, message_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"telegram", "file-tg-1", "audio/ogg", 5000, now, now, 123, 456,
+	); err != nil {
+		t.Fatalf("insert telegram row: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO voice_queue(source_kind, payload, mime_type, duration_ms, received_at, next_attempt_at, device_id, client_job_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"client", "2026/05/abc.ogg", "audio/ogg", 3000, now, now, "dev-1", "job-uuid-down",
+	); err != nil {
+		t.Fatalf("insert client row: %v", err)
+	}
+
+	if err := goose.DownTo(db, ".", 11); err != nil {
+		t.Fatalf("DownTo 11: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM voice_queue`).Scan(&count); err != nil {
+		t.Fatalf("count after Down: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("want 1 row (only telegram), got %d", count)
+	}
+
+	var fileID string
+	var chatID, messageID int64
+	if err := db.QueryRow(`SELECT file_id, chat_id, message_id FROM voice_queue`).Scan(&fileID, &chatID, &messageID); err != nil {
+		t.Fatalf("scan after Down: %v", err)
+	}
+	if fileID != "file-tg-1" {
+		t.Errorf("file_id=%q after Down, want 'file-tg-1' (was payload)", fileID)
+	}
+	if chatID != 123 {
+		t.Errorf("chat_id=%d, want 123", chatID)
+	}
+	if messageID != 456 {
+		t.Errorf("message_id=%d, want 456", messageID)
+	}
+}
+
+// TestMigration013BackfillsMessageID verifies that existing messages rows get a
+// non-empty, unique 32-char hex message_id after migration 013.
+func TestMigration013BackfillsMessageID(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 12); err != nil {
+		t.Fatalf("UpTo 12: %v", err)
+	}
+
+	now := time.Now().Unix()
+	for _, args := range [][3]string{
+		{"src-1", "Alice", "hello"},
+		{"src-2", "Bot", "world"},
+	} {
+		if _, err := db.Exec(
+			`INSERT INTO messages(source_id, author_name, text, timestamp) VALUES (?, ?, ?, ?)`,
+			args[0], args[1], args[2], now,
+		); err != nil {
+			t.Fatalf("insert message %v: %v", args, err)
+		}
+	}
+
+	if err := goose.UpTo(db, ".", 13); err != nil {
+		t.Fatalf("UpTo 13: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT message_id FROM messages ORDER BY id`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	seen := map[string]bool{}
+	for rows.Next() {
+		var msgID string
+		if err := rows.Scan(&msgID); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if msgID == "" {
+			t.Error("message_id must not be empty after migration 013")
+		}
+		if len(msgID) != 32 {
+			t.Errorf("message_id=%q has length %d, want 32 (hex-encoded randomblob(16))", msgID, len(msgID))
+		}
+		if seen[msgID] {
+			t.Errorf("duplicate message_id found: %q", msgID)
+		}
+		seen[msgID] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("want 2 rows with unique message_id, got %d", len(seen))
+	}
+}
+
+// TestMigration013UniqueConstraintRejectsduplicate verifies that inserting a row with
+// a duplicate message_id is rejected by the UNIQUE index after migration 013.
+func TestMigration013UniqueConstraintRejectsdup(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 13); err != nil {
+		t.Fatalf("UpTo 13: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO messages(source_id, author_name, text, timestamp, message_id) VALUES (?, ?, ?, ?, ?)`,
+		"src-1", "Alice", "hello", now, "abcdef1234567890abcdef1234567890",
+	); err != nil {
+		t.Fatalf("insert first message: %v", err)
+	}
+
+	_, err = db.Exec(
+		`INSERT INTO messages(source_id, author_name, text, timestamp, message_id) VALUES (?, ?, ?, ?, ?)`,
+		"src-2", "Bob", "world", now, "abcdef1234567890abcdef1234567890",
+	)
+	if err == nil {
+		t.Fatal("expected UNIQUE constraint violation for duplicate message_id")
+	}
+}
+
+// TestMigration013DownDropsColumn verifies that rolling back migration 013 removes the
+// message_id column while preserving all other data.
+func TestMigration013DownDropsColumn(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	goose.SetBaseFS(migrations.FS)
+	_ = goose.SetDialect("sqlite3")
+	if err := goose.UpTo(db, ".", 13); err != nil {
+		t.Fatalf("UpTo 13: %v", err)
+	}
+
+	now := time.Now().Unix()
+	if _, err := db.Exec(
+		`INSERT INTO messages(source_id, author_name, text, timestamp, message_id) VALUES (?, ?, ?, ?, ?)`,
+		"src-1", "Alice", "hello world", now, "deadbeefdeadbeefdeadbeefdeadbeef",
+	); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+
+	if err := goose.DownTo(db, ".", 12); err != nil {
+		t.Fatalf("DownTo 12: %v", err)
+	}
+
+	// Data should still be there.
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("want 1 row after Down, got %d", count)
+	}
+
+	// message_id column must not exist.
+	if _, err := db.Query(`SELECT message_id FROM messages`); err == nil {
+		t.Fatal("expected error selecting message_id column after Down migration")
+	}
+
+	// Other columns intact.
+	var srcID, authorName, text string
+	if err := db.QueryRow(`SELECT source_id, author_name, text FROM messages`).Scan(&srcID, &authorName, &text); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if srcID != "src-1" || authorName != "Alice" || text != "hello world" {
+		t.Errorf("data mismatch: source_id=%q author_name=%q text=%q", srcID, authorName, text)
+	}
+}
+
 func TestUpIdempotent(t *testing.T) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

@@ -163,10 +163,17 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		slog.Info("transcriber configured", "provider", transcriber.Name())
 	}
 
-	var voiceEnqueueFn func(context.Context, model.VoiceJob) error
+	uploadsDir := cfg.Transcriber.UploadsDir
+	if err := os.MkdirAll(uploadsDir, 0o700); err != nil {
+		return fmt.Errorf("creating uploads directory: %w", err)
+	}
+
 	var voiceQueue *storage.SQLiteVoiceQueue
-	if transcriber != nil && cfg.Channels.Telegram != nil {
+	if (transcriber != nil && cfg.Channels.Telegram != nil) || cfg.API.Enabled {
 		voiceQueue = storage.NewSQLiteVoiceQueue(db)
+	}
+	var voiceEnqueueFn func(context.Context, model.VoiceJob) error
+	if voiceQueue != nil && cfg.Channels.Telegram != nil {
 		voiceEnqueueFn = voiceQueue.Enqueue
 	}
 
@@ -326,16 +333,34 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		}
 	}
 
-	if voiceQueue != nil && tgChannel != nil {
-		voiceWorker := transcribe.NewWorker(transcribe.WorkerDeps{
-			Queue:        voiceQueue,
-			Transcriber:  transcriber,
-			DownloadFn:   tgChannel.DownloadFileFn(),
-			Handler:      watchHandler,
-			BuildMessage: tgChannel.BuildVoiceMessage,
-			OnDrop:       tgChannel.ReplyVoiceError,
-			OnEmpty:      tgChannel.ReplyVoiceEmpty,
-			Logger:       logger,
+	if voiceQueue != nil && transcriber != nil {
+		downloaders := map[string]model.VoiceDownloader{}
+		consumers := map[string]model.VoiceConsumer{}
+
+		if telegramBot != nil && tgChannel != nil {
+			downloaders["telegram"] = transcribe.NewTelegramDownloader(telegramBot)
+			consumers["telegram"] = channel.NewTelegramVoiceConsumer(tgChannel, watchHandler)
+		}
+
+		if cfg.API.Enabled {
+			downloaders["client"] = transcribe.NewLocalFileDownloader(uploadsDir)
+			consumers["client"] = usecase.NewClientVoiceConsumer(usecase.ClientVoiceConsumerDeps{
+				DB:      db,
+				History: hist,
+				Events:  eventStore,
+				Broker:  broker,
+				Chat:    chatSvc,
+				Tasks:   taskStore,
+				Logger:  logger,
+			})
+		}
+
+		voiceWorker := transcribe.NewWorker(transcribe.WorkerConfig{
+			Queue:       voiceQueue,
+			Transcriber: transcriber,
+			Downloaders: downloaders,
+			Consumers:   consumers,
+			Logger:      logger,
 		})
 		go func() {
 			if err := voiceWorker.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -404,6 +429,8 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		Pairing:         pairingStore,
 		Devices:         deviceStore,
 		Revoker:         relayClient,
+		VoiceChecker:    voiceQueue,
+		UploadsDir:      uploadsDir,
 		EventRetention:  cfg.API.EventsRetention,
 		DeviceInactive:  cfg.Devices.InactiveThreshold,
 		DeviceRetention: cfg.Devices.RetentionPeriod,
@@ -461,7 +488,14 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 				UserName:       cfg.User.UserName,
 				TelegramUserID: cfg.User.TelegramUserID,
 			},
-			DateTime: cfg.DateTime,
+			DateTime:       cfg.DateTime,
+			VoiceQueue:     voiceQueue,
+			UploadsDir:     uploadsDir,
+			VoiceMaxBytes:  cfg.API.VoiceMaxBytes,
+			VoiceDuration:  cfg.Transcriber.MaxDuration,
+			Transcriber:    transcriber,
+			TaskStore:      taskStore,
+			VoiceRateLimit: cfg.API.VoiceRateLimitPerMinute,
 		})
 		go func() {
 			if err := apiSrv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

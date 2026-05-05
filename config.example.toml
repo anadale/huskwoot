@@ -116,6 +116,10 @@ default = "evening"  # time-of-day marker used when a date is given without expl
 # pairing_status_long_poll = "60s"
 # # POST /v1/pair/request budget per IP per hour (default: 5)
 # rate_limit_pair_per_hour = 5
+# Maximum size of uploaded audio for POST /v1/chat/voice (default: 10MiB)
+# voice_max_bytes = "10MiB"
+# Per-device rate limit for POST /v1/chat/voice per minute (default: 10; negative = startup error)
+# voice_rate_limit_per_minute = 10
 
 # Push notifications via an external relay service (optional).
 # To enable, all three fields must be set: relay_url, instance_id, instance_secret.

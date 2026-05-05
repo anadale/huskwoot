@@ -50,7 +50,7 @@ func (y *Yandex) Transcribe(ctx context.Context, audio model.AudioInput) (string
 	mimeBase := strings.TrimSpace(strings.SplitN(audio.MimeType, ";", 2)[0])
 	format, ok := mimeToYandexFormat[mimeBase]
 	if !ok {
-		return "", fmt.Errorf("yandex stt: unsupported audio format %q", audio.MimeType)
+		return "", fmt.Errorf("%w: yandex stt does not support %q", ErrUnsupportedFormat, audio.MimeType)
 	}
 	endpoint, err := buildYandexURL(y.cfg.Endpoint, y.cfg.FolderID, y.cfg.Language, format)
 	if err != nil {

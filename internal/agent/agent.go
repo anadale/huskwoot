@@ -133,12 +133,23 @@ func (a *Agent) Handle(ctx context.Context, msg model.Message) (string, error) {
 		}
 	}
 
+	type projectHintEntry struct {
+		Name string
+		Slug string
+	}
+	var projectHint *projectHintEntry
+	if msg.ProjectHint != nil {
+		projectHint = &projectHintEntry{Name: msg.ProjectHint.Name, Slug: msg.ProjectHint.Slug}
+	}
+
 	data := struct {
-		Now      string
-		Projects []projectEntry
+		Now         string
+		Projects    []projectEntry
+		ProjectHint *projectHintEntry
 	}{
-		Now:      now.Format("2006-01-02 15:04:05 -07:00"),
-		Projects: projectEntries,
+		Now:         now.Format("2006-01-02 15:04:05 -07:00"),
+		Projects:    projectEntries,
+		ProjectHint: projectHint,
 	}
 	var systemPromptBuf strings.Builder
 	if err := a.systemTmpl.Execute(&systemPromptBuf, data); err != nil {

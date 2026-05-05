@@ -891,13 +891,16 @@ func (w *TelegramChannel) enqueueVoice(ctx context.Context, m *tgbotapi.Message)
 		return
 	}
 
+	receivedAt := time.Unix(int64(m.Date), 0)
 	job := model.VoiceJob{
-		ChatID:     chatID,
-		MessageID:  m.MessageID,
-		FileID:     fileID,
-		MimeType:   mimeType,
-		Duration:   d,
-		ReceivedAt: time.Unix(int64(m.Date), 0),
+		SourceKind:    "telegram",
+		Payload:       fileID,
+		ChatID:        chatID,
+		MessageID:     m.MessageID,
+		MimeType:      mimeType,
+		Duration:      d,
+		ReceivedAt:    receivedAt,
+		NextAttemptAt: receivedAt,
 	}
 	if err := w.cfg.VoiceEnqueueFn(ctx, job); err != nil {
 		slog.ErrorContext(ctx, "voice: failed to enqueue", "chat_id", chatID, "err", err)

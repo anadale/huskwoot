@@ -975,6 +975,13 @@ func (m *mockHistory) Add(_ context.Context, source string, entry model.HistoryE
 	return m.addErr
 }
 
+func (m *mockHistory) AddTx(_ context.Context, _ *sql.Tx, source string, entry model.HistoryEntry) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.addCalls = append(m.addCalls, addHistoryArgs{source: source, entry: entry})
+	return "mock-message-id", m.addErr
+}
+
 func (m *mockHistory) Recent(_ context.Context, _ string, _ int) ([]model.HistoryEntry, error) {
 	return m.recentResult, m.recentErr
 }
@@ -3369,8 +3376,8 @@ func TestWatch_VoiceDM_EnqueueFnCalled(t *testing.T) {
 	if enqueued[0].MessageID != 5 {
 		t.Errorf("enqueued MessageID: want 5, got %d", enqueued[0].MessageID)
 	}
-	if enqueued[0].FileID != "voice_file_1" {
-		t.Errorf("enqueued FileID: want %q, got %q", "voice_file_1", enqueued[0].FileID)
+	if enqueued[0].Payload != "voice_file_1" {
+		t.Errorf("enqueued Payload: want %q, got %q", "voice_file_1", enqueued[0].Payload)
 	}
 	if enqueued[0].MimeType != "audio/ogg" {
 		t.Errorf("enqueued MimeType: want %q, got %q", "audio/ogg", enqueued[0].MimeType)

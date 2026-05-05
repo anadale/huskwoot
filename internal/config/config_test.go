@@ -1762,6 +1762,168 @@ ttl = "1h"
 	})
 }
 
+func TestLoad_TranscriberUploadsDir(t *testing.T) {
+	t.Run("явный путь пробрасывается", func(t *testing.T) {
+		content := validBase() + `
+[transcriber]
+uploads_dir = "/var/x"
+`
+		cfg, err := Load(writeConfig(t, content))
+		if err != nil {
+			t.Fatalf("expected success: %v", err)
+		}
+		if cfg.Transcriber.UploadsDir != "/var/x" {
+			t.Errorf("Transcriber.UploadsDir = %q, want %q", cfg.Transcriber.UploadsDir, "/var/x")
+		}
+	})
+
+	t.Run("пустой uploads_dir — дефолт через ApplyDefaults", func(t *testing.T) {
+		dir := t.TempDir()
+		var cfg Config
+		cfg.ApplyDefaults(dir)
+		want := filepath.Join(dir, "voice_uploads")
+		if cfg.Transcriber.UploadsDir != want {
+			t.Errorf("Transcriber.UploadsDir = %q, want %q", cfg.Transcriber.UploadsDir, want)
+		}
+	})
+
+	t.Run("Load устанавливает дефолт uploads_dir на основе configDir", func(t *testing.T) {
+		dir := writeConfig(t, validBase())
+		cfg, err := Load(dir)
+		if err != nil {
+			t.Fatalf("expected success: %v", err)
+		}
+		want := filepath.Join(dir, "voice_uploads")
+		if cfg.Transcriber.UploadsDir != want {
+			t.Errorf("Transcriber.UploadsDir = %q, want %q", cfg.Transcriber.UploadsDir, want)
+		}
+	})
+
+	t.Run("непустой uploads_dir не перезаписывается ApplyDefaults", func(t *testing.T) {
+		dir := t.TempDir()
+		var cfg Config
+		cfg.Transcriber.UploadsDir = "/custom/path"
+		cfg.ApplyDefaults(dir)
+		if cfg.Transcriber.UploadsDir != "/custom/path" {
+			t.Errorf("Transcriber.UploadsDir = %q, want %q", cfg.Transcriber.UploadsDir, "/custom/path")
+		}
+	})
+}
+
+func TestLoad_APIVoiceMaxBytes(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{"пустое → дефолт 10MiB", "", 10 * 1024 * 1024, false},
+		{"10MiB", `voice_max_bytes = "10MiB"`, 10 * 1024 * 1024, false},
+		{"5MiB", `voice_max_bytes = "5MiB"`, 5 * 1024 * 1024, false},
+		{"1KiB", `voice_max_bytes = "1KiB"`, 1024, false},
+		{"невалидный abc → ошибка", `voice_max_bytes = "abc"`, 0, true},
+		{"пустая строка → дефолт", `voice_max_bytes = ""`, 10 * 1024 * 1024, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content := validBase() + `
+[api]
+` + tc.raw + `
+`
+			cfg, err := Load(writeConfig(t, content))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success: %v", err)
+			}
+			if cfg.API.VoiceMaxBytes != tc.want {
+				t.Errorf("API.VoiceMaxBytes = %d, want %d", cfg.API.VoiceMaxBytes, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_APIVoiceRateLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		want    int
+		wantErr bool
+	}{
+		{"0 → дефолт 10", `voice_rate_limit_per_minute = 0`, 10, false},
+		{"не задан → дефолт 10", "", 10, false},
+		{"явный 20", `voice_rate_limit_per_minute = 20`, 20, false},
+		{"явный 1", `voice_rate_limit_per_minute = 1`, 1, false},
+		{"отрицательный → ошибка", `voice_rate_limit_per_minute = -1`, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content := validBase() + `
+[api]
+` + tc.raw + `
+`
+			cfg, err := Load(writeConfig(t, content))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected success: %v", err)
+			}
+			if cfg.API.VoiceRateLimitPerMinute != tc.want {
+				t.Errorf("API.VoiceRateLimitPerMinute = %d, want %d", cfg.API.VoiceRateLimitPerMinute, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseBytes(t *testing.T) {
+	cases := []struct {
+		input   string
+		want    int64
+		wantErr bool
+	}{
+		{"10MiB", 10 * 1024 * 1024, false},
+		{"1MiB", 1024 * 1024, false},
+		{"1KiB", 1024, false},
+		{"1GiB", 1 << 30, false},
+		{"1024B", 1024, false},
+		{"1024", 1024, false},
+		{"1MB", 1_000_000, false},
+		{"1KB", 1_000, false},
+		{"1GB", 1_000_000_000, false},
+		{"0", 0, false},
+		{"0B", 0, false},
+		{"abc", 0, true},
+		{"", 0, true},
+		{"-1MiB", 0, true},
+		{"10XiB", 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got, err := parseBytes(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseBytes(%q): expected error, got nil (result=%d)", tc.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseBytes(%q): expected success, got %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Errorf("parseBytes(%q) = %d, want %d", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoad_UserLanguage(t *testing.T) {
 	cases := []struct {
 		name     string

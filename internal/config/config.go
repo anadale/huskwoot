@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -203,6 +204,12 @@ type APIConfig struct {
 	PairingStatusLongPoll time.Duration `toml:"-"`
 	// RateLimitPairPerHour is the POST /v1/pair/request budget per IP per hour; default 5.
 	RateLimitPairPerHour int `toml:"rate_limit_pair_per_hour"`
+	// VoiceMaxBytesRaw is the max audio upload size as a human-readable byte string (e.g. "10MiB"); default "10MiB".
+	VoiceMaxBytesRaw string `toml:"voice_max_bytes"`
+	// VoiceMaxBytes is the parsed max audio upload size in bytes.
+	VoiceMaxBytes int64 `toml:"-"`
+	// VoiceRateLimitPerMinute is the per-device rate limit for POST /v1/chat/voice, per minute; 0 → default 10.
+	VoiceRateLimitPerMinute int `toml:"voice_rate_limit_per_minute"`
 }
 
 // PushConfig describes push dispatcher and relay connection parameters.
@@ -288,6 +295,8 @@ type TranscriberConfig struct {
 	MaxDurationRaw string `toml:"max_duration"`
 	// MaxDuration is the parsed maximum duration value.
 	MaxDuration time.Duration `toml:"-"`
+	// UploadsDir is the base directory for client audio file storage. If empty, defaults to <configDir>/voice_uploads.
+	UploadsDir string `toml:"uploads_dir"`
 	// Whisper holds whisper.cpp-specific settings.
 	Whisper WhisperConfig `toml:"whisper"`
 	// Yandex holds Yandex SpeechKit-specific settings.
@@ -326,11 +335,22 @@ func Load(dir string) (*Config, error) {
 		return nil, fmt.Errorf("parsing TOML: %w", err)
 	}
 
+	cfg.ApplyDefaults(dir)
+
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("validating configuration: %w", err)
 	}
 
 	return &cfg, nil
+}
+
+// ApplyDefaults sets directory-relative defaults that require the configDir path.
+// It must be called before validate(). Callers outside Load (e.g. tests) should
+// call this explicitly when testing default values.
+func (c *Config) ApplyDefaults(configDir string) {
+	if c.Transcriber.UploadsDir == "" {
+		c.Transcriber.UploadsDir = filepath.Join(configDir, "voice_uploads")
+	}
 }
 
 // expandEnvVars substitutes ${ENV_VAR} references with values from the environment.
@@ -595,6 +615,27 @@ func (c *Config) validateAPI() error {
 		c.API.RateLimitPairPerHour = 5
 	}
 
+	const defaultVoiceMaxBytes int64 = 10 * 1024 * 1024
+	if c.API.VoiceMaxBytesRaw == "" {
+		c.API.VoiceMaxBytes = defaultVoiceMaxBytes
+	} else {
+		n, err := parseBytes(c.API.VoiceMaxBytesRaw)
+		if err != nil {
+			return fmt.Errorf("api.voice_max_bytes %q: %w", c.API.VoiceMaxBytesRaw, err)
+		}
+		if n <= 0 {
+			return fmt.Errorf("api.voice_max_bytes must be positive, got %q", c.API.VoiceMaxBytesRaw)
+		}
+		c.API.VoiceMaxBytes = n
+	}
+
+	if c.API.VoiceRateLimitPerMinute < 0 {
+		return fmt.Errorf("api.voice_rate_limit_per_minute must be non-negative, got %d", c.API.VoiceRateLimitPerMinute)
+	}
+	if c.API.VoiceRateLimitPerMinute == 0 {
+		c.API.VoiceRateLimitPerMinute = 10
+	}
+
 	if c.API.Enabled && c.API.ListenAddr == "" {
 		return fmt.Errorf("api.listen_addr is required when api.enabled = true")
 	}
@@ -805,6 +846,51 @@ func (c *Config) validateTranscriber() error {
 	}
 
 	return nil
+}
+
+// parseBytes parses a human-readable byte size string (e.g. "10MiB", "1024", "500KB").
+// Supported suffixes: B, KiB, MiB, GiB, KB, MB, GB. No suffix means bytes.
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty byte size string")
+	}
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"GiB", 1 << 30},
+		{"MiB", 1 << 20},
+		{"KiB", 1 << 10},
+		{"GB", 1_000_000_000},
+		{"MB", 1_000_000},
+		{"KB", 1_000},
+		{"B", 1},
+	}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			numStr := strings.TrimSpace(strings.TrimSuffix(s, u.suffix))
+			n, err := strconv.ParseInt(numStr, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid byte size %q", s)
+			}
+			if n < 0 {
+				return 0, fmt.Errorf("byte size %q must be non-negative", s)
+			}
+			if u.mult > 1 && n > math.MaxInt64/u.mult {
+				return 0, fmt.Errorf("byte size %q overflows int64", s)
+			}
+			return n * u.mult, nil
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size %q", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("byte size %q must be non-negative", s)
+	}
+	return n, nil
 }
 
 // parseHHMM parses a string in "HH:MM" format (hours 0–23, minutes 0–59).
