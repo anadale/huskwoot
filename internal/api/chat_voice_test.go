@@ -109,6 +109,10 @@ func (s *voiceTestTaskStore) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx, 
 func (s *voiceTestTaskStore) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
 	return nil, nil
 }
+func (s *voiceTestTaskStore) ListClosedOlderThan(_ context.Context, _ time.Time) ([]model.Task, error) {
+	return nil, nil
+}
+func (s *voiceTestTaskStore) DeleteTaskTx(_ context.Context, _ *sql.Tx, _ string) error { return nil }
 
 // chatVoiceHarness sets up an api.Server wired for POST /v1/chat/voice.
 type chatVoiceHarness struct {
