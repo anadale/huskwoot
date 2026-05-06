@@ -595,7 +595,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "415":
-          description: mimeType is not in the accepted list (audio/ogg;codecs=opus, audio/mp4, audio/webm;codecs=opus).
+          description: mimeType is not in the accepted list (audio/ogg;codecs=opus, audio/mp4, audio/webm;codecs=opus, audio/wav).
           content:
             application/json:
               schema:
@@ -1297,6 +1297,7 @@ components:
             - "audio/ogg;codecs=opus"
             - "audio/mp4"
             - "audio/webm;codecs=opus"
+            - "audio/wav"
         projectId:
           type: string
           format: uuid

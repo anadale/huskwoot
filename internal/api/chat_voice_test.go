@@ -76,7 +76,9 @@ func (s *voiceTestTaskStore) UpdateProjectTx(_ context.Context, _ *sql.Tx, _ str
 func (s *voiceTestTaskStore) GetProjectTx(_ context.Context, _ *sql.Tx, id string) (*model.Project, error) {
 	return s.GetProject(context.Background(), id)
 }
-func (s *voiceTestTaskStore) ListProjects(_ context.Context) ([]model.Project, error) { return nil, nil }
+func (s *voiceTestTaskStore) ListProjects(_ context.Context) ([]model.Project, error) {
+	return nil, nil
+}
 func (s *voiceTestTaskStore) FindProjectByName(_ context.Context, _ string) (*model.Project, error) {
 	return nil, nil
 }
@@ -99,7 +101,7 @@ func (s *voiceTestTaskStore) UpdateTaskTx(_ context.Context, _ *sql.Tx, _ string
 	return nil
 }
 func (s *voiceTestTaskStore) MoveTaskTx(_ context.Context, _ *sql.Tx, _, _ string) error { return nil }
-func (s *voiceTestTaskStore) DefaultProjectID() string                                     { return "" }
+func (s *voiceTestTaskStore) DefaultProjectID() string                                   { return "" }
 func (s *voiceTestTaskStore) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
 	return nil
 }
@@ -393,9 +395,9 @@ func TestChatVoiceBodyTooLarge(t *testing.T) {
 
 func TestChatVoiceUnsupportedMimeType(t *testing.T) {
 	h := newChatVoiceHarness(t)
-	body, ct := buildVoiceMultipart(t, []byte("audio"), "audio/wav", map[string]any{
+	body, ct := buildVoiceMultipart(t, []byte("audio"), "audio/mpeg", map[string]any{
 		"durationMs": 1000,
-		"mimeType":   "audio/wav",
+		"mimeType":   "audio/mpeg",
 	})
 
 	rec := h.doVoice(body, ct, h.token)
@@ -812,7 +814,9 @@ func TestChatVoiceIdempotencyPerDevice(t *testing.T) {
 		t.Fatalf("device B: status=%d, want 202; body=%s", recB.Code, recB.Body.String())
 	}
 
-	var rA, rB struct{ JobID string `json:"jobId"` }
+	var rA, rB struct {
+		JobID string `json:"jobId"`
+	}
 	decodeJSONResp(t, recA.Body, &rA)
 	decodeJSONResp(t, recB.Body, &rB)
 

@@ -25,6 +25,7 @@ var allowedMimeTypes = map[string]string{
 	"audio/ogg;codecs=opus":  ".ogg",
 	"audio/mp4":              ".m4a",
 	"audio/webm;codecs=opus": ".webm",
+	"audio/wav":              ".wav",
 }
 
 // voiceMetadata is the JSON payload from the "metadata" part of the multipart form.
@@ -137,7 +138,7 @@ func (h *chatVoiceHandler) post(w http.ResponseWriter, r *http.Request) {
 	ext, ok := allowedMimeTypes[normMeta]
 	if !ok {
 		WriteError(w, http.StatusUnsupportedMediaType, ErrorCodeUnsupportedMedia,
-			"unsupported audio format; accepted: audio/ogg;codecs=opus, audio/mp4, audio/webm;codecs=opus")
+			"unsupported audio format; accepted: audio/ogg;codecs=opus, audio/mp4, audio/webm;codecs=opus, audio/wav")
 		return
 	}
 
@@ -244,7 +245,7 @@ func (h *chatVoiceHandler) post(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, ErrorCodeInternal, "failed to store audio")
 		return
 	}
-	tmpPath = ""       // tmp was renamed; defer must not try to remove it
+	tmpPath = ""         // tmp was renamed; defer must not try to remove it
 	finalPath = destPath // defer removes this if enqueue fails
 
 	relPath := destFileName
