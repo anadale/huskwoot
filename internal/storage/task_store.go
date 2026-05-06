@@ -627,6 +627,80 @@ func (s *SQLiteTaskStore) MoveTaskTx(ctx context.Context, tx *sql.Tx, taskID, ne
 	return nil
 }
 
+// ListClosedOlderThan returns full snapshots of tasks with status
+// "done"/"cancelled" whose closed_at is strictly before cutoff. Tasks without
+// closed_at are skipped — their close time is unknown.
+func (s *SQLiteTaskStore) ListClosedOlderThan(ctx context.Context, cutoff time.Time) ([]model.Task, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
+		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+		 FROM tasks t JOIN projects p ON t.project_id = p.id
+		 WHERE t.status IN ('done', 'cancelled')
+		   AND t.closed_at IS NOT NULL
+		   AND t.closed_at < ?
+		 ORDER BY t.closed_at`,
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing closed tasks older than %s: %w", cutoff.Format(time.RFC3339), err)
+	}
+	defer rows.Close()
+
+	var tasks []model.Task
+	for rows.Next() {
+		var task model.Task
+		var createdAtStr, updatedAtStr string
+		var deadlineStr, closedAtStr *string
+
+		if err := rows.Scan(
+			&task.ID, &task.ProjectID, &task.ProjectSlug, &task.Number,
+			&task.Summary, &task.Details, &task.Topic, &task.Status,
+			&deadlineStr, &closedAtStr,
+			&createdAtStr, &updatedAtStr,
+			&task.Source.Kind, &task.Source.ID,
+		); err != nil {
+			return nil, fmt.Errorf("scanning closed task: %w", err)
+		}
+
+		task.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing created_at: %w", err)
+		}
+		task.UpdatedAt, err = time.Parse(time.RFC3339, updatedAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("parsing updated_at: %w", err)
+		}
+		if deadlineStr != nil {
+			dl, err := time.Parse(time.RFC3339, *deadlineStr)
+			if err != nil {
+				return nil, fmt.Errorf("parsing deadline: %w", err)
+			}
+			task.Deadline = &dl
+		}
+		if closedAtStr != nil {
+			ca, err := parseClosedAt(*closedAtStr)
+			if err != nil {
+				return nil, fmt.Errorf("parsing closed_at: %w", err)
+			}
+			task.ClosedAt = &ca
+		}
+
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating closed tasks: %w", err)
+	}
+	return tasks, nil
+}
+
+// DeleteTaskTx physically deletes a task row by id within the given transaction.
+func (s *SQLiteTaskStore) DeleteTaskTx(ctx context.Context, tx *sql.Tx, id string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("deleting task %q: %w", id, err)
+	}
+	return nil
+}
+
 // nullableTime converts *time.Time to *string for SQLite storage.
 func nullableTime(t *time.Time) *string {
 	if t == nil {

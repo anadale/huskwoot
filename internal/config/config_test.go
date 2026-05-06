@@ -1981,3 +1981,87 @@ ttl = "1h"
 		})
 	}
 }
+
+func TestLoadConfig_TasksDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validBase()))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	if cfg.Tasks.ClosedRetention != 14*24*time.Hour {
+		t.Errorf("Tasks.ClosedRetention default = %v, want 336h", cfg.Tasks.ClosedRetention)
+	}
+	if cfg.Tasks.CleanupTime != "04:00" {
+		t.Errorf("Tasks.CleanupTime default = %q, want 04:00", cfg.Tasks.CleanupTime)
+	}
+	if cfg.Tasks.CleanupHour != 4 || cfg.Tasks.CleanupMinute != 0 {
+		t.Errorf("CleanupHour:Minute = %d:%d, want 4:0", cfg.Tasks.CleanupHour, cfg.Tasks.CleanupMinute)
+	}
+}
+
+func TestLoadConfig_TasksOverrides(t *testing.T) {
+	content := validBase() + `
+[tasks]
+closed_retention = "72h"
+cleanup_time = "03:30"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	if cfg.Tasks.ClosedRetention != 72*time.Hour {
+		t.Errorf("ClosedRetention = %v, want 72h", cfg.Tasks.ClosedRetention)
+	}
+	if cfg.Tasks.CleanupHour != 3 || cfg.Tasks.CleanupMinute != 30 {
+		t.Errorf("CleanupHour:Minute = %d:%d, want 3:30", cfg.Tasks.CleanupHour, cfg.Tasks.CleanupMinute)
+	}
+}
+
+func TestLoadConfig_TasksZeroRetentionDisables(t *testing.T) {
+	content := validBase() + `
+[tasks]
+closed_retention = "0s"
+`
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatalf("expected success: %v", err)
+	}
+	if cfg.Tasks.ClosedRetention != 0 {
+		t.Errorf("ClosedRetention = %v, want 0 (disabled)", cfg.Tasks.ClosedRetention)
+	}
+}
+
+func TestLoadConfig_TasksValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "negative retention",
+			content: validBase() + `
+[tasks]
+closed_retention = "-1h"
+`,
+		},
+		{
+			name: "invalid duration",
+			content: validBase() + `
+[tasks]
+closed_retention = "garbage"
+`,
+		},
+		{
+			name: "invalid cleanup time",
+			content: validBase() + `
+[tasks]
+cleanup_time = "25:00"
+`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, tc.content)); err == nil {
+				t.Fatalf("expected validation error, got nil")
+			}
+		})
+	}
+}

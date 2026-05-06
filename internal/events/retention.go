@@ -63,6 +63,21 @@ type RunnerConfig struct {
 	// DeviceRetention is the time after which a revoked device is physically
 	// deleted from the store. Zero disables the physical deletion sweep.
 	DeviceRetention time.Duration
+	// TaskCleanup deletes closed tasks older than cutoff and returns the number
+	// of tasks deleted. Implemented by TaskService.PurgeClosedOlderThan; the
+	// runner uses a function so the events package does not depend on the
+	// use-case layer. nil disables the closed-task cleanup.
+	TaskCleanup func(ctx context.Context, cutoff time.Time) (int, error)
+	// TaskClosedRetention is the period after closed_at before a done/cancelled
+	// task is physically deleted. Zero or negative disables the cleanup.
+	TaskClosedRetention time.Duration
+	// TaskCleanupHour and TaskCleanupMinute select the local time-of-day at
+	// which the daily task cleanup runs (e.g. hour=4, minute=0 for 04:00).
+	TaskCleanupHour   int
+	TaskCleanupMinute int
+	// TaskCleanupTZ is the timezone used to interpret the cleanup time.
+	// nil falls back to time.UTC.
+	TaskCleanupTZ *time.Location
 	// Logger is the structured logger; slog.Default is used when nil.
 	Logger *slog.Logger
 }
@@ -71,18 +86,24 @@ type RunnerConfig struct {
 // expired pairing requests, revokes / deletes inactive devices, and sweeps
 // orphaned voice upload files.
 type Runner struct {
-	events          model.EventStore
-	queue           model.PushQueue
-	pairing         model.PairingStore
-	devices         model.DeviceStore
-	revoker         RegistrationRevoker
-	voiceChecker    VoiceOrphanChecker
-	uploadsDir      string
-	eventRetention  time.Duration
-	deviceInactive  time.Duration
-	deviceRetention time.Duration
-	interval        time.Duration
-	logger          *slog.Logger
+	events              model.EventStore
+	queue               model.PushQueue
+	pairing             model.PairingStore
+	devices             model.DeviceStore
+	revoker             RegistrationRevoker
+	voiceChecker        VoiceOrphanChecker
+	uploadsDir          string
+	eventRetention      time.Duration
+	deviceInactive      time.Duration
+	deviceRetention     time.Duration
+	taskCleanup         func(ctx context.Context, cutoff time.Time) (int, error)
+	taskClosedRetention time.Duration
+	taskCleanupHour     int
+	taskCleanupMinute   int
+	taskCleanupTZ       *time.Location
+	nextTaskCleanup     time.Time
+	interval            time.Duration
+	logger              *slog.Logger
 }
 
 // NewRunner creates a Runner with the given configuration.
@@ -91,19 +112,28 @@ func NewRunner(cfg RunnerConfig) *Runner {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	tz := cfg.TaskCleanupTZ
+	if tz == nil {
+		tz = time.UTC
+	}
 	return &Runner{
-		events:          cfg.Events,
-		queue:           cfg.Queue,
-		pairing:         cfg.Pairing,
-		devices:         cfg.Devices,
-		revoker:         cfg.Revoker,
-		voiceChecker:    cfg.VoiceChecker,
-		uploadsDir:      cfg.UploadsDir,
-		eventRetention:  cfg.EventRetention,
-		deviceInactive:  cfg.DeviceInactive,
-		deviceRetention: cfg.DeviceRetention,
-		interval:        defaultRetentionInterval,
-		logger:          logger,
+		events:              cfg.Events,
+		queue:               cfg.Queue,
+		pairing:             cfg.Pairing,
+		devices:             cfg.Devices,
+		revoker:             cfg.Revoker,
+		voiceChecker:        cfg.VoiceChecker,
+		uploadsDir:          cfg.UploadsDir,
+		eventRetention:      cfg.EventRetention,
+		deviceInactive:      cfg.DeviceInactive,
+		deviceRetention:     cfg.DeviceRetention,
+		taskCleanup:         cfg.TaskCleanup,
+		taskClosedRetention: cfg.TaskClosedRetention,
+		taskCleanupHour:     cfg.TaskCleanupHour,
+		taskCleanupMinute:   cfg.TaskCleanupMinute,
+		taskCleanupTZ:       tz,
+		interval:            defaultRetentionInterval,
+		logger:              logger,
 	}
 }
 
@@ -153,7 +183,47 @@ func (r *Runner) Tick(ctx context.Context, now time.Time) error {
 	if _, err := r.events.DeleteOlderThan(ctx, cutoff); err != nil {
 		r.logger.Warn("events cleanup", "error", err)
 	}
+
+	r.sweepClosedTasks(ctx, now)
 	return nil
+}
+
+// sweepClosedTasks runs the daily cleanup of done/cancelled tasks if the
+// scheduled time-of-day has been reached. The next-fire time is recomputed
+// after each successful trigger so the sweep runs at most once per local day.
+func (r *Runner) sweepClosedTasks(ctx context.Context, now time.Time) {
+	if r.taskCleanup == nil || r.taskClosedRetention <= 0 {
+		return
+	}
+	if r.nextTaskCleanup.IsZero() {
+		r.nextTaskCleanup = nextDailyAt(now, r.taskCleanupHour, r.taskCleanupMinute, r.taskCleanupTZ)
+		return
+	}
+	if now.Before(r.nextTaskCleanup) {
+		return
+	}
+
+	cutoff := now.Add(-r.taskClosedRetention)
+	n, err := r.taskCleanup(ctx, cutoff)
+	if err != nil {
+		r.logger.Warn("tasks: closed cleanup", "error", err)
+	} else if n > 0 {
+		r.logger.Info("tasks: deleted closed tasks", "count", n,
+			"older_than", cutoff.Format(time.RFC3339))
+	}
+	r.nextTaskCleanup = nextDailyAt(now, r.taskCleanupHour, r.taskCleanupMinute, r.taskCleanupTZ)
+}
+
+// nextDailyAt returns the next instant strictly after now whose local time
+// (in tz) equals hour:minute. If today's slot has not yet passed, it returns
+// today's slot; otherwise tomorrow's.
+func nextDailyAt(now time.Time, hour, minute int, tz *time.Location) time.Time {
+	local := now.In(tz)
+	candidate := time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, tz)
+	if !candidate.After(local) {
+		candidate = candidate.AddDate(0, 0, 1)
+	}
+	return candidate
 }
 
 // sweepDevices auto-revokes inactive devices and deletes long-revoked ones.

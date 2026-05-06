@@ -19,6 +19,10 @@ const (
 	EventTaskReopened EventKind = "task_reopened"
 	// EventTaskMoved — a task was moved to another project.
 	EventTaskMoved EventKind = "task_moved"
+	// EventTaskDeleted — a task was physically deleted by the retention sweep.
+	// Emitted only by the daily cleanup of done/cancelled tasks older than
+	// closed_retention; no other operation deletes tasks.
+	EventTaskDeleted EventKind = "task_deleted"
 	// EventProjectCreated — a project was created.
 	EventProjectCreated EventKind = "project_created"
 	// EventProjectUpdated — project fields changed (name, description, slug).

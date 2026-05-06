@@ -157,6 +157,12 @@ func (m *mockForwardTaskStore) RemoveProjectAliasTx(_ context.Context, _ *sql.Tx
 func (m *mockForwardTaskStore) ListAliasesForProject(_ context.Context, _ string) ([]string, error) {
 	return nil, nil
 }
+func (m *mockForwardTaskStore) ListClosedOlderThan(_ context.Context, _ time.Time) ([]model.Task, error) {
+	return nil, nil
+}
+func (m *mockForwardTaskStore) DeleteTaskTx(_ context.Context, _ *sql.Tx, _ string) error {
+	return nil
+}
 
 // --- Mock: EventStore ---
 

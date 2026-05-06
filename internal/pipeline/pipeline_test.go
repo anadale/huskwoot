@@ -135,6 +135,9 @@ func (m *mockTaskService) GetTask(_ context.Context, _ string) (*model.Task, err
 func (m *mockTaskService) GetTaskByRef(_ context.Context, _ string, _ int) (*model.Task, error) {
 	return nil, nil
 }
+func (m *mockTaskService) PurgeClosedOlderThan(_ context.Context, _ time.Time) (int, error) {
+	return 0, nil
+}
 
 // mockProjectService implements model.ProjectService for tests.
 type mockProjectService struct {

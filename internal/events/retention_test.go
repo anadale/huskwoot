@@ -526,6 +526,153 @@ func TestRetentionRunStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// stubTaskCleanup is a TaskCleanup function stub for task-cleanup tests.
+type stubTaskCleanup struct {
+	calls    atomic.Int32
+	lastCut  time.Time
+	returned int
+	err      error
+}
+
+func (s *stubTaskCleanup) Cleanup(_ context.Context, cutoff time.Time) (int, error) {
+	s.calls.Add(1)
+	s.lastCut = cutoff
+	return s.returned, s.err
+}
+
+func TestRetentionRunner_TaskCleanupSkipsBeforeScheduledTime(t *testing.T) {
+	tasks := &stubTaskCleanup{returned: 5}
+	tz := time.UTC
+	now := time.Date(2026, 4, 19, 2, 0, 0, 0, tz) // 02:00, before 04:00
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:              &stubEventStore{},
+		Queue:               &stubPushQueue{},
+		TaskCleanup:         tasks.Cleanup,
+		TaskClosedRetention: 14 * 24 * time.Hour,
+		TaskCleanupHour:     4,
+		TaskCleanupMinute:   0,
+		TaskCleanupTZ:       tz,
+		EventRetention:      time.Hour,
+		Logger:              silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), now); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if tasks.calls.Load() != 0 {
+		t.Fatalf("TaskCleanup called on first tick before scheduled time, want 0")
+	}
+}
+
+func TestRetentionRunner_TaskCleanupRunsAtScheduledTime(t *testing.T) {
+	tasks := &stubTaskCleanup{returned: 7}
+	tz := time.UTC
+	retention := 14 * 24 * time.Hour
+	startup := time.Date(2026, 4, 19, 2, 0, 0, 0, tz)
+	afterSlot := time.Date(2026, 4, 19, 4, 30, 0, 0, tz)
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:              &stubEventStore{},
+		Queue:               &stubPushQueue{},
+		TaskCleanup:         tasks.Cleanup,
+		TaskClosedRetention: retention,
+		TaskCleanupHour:     4,
+		TaskCleanupMinute:   0,
+		TaskCleanupTZ:       tz,
+		EventRetention:      time.Hour,
+		Logger:              silentLogger(),
+	})
+
+	// First tick: schedule next-cleanup, do not run.
+	if err := runner.Tick(context.Background(), startup); err != nil {
+		t.Fatalf("Tick startup: %v", err)
+	}
+	if tasks.calls.Load() != 0 {
+		t.Fatalf("first tick triggered cleanup, want 0 (deferred to schedule)")
+	}
+
+	// Second tick after the scheduled slot: should fire.
+	if err := runner.Tick(context.Background(), afterSlot); err != nil {
+		t.Fatalf("Tick afterSlot: %v", err)
+	}
+	if tasks.calls.Load() != 1 {
+		t.Fatalf("TaskCleanup called %d times, want 1", tasks.calls.Load())
+	}
+	expected := afterSlot.Add(-retention)
+	if !tasks.lastCut.Equal(expected) {
+		t.Fatalf("cutoff = %v, want %v", tasks.lastCut, expected)
+	}
+
+	// Third tick same day: must not fire again.
+	sameDayLater := afterSlot.Add(2 * time.Hour)
+	if err := runner.Tick(context.Background(), sameDayLater); err != nil {
+		t.Fatalf("Tick sameDayLater: %v", err)
+	}
+	if tasks.calls.Load() != 1 {
+		t.Fatalf("cleanup fired twice in one day, calls=%d", tasks.calls.Load())
+	}
+
+	// Tick on the next day after the slot: must fire again.
+	nextDay := time.Date(2026, 4, 20, 4, 30, 0, 0, tz)
+	if err := runner.Tick(context.Background(), nextDay); err != nil {
+		t.Fatalf("Tick nextDay: %v", err)
+	}
+	if tasks.calls.Load() != 2 {
+		t.Fatalf("cleanup did not fire on next day, calls=%d", tasks.calls.Load())
+	}
+}
+
+func TestRetentionRunner_TaskCleanupDisabledWhenZeroRetention(t *testing.T) {
+	tasks := &stubTaskCleanup{}
+	tz := time.UTC
+	now := time.Date(2026, 4, 19, 4, 30, 0, 0, tz)
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:              &stubEventStore{},
+		Queue:               &stubPushQueue{},
+		TaskCleanup:         tasks.Cleanup,
+		TaskClosedRetention: 0,
+		TaskCleanupHour:     4,
+		TaskCleanupTZ:       tz,
+		EventRetention:      time.Hour,
+		Logger:              silentLogger(),
+	})
+
+	if err := runner.Tick(context.Background(), now); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if tasks.calls.Load() != 0 {
+		t.Fatalf("TaskCleanup called when retention is 0, want 0")
+	}
+}
+
+func TestRetentionRunner_TaskCleanupErrorDoesNotCrash(t *testing.T) {
+	tasks := &stubTaskCleanup{err: errors.New("disk full")}
+	tz := time.UTC
+	startup := time.Date(2026, 4, 19, 2, 0, 0, 0, tz)
+	afterSlot := time.Date(2026, 4, 19, 4, 30, 0, 0, tz)
+
+	runner := events.NewRunner(events.RunnerConfig{
+		Events:              &stubEventStore{},
+		Queue:               &stubPushQueue{},
+		TaskCleanup:         tasks.Cleanup,
+		TaskClosedRetention: 14 * 24 * time.Hour,
+		TaskCleanupHour:     4,
+		TaskCleanupTZ:       tz,
+		EventRetention:      time.Hour,
+		Logger:              silentLogger(),
+	})
+
+	_ = runner.Tick(context.Background(), startup)
+	if err := runner.Tick(context.Background(), afterSlot); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if tasks.calls.Load() != 1 {
+		t.Fatalf("TaskCleanup calls = %d, want 1", tasks.calls.Load())
+	}
+}
+
 func TestRetentionRunner_DeletesExpiredPairings(t *testing.T) {
 	eventsStub := &stubEventStore{}
 	queueStub := &stubPushQueue{}

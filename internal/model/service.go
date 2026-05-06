@@ -74,6 +74,10 @@ type TaskService interface {
 	GetTask(ctx context.Context, id string) (*Task, error)
 	// GetTaskByRef finds a task by its human-readable reference "<slug>#<number>".
 	GetTaskByRef(ctx context.Context, projectSlug string, number int) (*Task, error)
+	// PurgeClosedOlderThan deletes done/cancelled tasks closed before cutoff
+	// and emits a task_deleted event for each one (transactionally with the
+	// delete). Returns the number of tasks deleted.
+	PurgeClosedOlderThan(ctx context.Context, cutoff time.Time) (int, error)
 }
 
 // ProjectService is the use-case layer for project operations.
