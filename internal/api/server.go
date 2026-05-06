@@ -89,6 +89,9 @@ type Config struct {
 	TaskStore model.TaskStore
 	// VoiceRateLimit is the per-device rate limit for POST /v1/chat/voice, per minute. 0 → default 10.
 	VoiceRateLimit int
+	// BuildVersion is the binary version string injected via ldflags. Falls back to
+	// the package-level Version constant when empty.
+	BuildVersion string
 }
 
 // Server wraps http.Server and a chi router.

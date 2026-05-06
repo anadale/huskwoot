@@ -17,11 +17,15 @@ type meResponse struct {
 // getMe returns the current device identity and instance metadata.
 // Authentication is provided by AuthMiddleware: device_id is always in context.
 func (s *Server) getMe(w http.ResponseWriter, r *http.Request) {
+	v := s.cfg.BuildVersion
+	if v == "" {
+		v = Version
+	}
 	resp := meResponse{
 		DeviceID:       DeviceIDFromContext(r.Context()),
 		OwnerName:      s.cfg.Owner.UserName,
 		TelegramUserID: s.cfg.Owner.TelegramUserID,
-		Version:        Version,
+		Version:        v,
 		VoiceEnabled:   s.cfg.Transcriber != nil,
 	}
 	writeJSON(w, http.StatusOK, resp)

@@ -495,6 +495,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 				UserName:       cfg.User.UserName,
 				TelegramUserID: cfg.User.TelegramUserID,
 			},
+			BuildVersion: version,
 			DateTime:       cfg.DateTime,
 			VoiceQueue:     voiceQueue,
 			UploadsDir:     uploadsDir,
