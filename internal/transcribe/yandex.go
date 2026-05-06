@@ -43,6 +43,7 @@ func (y *Yandex) Name() string {
 var mimeToYandexFormat = map[string]string{
 	"audio/ogg":  "oggopus",
 	"audio/mpeg": "mp3",
+	"audio/wav":  "lpcm",
 }
 
 // Transcribe sends audio to Yandex SpeechKit and returns the recognized text.
@@ -57,7 +58,15 @@ func (y *Yandex) Transcribe(ctx context.Context, audio model.AudioInput) (string
 		return "", fmt.Errorf("yandex stt: build url: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(audio.Data))
+	audioData := audio.Data
+	if format == "lpcm" {
+		audioData, err = stripWAVHeader(audioData)
+		if err != nil {
+			return "", fmt.Errorf("yandex stt: %w", err)
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(audioData))
 	if err != nil {
 		return "", fmt.Errorf("yandex stt: create request: %w", err)
 	}
@@ -98,6 +107,35 @@ func buildYandexURL(endpoint, folderID, language, format string) (string, error)
 	q.Set("folderId", folderID)
 	q.Set("lang", language)
 	q.Set("format", format)
+	if format == "lpcm" {
+		q.Set("sampleRateHertz", "16000")
+	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// stripWAVHeader parses a RIFF/WAVE file and returns the raw PCM payload from
+// the "data" chunk. Yandex SpeechKit's lpcm format requires headerless PCM.
+func stripWAVHeader(data []byte) ([]byte, error) {
+	if len(data) < 12 || string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("not a valid RIFF/WAVE file")
+	}
+	i := 12
+	for i+8 <= len(data) {
+		chunkID := string(data[i : i+4])
+		chunkSize := int(data[i+4]) | int(data[i+5])<<8 | int(data[i+6])<<16 | int(data[i+7])<<24
+		i += 8
+		if chunkID == "data" {
+			end := i + chunkSize
+			if end > len(data) {
+				end = len(data)
+			}
+			return data[i:end], nil
+		}
+		i += chunkSize
+		if chunkSize%2 != 0 {
+			i++ // RIFF pads odd-size chunks to word boundaries
+		}
+	}
+	return nil, fmt.Errorf("no data chunk found in WAV file")
 }

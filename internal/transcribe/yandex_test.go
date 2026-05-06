@@ -145,6 +145,38 @@ func TestYandex_Transcribe(t *testing.T) {
 			wantText: "mp3 result",
 		},
 		{
+			name: "wav audio uses lpcm format with sampleRateHertz",
+			response: serverResponse{
+				status: 200,
+				body:   `{"result":"голос"}`,
+			},
+			audio: model.AudioInput{Data: makeWAV([]byte{0x01, 0x00, 0x02, 0x00}), MimeType: "audio/wav"},
+			checkReq: func(t *testing.T, r *http.Request, body []byte) {
+				t.Helper()
+				if got := r.URL.Query().Get("format"); got != "lpcm" {
+					t.Errorf("format query param = %q, want %q", got, "lpcm")
+				}
+				if got := r.URL.Query().Get("sampleRateHertz"); got != "16000" {
+					t.Errorf("sampleRateHertz query param = %q, want %q", got, "16000")
+				}
+				want := []byte{0x01, 0x00, 0x02, 0x00}
+				if string(body) != string(want) {
+					t.Errorf("request body = %x, want %x (WAV header must be stripped)", body, want)
+				}
+			},
+			wantText: "голос",
+		},
+		{
+			name: "wav with invalid header returns error",
+			response: serverResponse{
+				status: 200,
+				body:   `{"result":"ok"}`,
+			},
+			audio:          model.AudioInput{Data: []byte("not-a-wav-file"), MimeType: "audio/wav"},
+			wantErr:        true,
+			wantErrContain: "not a valid RIFF/WAVE file",
+		},
+		{
 			name: "correct headers and query params",
 			response: serverResponse{
 				status: 200,
@@ -307,6 +339,82 @@ func TestYandex_Transcribe_InvalidJSON(t *testing.T) {
 	}
 }
 
+// makeWAV creates a minimal valid RIFF/WAVE file containing the given PCM payload.
+func makeWAV(pcm []byte) []byte {
+	dataSize := len(pcm)
+	fileSize := 36 + dataSize
+	out := make([]byte, 44+dataSize)
+	copy(out[0:], "RIFF")
+	out[4], out[5], out[6], out[7] = byte(fileSize), byte(fileSize>>8), byte(fileSize>>16), byte(fileSize>>24)
+	copy(out[8:], "WAVE")
+	copy(out[12:], "fmt ")
+	out[16] = 16 // fmt chunk size
+	out[20] = 1  // PCM format
+	out[22] = 1  // mono
+	// sample rate 16000 = 0x3E80
+	out[24], out[25], out[26], out[27] = 0x80, 0x3E, 0x00, 0x00
+	// byte rate = 32000 = 0x7D00
+	out[28], out[29], out[30], out[31] = 0x00, 0x7D, 0x00, 0x00
+	out[32] = 2 // block align
+	out[34] = 16 // bits per sample
+	copy(out[36:], "data")
+	out[40], out[41], out[42], out[43] = byte(dataSize), byte(dataSize>>8), byte(dataSize>>16), byte(dataSize>>24)
+	copy(out[44:], pcm)
+	return out
+}
+
+func TestStripWAVHeader(t *testing.T) {
+	t.Run("extracts PCM from standard 44-byte WAV", func(t *testing.T) {
+		pcm := []byte{0x01, 0x00, 0x02, 0x00, 0x03, 0x00}
+		wav := makeWAV(pcm)
+		got, err := stripWAVHeader(wav)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(got) != string(pcm) {
+			t.Errorf("got %x, want %x", got, pcm)
+		}
+	})
+
+	t.Run("rejects non-RIFF data", func(t *testing.T) {
+		_, err := stripWAVHeader([]byte("not-a-wav-file-at-all"))
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("rejects data shorter than 12 bytes", func(t *testing.T) {
+		_, err := stripWAVHeader([]byte("RIFF"))
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("rejects RIFF file without WAVE marker", func(t *testing.T) {
+		data := make([]byte, 12)
+		copy(data[0:], "RIFF")
+		copy(data[8:], "AVI ")
+		_, err := stripWAVHeader(data)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+	})
+
+	t.Run("returns error when no data chunk present", func(t *testing.T) {
+		// Valid RIFF/WAVE header but only fmt chunk, no data chunk
+		out := make([]byte, 28)
+		copy(out[0:], "RIFF")
+		out[4] = 20
+		copy(out[8:], "WAVE")
+		copy(out[12:], "fmt ")
+		out[16] = 4 // chunk size 4 bytes
+		_, err := stripWAVHeader(out)
+		if err == nil {
+			t.Fatal("expected error for missing data chunk, got nil")
+		}
+	})
+}
+
 func TestBuildYandexURL(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -337,6 +445,17 @@ func TestBuildYandexURL(t *testing.T) {
 			format:   "mp3",
 			wantParams: map[string]string{
 				"format": "mp3",
+			},
+		},
+		{
+			name:     "lpcm format adds sampleRateHertz",
+			endpoint: "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize",
+			folderID: "my-folder",
+			language: "ru-RU",
+			format:   "lpcm",
+			wantParams: map[string]string{
+				"format":          "lpcm",
+				"sampleRateHertz": "16000",
 			},
 		},
 		{
