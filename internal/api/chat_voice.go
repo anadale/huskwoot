@@ -174,15 +174,19 @@ func (h *chatVoiceHandler) post(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate projectId if provided.
+	// Validate projectId if provided. Normalize to a canonical lowercase form so
+	// clients that send UUIDs in upper-case (e.g., Swift's UUID.uuidString) match
+	// the lower-case rows stored in SQLite.
 	var projectID string
 	if meta.ProjectID != "" {
-		if _, err := uuid.Parse(meta.ProjectID); err != nil {
+		parsed, err := uuid.Parse(meta.ProjectID)
+		if err != nil {
 			WriteError(w, http.StatusBadRequest, ErrorCodeInvalidMetadata, "projectId must be a valid UUID")
 			return
 		}
+		projectID = parsed.String()
 		if h.taskStore != nil {
-			proj, err := h.taskStore.GetProject(r.Context(), meta.ProjectID)
+			proj, err := h.taskStore.GetProject(r.Context(), projectID)
 			if err != nil {
 				h.logError(r.Context(), "get project for voice upload", err)
 				WriteError(w, http.StatusInternalServerError, ErrorCodeInternal, "failed to validate projectId")
@@ -193,7 +197,6 @@ func (h *chatVoiceHandler) post(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		projectID = meta.ProjectID
 	}
 
 	clientJobID := uuid.NewString()
