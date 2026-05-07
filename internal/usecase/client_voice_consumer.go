@@ -180,7 +180,6 @@ func (c *clientVoiceConsumer) Consume(ctx context.Context, job model.VoiceJob, t
 
 	const ackGrace = 1500 * time.Millisecond
 	const hardDeadline = 60 * time.Second
-	startedAt := now
 	deadline := time.After(hardDeadline)
 	var ackTimer <-chan time.Time
 	var taskFired bool
@@ -195,7 +194,12 @@ raceLoop:
 				ackEvents = nil
 				continue
 			}
-			if !taskFired && isTaskMutationEvent(ev.Kind) && !ev.CreatedAt.Before(startedAt) {
+			// Подписка открыта непосредственно перед HandleMessage, так что любой
+			// task-event, прилетевший в этот канал, гарантированно вызван текущим
+			// agent-вызовом. Не фильтруем по timestamp: recordEvent в task service
+			// не заполняет CreatedAt, поле остаётся zero и фильтр по времени
+			// отбрасывал валидные события.
+			if !taskFired && isTaskMutationEvent(ev.Kind) {
 				taskFired = true
 				ackTimer = time.After(ackGrace)
 			}
