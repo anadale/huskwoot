@@ -13,6 +13,18 @@ func (r *russianDateLanguage) Parse(expr string, now time.Time, cfg Config) (tim
 	if t, ok := matchRelativeAmount(expr, now, cfg); ok {
 		return *t, true
 	}
+	if t, ok := matchNoonMidnight(expr, now, cfg); ok {
+		return *t, true
+	}
+	if t, ok := matchDayPeriodClockTime(expr, now, cfg); ok {
+		return *t, true
+	}
+	if t, ok := matchWeekdayPeriodClockTime(expr, now, cfg); ok {
+		return *t, true
+	}
+	if t, ok := matchPeriodClockTime(expr, now, cfg); ok {
+		return *t, true
+	}
 	if t, ok := matchDayTime(expr, now, cfg); ok {
 		return *t, true
 	}
