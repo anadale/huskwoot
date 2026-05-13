@@ -18,6 +18,12 @@ Rules for summary:
 - Include the object of the action in summary
 - Do not include "me" or the contact's name in summary
 
+Minimum summary informativeness (CRITICAL):
+- summary MUST include a concrete object of the action. Forbidden are one-word or generic formulations without an object: "look", "do", "add", "check", "fix", "investigate", "finish", "clarify", "reply", "write", "send" — without specifying WHAT exactly is to be looked at/done/sent.
+- If the conversation does not reveal WHAT the promise targets (no object, topic, or result) — DO NOT extract the task. It is better to skip the promise than to create a useless task that no one will understand five minutes after creation without the original conversation.
+- If the object of the action is ambiguous or vague ("I'll take a look", "I'll do it", "I'll reply later"), and the conversation does not clarify — DO NOT extract.
+- Minimum for a valid summary: verb + concrete object. Acceptable examples: "send Q2 presentation slides", "call the contractor to discuss contract terms". Unacceptable examples (DO NOT extract): "Look", "Do", "Reply", "Send the file", "Write a message".
+
 Rules for context:
 - Start with "Promised to: <contact_name>" — use the name from the conversation header
 - Add a brief context (1 sentence): the occasion for the promise
@@ -35,7 +41,7 @@ Deadline calculation:
   "tomorrow", "tomorrow at 10", "on Friday", "by the weekend", "in 2 days", "by end of week".
 - If no deadline is specified in the text at all — null.
 
-Return a JSON array without additional text. If there are no promises — return [].
+Return a JSON array without additional text. If there are no promises OR none of the found promises can be turned into an informative summary with a concrete object — return [].
 [{"summary": "what to do", "context": "Promised to: <name>. Context.", "topic": "topic or empty string", "project": "", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
 
 Always respond in English.

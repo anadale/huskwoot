@@ -18,6 +18,12 @@ Rules for summary:
 - Do not include the user's name in summary
 - Do not repeat circumstances and participants, only the action, its object, and goal
 
+Minimum summary informativeness (CRITICAL):
+- summary MUST include a concrete object of the action. Forbidden are one-word or generic formulations without an object: "look", "do", "add", "check", "fix", "investigate", "finish", "clarify", "reply", "write", "send" — without specifying WHAT exactly is to be looked at/done/added.
+- If neither the text nor the dialog history reveals WHAT the action targets (no object, topic, or result) — DO NOT extract the task. It is better to skip the promise than to create a useless task that no one will understand five minutes after creation without the original message.
+- If the object of the action is ambiguous or vague (e.g. "look at this", "deal with that thing", "finish what we agreed on"), and context does not clarify — DO NOT extract.
+- Minimum for a valid summary: verb + concrete object. Acceptable examples: "review PR #142 about payments migration", "add user_id column to sessions table", "fix the flaky auth_login_test". Unacceptable examples (DO NOT extract): "Look", "Do", "Add", "Look at the request", "Make a report", "Add a column".
+
 Rules for context:
 - Brief background (1-2 sentences) enabling understanding of the promise without the original message
 - Who asked, on what occasion, what the problem is — facts from the text only
@@ -41,7 +47,7 @@ Deadline calculation:
 - If unsure of the exact time — it is acceptable to return a natural English expression: "tomorrow", "tomorrow at 10", "on Friday", "by the weekend", "in 2 days", "by end of week". The parser will recognize them.
 - If no deadline is specified in the text at all — null.
 
-Return a JSON array without additional text. If there are no promises — return [].
+Return a JSON array without additional text. If there are no promises OR none of the found promises can be turned into an informative summary with a concrete object — return [].
 [{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
 
 Always respond in English.
