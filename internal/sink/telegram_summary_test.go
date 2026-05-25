@@ -107,12 +107,13 @@ func TestTelegramSummaryDeliverer_EnglishLocalizer(t *testing.T) {
 }
 
 func TestTelegramSummaryDeliverer_Deliver_Success(t *testing.T) {
-	var capturedText string
+	var capturedText, capturedParseMode string
 	srv := newTGTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parsing request form: %v", err)
 		}
 		capturedText = r.FormValue("text")
+		capturedParseMode = r.FormValue("parse_mode")
 		successSendHandler(w, r)
 	})
 	defer srv.Close()
@@ -125,6 +126,10 @@ func TestTelegramSummaryDeliverer_Deliver_Success(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 
+	if capturedParseMode != "HTML" {
+		t.Errorf("parse_mode = %q, want HTML", capturedParseMode)
+	}
+
 	checks := []struct{ name, contain string }{
 		{"emoji утренней сводки", "🌅"},
 		{"заголовок", "Утренняя сводка"},
@@ -133,9 +138,10 @@ func TestTelegramSummaryDeliverer_Deliver_Success(t *testing.T) {
 		{"заголовок сегодня", "📋 Нужно выполнить"},
 		{"заголовок планов", "🗓 Планы"},
 		{"заголовок без срока", "📦 Без срока"},
-		{"название проекта", "[work]"},
+		{"название проекта курсивом", "<i>work</i>"},
+		{"проект inbox курсивом", "<i>inbox</i>"},
 		{"просроченная задача", "подготовить отчёт"},
-		{"дедлайн просроченной", "просрочено с 16.04"},
+		{"дата просроченной", "16.04"},
 		{"тема задачи", "#отчётность"},
 		{"время сегодняшней задачи", "15:00"},
 		{"дата плановой задачи", "20.04"},
@@ -213,9 +219,10 @@ func TestTruncate_LongSummary(t *testing.T) {
 		t.Errorf("truncated text does not contain tail:\n%.200s", truncated)
 	}
 
-	// Count removed task lines and verify N in the tail.
-	originalTaskLines := strings.Count(full, "\n    — ")
-	truncatedTaskLines := strings.Count(truncated, "\n    — ")
+	// Count removed task lines and verify N in the tail. Undated task lines
+	// start with an em dash prefix.
+	originalTaskLines := strings.Count(full, "\n— ")
+	truncatedTaskLines := strings.Count(truncated, "\n— ")
 	removed := originalTaskLines - truncatedTaskLines
 	expectedSuffix := fmt.Sprintf("… и ещё %d задач", removed)
 	if !strings.Contains(truncated, expectedSuffix) {

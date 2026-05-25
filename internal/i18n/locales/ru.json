@@ -12,7 +12,6 @@
   "section_upcoming": "🗓 Планы",
   "section_undated": "📦 Без срока",
   "section_undated_limited": "📦 Без срока (показано {{.Shown}} из {{.Total}})",
-  "task_overdue_since": "📅 просрочено с {{.Date}}",
   "tasks_more": {
     "one": "{{.Count}} задача",
     "few": "{{.Count}} задачи",

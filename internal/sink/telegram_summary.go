@@ -3,7 +3,9 @@ package sink
 import (
 	"context"
 	"fmt"
+	"html"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -39,6 +41,7 @@ func (d *TelegramSummaryDeliverer) Deliver(_ context.Context, summary model.Summ
 		text = truncate(d.loc, formatSummary(d.loc, summary), telegramSummaryMaxLen)
 	}
 	msg := tgbotapi.NewMessage(d.chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
 	if _, err := d.bot.Send(msg); err != nil {
 		return fmt.Errorf("sending summary: %w", err)
 	}
@@ -104,26 +107,31 @@ func formatSectionHeader(loc *goI18n.Localizer, bucket string, undatedShown, und
 	}
 }
 
-func formatTaskLine(loc *goI18n.Localizer, bucket string, t model.Task) string {
+// formatTaskLine renders a single flat task line: "<deadline> · <summary> · #<topic> · <project>".
+// Undated tasks start with an em-dash marker instead of a deadline. The deadline status
+// (overdue / today / upcoming) is conveyed by the section header, so only the bare date or
+// time is shown. The project name is emphasised via HTML italics; user-controlled text is
+// HTML-escaped for the Telegram HTML parse mode.
+func formatTaskLine(_ *goI18n.Localizer, bucket string, t model.Task, projectName string) string {
 	var sb strings.Builder
-	sb.WriteString("    — ")
-	sb.WriteString(strings.ReplaceAll(t.Summary, "\n", " "))
 
-	if t.Deadline != nil {
-		switch bucket {
-		case "overdue":
-			fmt.Fprintf(&sb, " %s", huskwootI18n.Translate(loc, "task_overdue_since", map[string]any{
-				"Date": t.Deadline.Format("02.01"),
-			}))
-		case "today":
-			fmt.Fprintf(&sb, " 📅 %s", t.Deadline.Format("15:04"))
-		case "upcoming":
-			fmt.Fprintf(&sb, " 📅 %s", t.Deadline.Format("02.01"))
-		}
+	switch {
+	case t.Deadline == nil:
+		sb.WriteString("— ")
+	case bucket == "today":
+		fmt.Fprintf(&sb, "%s · ", t.Deadline.Format("15:04"))
+	default: // overdue, upcoming
+		fmt.Fprintf(&sb, "%s · ", t.Deadline.Format("02.01"))
 	}
 
+	sb.WriteString(html.EscapeString(strings.ReplaceAll(t.Summary, "\n", " ")))
+
 	if t.Topic != "" {
-		fmt.Fprintf(&sb, " · #%s", t.Topic)
+		fmt.Fprintf(&sb, " · #%s", html.EscapeString(t.Topic))
+	}
+
+	if projectName != "" {
+		fmt.Fprintf(&sb, " · <i>%s</i>", html.EscapeString(projectName))
 	}
 
 	return sb.String()
@@ -148,9 +156,8 @@ func formatSection(loc *goI18n.Localizer, bucket string, groups []model.ProjectG
 	sb.WriteByte('\n')
 
 	for _, group := range groups {
-		fmt.Fprintf(&sb, "  [%s]\n", group.ProjectName)
 		for _, task := range group.Tasks {
-			sb.WriteString(formatTaskLine(loc, bucket, task))
+			sb.WriteString(formatTaskLine(loc, bucket, task, group.ProjectName))
 			sb.WriteByte('\n')
 		}
 	}
@@ -184,6 +191,17 @@ func formatSummary(loc *goI18n.Localizer, s model.Summary) string {
 	return sb.String()
 }
 
+// isSummaryTaskLine reports whether a rendered line is a task line (as opposed to the
+// summary header, a section header, or a blank line). Task lines either start with a
+// deadline (a digit, e.g. "27.05" or "15:00") or, for undated tasks, with an em-dash marker.
+func isSummaryTaskLine(line string) bool {
+	if strings.HasPrefix(line, "— ") {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(line)
+	return unicode.IsDigit(r)
+}
+
 // truncate trims text to limit Unicode code points by removing task lines from the end
 // and appending a tail. Guarantees len(result) <= limit.
 func truncate(loc *goI18n.Localizer, text string, limit int) string {
@@ -193,10 +211,10 @@ func truncate(loc *goI18n.Localizer, text string, limit int) string {
 
 	lines := strings.Split(text, "\n")
 
-	// Collect indices of task lines (those starting with "    — ")
+	// Collect indices of task lines (see isSummaryTaskLine).
 	var taskIndices []int
 	for i, line := range lines {
-		if strings.HasPrefix(line, "    — ") {
+		if isSummaryTaskLine(line) {
 			taskIndices = append(taskIndices, i)
 		}
 	}

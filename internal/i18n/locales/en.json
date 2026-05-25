@@ -12,7 +12,6 @@
   "section_upcoming": "🗓 Upcoming",
   "section_undated": "📦 No due date",
   "section_undated_limited": "📦 No due date (showing {{.Shown}} of {{.Total}})",
-  "task_overdue_since": "📅 overdue since {{.Date}}",
   "tasks_more": {
     "one": "{{.Count}} task",
     "other": "{{.Count}} tasks"
