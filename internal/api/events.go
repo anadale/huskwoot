@@ -86,6 +86,12 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
 
+	// Сразу после подключения шлём keepalive с текущим maxSeq, чтобы клиент
+	// немедленно (не дожидаясь первого тика) узнал, насколько он отстаёт.
+	if !h.writeKeepalive(ctx, w, flusher) {
+		return
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -103,12 +109,34 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-ticker.C:
-			if _, err := fmt.Fprint(w, ":keepalive\n\n"); err != nil {
+			if !h.writeKeepalive(ctx, w, flusher) {
 				return
 			}
-			flusher.Flush()
 		}
 	}
+}
+
+// writeKeepalive sends a heartbeat comment carrying the server's current max
+// event seq, e.g. ":keepalive 105\n\n". The client compares it to its own
+// cursor to compute how many events it is behind — this surfaces divergence
+// even on a silently stalled stream (the connection looks alive but delivers
+// nothing). On a MaxSeq error a plain ":keepalive\n\n" is sent: the connection
+// is still alive, only the seq is unknown for this tick.
+func (h *eventsHandler) writeKeepalive(ctx context.Context, w http.ResponseWriter, flusher http.Flusher) bool {
+	maxSeq, err := h.events.MaxSeq(ctx)
+	if err != nil {
+		h.logError(ctx, "keepalive MaxSeq", err)
+		if _, werr := fmt.Fprint(w, ":keepalive\n\n"); werr != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+	if _, werr := fmt.Fprintf(w, ":keepalive %d\n\n", maxSeq); werr != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
 }
 
 // replay page-fetches events with seq > lastID. Returns the last actually

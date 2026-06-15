@@ -344,6 +344,56 @@ func TestSSEHeartbeat(t *testing.T) {
 	}
 }
 
+func TestSSEKeepaliveCarriesMaxSeq(t *testing.T) {
+	h := newSSEHarness(t, 30*time.Millisecond)
+
+	// Три события до подключения → MaxSeq == 3.
+	for i := 0; i < 3; i++ {
+		if _, err := h.taskSvc.CreateTask(context.Background(), model.CreateTaskRequest{
+			Summary: "pre-" + strconv.Itoa(i),
+		}); err != nil {
+			t.Fatalf("CreateTask: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Last-Event-ID пустой → реплея нет, но сразу после подключения должен прийти
+	// keepalive с текущим maxSeq.
+	resp := h.openSSE(ctx, "")
+	defer resp.Body.Close()
+	events := readSSEEvents(resp.Body)
+	waitBrokerActive(t, h.broker, h.device.ID, 2*time.Second)
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("stream closed before keepalive")
+			}
+			if !strings.Contains(ev.comment, "keepalive") {
+				continue
+			}
+			fields := strings.Fields(ev.comment)
+			if len(fields) != 2 {
+				t.Fatalf("keepalive comment = %q, want \"keepalive <maxSeq>\"", ev.comment)
+			}
+			seq, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil {
+				t.Fatalf("keepalive maxSeq не число: %q", ev.comment)
+			}
+			if seq != 3 {
+				t.Fatalf("keepalive maxSeq = %d, want 3", seq)
+			}
+			return
+		case <-deadline:
+			t.Fatal("keepalive с maxSeq не пришёл за 2 секунды")
+		}
+	}
+}
+
 func TestSSEClientDisconnectUnsubscribes(t *testing.T) {
 	h := newSSEHarness(t, 0)
 
