@@ -41,11 +41,11 @@ Available in DM:
 
 ### Extracting Promises from Forwarded 1:1 Messages
 
-In a private Telegram chat you can't add a bot — so commitments you make there get lost. Huskwoot solves this: forward any selection of messages from a 1:1 conversation into your DM with the bot. The bot accumulates them silently, then extracts the promises **you** made and creates tasks automatically.
+In a private Telegram chat you can't add a bot — so commitments you make there get lost. Huskwoot solves this: forward any selection of messages from a 1:1 conversation into your DM with the bot. The bot accumulates them silently, extracts the promises **you** made, and checks for existing obligations before creating tasks.
 
 - **Trigger:** wait for the silence timeout (`forward_batch_timeout`) or send any non-forwarded message to kick off processing immediately. Include `#<project-slug-or-alias>` (e.g. `обработай #вася` or just `#вася`) to route tasks to a specific project; otherwise they go to Inbox.
 - **What's recognized:** only your promises — detected from Telegram forward metadata (`forward_from.id`). Your messages are labeled `[я, …]`; the other person's messages provide context.
-- **Cleanup:** set `delete_forwards_after_extract = true` to have the bot delete the forwarded messages and trigger from DM after successful extraction, keeping your history clean. The bot's confirmation reply stays.
+- **Cleanup:** set `delete_forwards_after_extract = true` to delete the processed forwarded messages and trigger from DM only when the batch immediately creates at least one task. A pending-only or duplicate-only batch leaves the Telegram messages intact.
 
 ```toml
 [channels.telegram]
@@ -334,6 +334,24 @@ Both values use Go duration format; the `"d"` suffix is not supported (use `"720
 
 ---
 
+### `[tasks]`
+
+Пороги смысловой проверки применяются только к автоматическому извлечению из Telegram, не к явным командам агента и не к REST API.
+
+```toml
+[tasks]
+duplicate_threshold = 0.95  # minimum sameness score for skipping a confirmed duplicate
+review_threshold    = 0.70  # distinct candidates below this score may be created
+closed_retention    = "336h"
+cleanup_time        = "04:00"
+```
+
+Требуется `0 < review_threshold < duplicate_threshold <= 1`. Оценка модели — не откалиброванная вероятность. Даже высокий балл не позволяет пропустить кандидата при конфликте требований или совпадении только с закрытой задачей.
+
+`closed_retention` задаёт срок хранения выполненных и отменённых задач; `0s` отключает их ежедневную очистку. `cleanup_time` — время очистки в часовом поясе пользователя.
+
+---
+
 ### `[transcriber]`
 
 Configures voice message transcription for Telegram DM and for `POST /v1/chat/voice` from HTTP API clients. Voice messages in groups and @mention chats are not transcribed regardless of this setting. When the section is absent or `provider = ""`, the bot replies with a "not configured" message on any Telegram voice input and the API returns `503` on voice upload attempts.
@@ -353,7 +371,7 @@ Provider-specific subsections (`[transcriber.whisper]`, `[transcriber.yandex]`) 
 
 ## Customizing AI Prompts
 
-Huskwoot uses Go templates for AI prompts. Any prompt can be overridden without recompilation by placing files in a `prompts/` subdirectory of the config directory.
+Huskwoot uses Go templates for AI prompts. The prompts listed below can be overridden without recompilation by placing files in a `prompts/` subdirectory of the config directory. The duplicate checker's language-specific prompts are built into the binary.
 
 ```
 <config-dir>/
@@ -433,7 +451,7 @@ Device registration happens automatically:
 1. Выберите несколько сообщений из личной переписки с кем-либо и перешлите их в DM к вашему боту.
 2. Бот молча накапливает пересланные сообщения.
 3. Либо подождите паузу (задаётся `forward_batch_timeout`), либо напишите боту любое обычное сообщение-триггер — обработка запустится немедленно.
-4. Бот извлечёт ваши обещания и создаст задачи. Если задачи найдены — пришлёт подтверждение со списком.
+4. Бот извлечёт ваши обещания и проверит их на дубли. Новые задачи появятся в списке, а сомнительные предложения потребуют решения в личном чате.
 
 **Выбор проекта:** добавьте в текст триггера `#<slug-или-alias-проекта>` (например, `обработай #вася` или просто `#вася`) — задачи попадут в указанный проект. Без хинта — в Inbox.
 
@@ -449,7 +467,7 @@ Device registration happens automatically:
 
 ### Удаление форвардов
 
-При `delete_forwards_after_extract = true` бот удаляет пересланные сообщения и сообщение-триггер из DM после успешного извлечения задач — чтобы не засорять историю переписки. Подтверждение бота остаётся. При классификации `skip` форварды **не удаляются**.
+При `delete_forwards_after_extract = true` бот удаляет обработанные пересланные сообщения и сообщение-триггер из DM, только если пакет сразу создал хотя бы одну задачу. Подтверждение бота остаётся. При классификации `skip`, одних дублях или только ожидающих решения кандидатах форварды **не удаляются**.
 
 ### Конфигурация
 
@@ -461,9 +479,26 @@ delete_forwards_after_extract = false   # удалять форварды + тр
 
 ### Ограничения
 
-- Окно удаления сообщений в Telegram — 48 часов; на практике обработка происходит за секунды, поэтому в окно всегда укладываемся.
-- Если сервер упал между сохранением задач и удалением форвардов в Telegram — задачи уже в базе, форварды останутся в DM (приемлемо: повторная обработка не создаст дублей благодаря `INSERT OR IGNORE`).
+- Окно удаления сообщений в Telegram — 48 часов. Ошибка удаления не отменяет уже сохранённые задачи и решения.
+- Если сервер упал между сохранением результатов и удалением форвардов в Telegram, результаты уже в базе, а форварды могут остаться в DM. Повтор того же входа распознаётся по сохранённым receipts; повторная пересылка с новым message ID проходит смысловую проверку.
 - При перезапуске сервера sweeper подхватит незавершённые батчи на первом тике.
+
+## Защита от дублей задач Telegram
+
+Автоматическое извлечение из групп и пересылок сравнивает кандидатов со всеми открытыми задачами целевого проекта, ожидающими подтверждения предложениями и ранее отклонёнными обязательствами. Закрытые задачи за последние 14 дней служат контекстом, но не основанием автоматически скрыть новую работу. Кандидаты одного извлечения также сравниваются между собой.
+
+Проверка использует smart-модель и сопоставляет действие, объект, период работы и исходный текст. Одна тема не делает задачи дублями; отчёты за разные периоды могут быть отдельными задачами. Неоднозначная смена срока требует решения, а не молчаливого изменения существующей задачи.
+
+- Явный дубль не создаётся.
+- Явно новое обязательство создаётся обычным способом.
+- Сомнительный кандидат сохраняется отдельно от задач. Бот отправляет владельцу личный вопрос с похожей задачей, причиной и inline-кнопками **«👍 Добавить» / «👎 Не добавлять»**. Это кнопки, не реакции на сообщение: получение событий настоящих реакций требует прав администратора в чате.
+- Положительный ответ создаёт задачу ровно один раз; отрицательный сохраняет отказ. Первое решение окончательно, повторный клик не создаёт и не удаляет задачу.
+- Без ответа задача не создаётся. Перезапуск не теряет кандидатов; неотправленные вопросы доставляются повторно. При сбое между отправкой вопроса и сохранением его message ID возможен повтор вопроса, но обе кнопки относятся к одному кандидату.
+- Ошибка сравнения приводит к вопросу, а не к потере кандидата или созданию вслепую. Если сравнивать не с чем, первая задача создаётся без дополнительного AI-запроса.
+
+Результаты обработки входов, кандидаты, решения, задачи, events и push queue сохраняются транзакционно. Для пересылок та же транзакция очищает только обработанный снимок буфера; сообщения, пришедшие во время AI-запроса, остаются для следующей обработки.
+
+Групповой update подтверждается Telegram только после успешной обработки. Поэтому polling может ждать AI-запрос группы; после ошибки сохранения вход повторяется с задержкой. Явные команды создания, REST API и IMAP не переводятся на этот механизм. Уже накопившиеся дубли автоматически не удаляются.
 
 ---
 

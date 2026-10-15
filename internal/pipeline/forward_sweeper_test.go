@@ -26,7 +26,7 @@ func (m *mockBufferForSweeper) LastReceivedAt(_ context.Context, _ string) (time
 func (m *mockBufferForSweeper) LoadBatch(_ context.Context, _ string) ([]model.ForwardEntry, error) {
 	return nil, nil
 }
-func (m *mockBufferForSweeper) DeleteBatchTx(_ context.Context, _ *sql.Tx, _ string) error {
+func (m *mockBufferForSweeper) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error {
 	return nil
 }
 func (m *mockBufferForSweeper) ListPendingChats(_ context.Context, _ time.Time) ([]string, error) {

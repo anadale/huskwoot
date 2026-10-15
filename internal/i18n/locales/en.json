@@ -112,5 +112,14 @@
     "other": "Extracted {{.Count}} tasks to project «{{.Project}}»:\n{{.Tasks}}"
   },
   "forward.no_promises_found": "No promises from you found in this conversation, messages left intact",
-  "forward.project_not_found": "Project «{{.Hint}}» not found, tasks placed in Inbox"
+  "forward.project_not_found": "Project «{{.Hint}}» not found, tasks placed in Inbox",
+  "auto_tasks.outcome": "Tasks created: {{.Created}}. Awaiting your decision: {{.Pending}}. Duplicates skipped: {{.Duplicates}}.",
+  "auto_tasks.question": "Should I add this task?\n\n{{.Summary}}{{if .Details}}\nDetails: {{.Details}}{{end}}{{if .Deadline}}\nDeadline: {{.Deadline}}{{end}}{{if .Project}}\nProject: {{.Project}}{{end}}{{if .MatchSummary}}\n\nSimilar task: {{.MatchSummary}}{{end}}{{if .MatchRef}}\nReference: {{.MatchRef}}{{end}}\n\nReason for review: {{.Reason}}",
+  "auto_tasks.approve": "👍 Add",
+  "auto_tasks.reject": "👎 Don't add",
+  "auto_tasks.created": "Task added.",
+  "auto_tasks.rejected": "Task not added.",
+  "auto_tasks.unavailable": "This task question is unavailable.",
+  "auto_tasks.retry": "Couldn't save your decision. Please try again.",
+  "auto_tasks.comparison_unavailable": "Couldn't reliably compare this with existing tasks."
 }

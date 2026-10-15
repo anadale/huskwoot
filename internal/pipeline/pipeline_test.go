@@ -261,9 +261,10 @@ func testBatchMsg() model.Message {
 // testConfig returns a base Config for tests.
 func testConfig() Config {
 	return Config{
-		OwnerIDs: []string{"owner-123"},
-		Aliases:  []string{"gregory", "greg"},
-		Logger:   discardLogger,
+		OwnerIDs:  []string{"owner-123"},
+		Aliases:   []string{"gregory", "greg"},
+		AutoTasks: &pipelineAutoTasks{},
+		Logger:    discardLogger,
 	}
 }
 
@@ -560,6 +561,7 @@ func TestProcess_Group_TaskServiceCreateTasks(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -590,6 +592,7 @@ func TestProcess_Batch_GoesToTaskService(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -605,7 +608,7 @@ func TestProcess_Batch_GoesToTaskService(t *testing.T) {
 	}
 }
 
-func TestProcess_TaskServiceError_NotifierStillCalled(t *testing.T) {
+func TestProcess_Batch_TaskServiceError_NotifierStillCalled(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{tasks: testTasks()}
 	taskSvc := &mockTaskService{createErr: errors.New("ошибка записи")}
@@ -615,10 +618,11 @@ func TestProcess_TaskServiceError_NotifierStillCalled(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
-	msg := testGroupMsg("owner-123")
+	msg := testBatchMsg()
 	if err := p.Process(context.Background(), msg); err != nil {
 		t.Fatalf("Process must not return error on TaskService failure: %v", err)
 	}
@@ -641,6 +645,7 @@ func TestProcess_ClassPromise_UsesProjectServiceToResolveChannel(t *testing.T) {
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Projects = projects
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -669,6 +674,7 @@ func TestProcess_ClassPromise_ProjectServiceFallbackToDefault(t *testing.T) {
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Projects = projects
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -697,6 +703,7 @@ func TestProcess_ClassPromise_ProjectServiceError_ContinuesWithEmptyProjectID(t 
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Projects = projects
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -723,6 +730,7 @@ func TestProcess_ClassSkip_NoTaskService(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
@@ -754,6 +762,7 @@ func TestProcess_ClassPromise_Group_HappyPath(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
@@ -792,6 +801,7 @@ func TestProcess_ClassPromise_Group_HistoryFnCalled(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	historyFnCalled := false
@@ -822,6 +832,7 @@ func TestProcess_ClassPromise_Group_HistoryFnNil_EmptyHistory(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -847,6 +858,7 @@ func TestProcess_ClassPromise_Group_HistoryFnError_ContinuesProcessing(t *testin
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -878,6 +890,7 @@ func TestProcess_ClassPromise_Batch_BypassOwnerCheck(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -955,6 +968,7 @@ func TestProcess_OwnerAlias_Processed(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("gregory")
@@ -980,12 +994,14 @@ func TestProcess_MultipleOwnerIDs(t *testing.T) {
 		Classifiers: groupClassifiers(classifier),
 		Extractors:  groupExtractors(extractor),
 		Tasks:       taskSvc,
+		AutoTasks:   &pipelineAutoTasks{tasks: taskSvc},
 		Logger:      discardLogger,
 	}
 	p := New(cfg)
 
 	for _, ownerID := range []string{"owner-111", "owner-222"} {
 		msg := testGroupMsg(ownerID)
+		msg.ID = ownerID + "-message"
 		if err := p.Process(context.Background(), msg); err != nil {
 			t.Fatalf("Process(%q) returned error: %v", ownerID, err)
 		}
@@ -1019,6 +1035,7 @@ func TestProcess_ClassifierByKind_GroupUsesGroupClassifier(t *testing.T) {
 	cfg.Classifiers = clsMap
 	cfg.Extractors = extrMap
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	groupMsg := testGroupMsg("owner-123")
@@ -1130,6 +1147,7 @@ func TestProcess_OriginTopic_ClearedForGroup(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -1159,6 +1177,7 @@ func TestProcess_OriginTopic_PreservedForBatch(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -1185,6 +1204,7 @@ func TestProcess_BatchMessage_TaskSourcePreserved(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := model.Message{
@@ -1219,6 +1239,7 @@ func TestProcess_MultipleNotifiers_AllCalled(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	cfg.Notifiers = []model.Notifier{notifier1, notifier2}
 	p := New(cfg)
 
@@ -1244,6 +1265,7 @@ func TestProcess_EmptyTasks_NoTaskServiceOrNotifier(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
@@ -1276,6 +1298,7 @@ func TestProcess_MultipleTasks_AllCreated(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -1324,6 +1347,7 @@ func TestProcess_ClassPromise_ReactPendingThenDone(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -1354,6 +1378,7 @@ func TestProcess_ClassPromise_NoTasksExtracted_ReactCleared(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")
@@ -1426,6 +1451,7 @@ func TestProcess_NilReactFn_NoError(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
+	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
 	p := New(cfg)
 
 	msg := testGroupMsg("owner-123")

@@ -2,8 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -23,26 +23,21 @@ type Config struct {
 	// Aliases are additional owner identifiers (names, aliases).
 	Aliases []string
 
-	Tasks    model.TaskService
-	Projects model.ProjectService
-	Chat     model.ChatService
+	Tasks     model.TaskService
+	AutoTasks model.AutoTaskService
+	Projects  model.ProjectService
+	Chat      model.ChatService
 
 	Classifiers map[model.MessageKind]model.Classifier
 	Extractors  map[model.MessageKind]model.Extractor
 	Notifiers   []model.Notifier
 	Logger      *slog.Logger
 
-	// ForwardBatch processing dependencies. All are optional; when nil the
-	// ForwardBatch pipeline branch is a no-op.
+	// ForwardBatch processing dependencies; persistence is provided by AutoTasks.
 	ForwardClassifier model.Classifier
 	ForwardExtractor  model.Extractor
 	ForwardBuffer     model.ForwardBuffer
-	DB                *sql.DB
 	TaskStore         model.TaskStore
-	EventStore        model.EventStore
-	PushQueue         model.PushQueue
-	Broker            model.Broker
-	DeviceStore       model.DeviceStore
 	Localizer         *goI18n.Localizer
 	// Timezone is used to format forwarded message timestamps for the LLM.
 	// Falls back to time.UTC when nil.
@@ -55,6 +50,7 @@ type Pipeline struct {
 	extractors  map[model.MessageKind]model.Extractor
 	notifiers   []model.Notifier
 	tasks       model.TaskService
+	autoTasks   model.AutoTaskService
 	projects    model.ProjectService
 	chat        model.ChatService
 	ownerIDs    []string
@@ -65,12 +61,7 @@ type Pipeline struct {
 	forwardClassifier model.Classifier
 	forwardExtractor  model.Extractor
 	forwardBuffer     model.ForwardBuffer
-	db                *sql.DB
 	taskStore         model.TaskStore
-	eventStore        model.EventStore
-	pushQueue         model.PushQueue
-	broker            model.Broker
-	deviceStore       model.DeviceStore
 	localizer         *goI18n.Localizer
 	timezone          *time.Location
 }
@@ -86,6 +77,7 @@ func New(cfg Config) *Pipeline {
 		extractors:        cfg.Extractors,
 		notifiers:         cfg.Notifiers,
 		tasks:             cfg.Tasks,
+		autoTasks:         cfg.AutoTasks,
 		projects:          cfg.Projects,
 		chat:              cfg.Chat,
 		ownerIDs:          cfg.OwnerIDs,
@@ -94,12 +86,7 @@ func New(cfg Config) *Pipeline {
 		forwardClassifier: cfg.ForwardClassifier,
 		forwardExtractor:  cfg.ForwardExtractor,
 		forwardBuffer:     cfg.ForwardBuffer,
-		db:                cfg.DB,
 		taskStore:         cfg.TaskStore,
-		eventStore:        cfg.EventStore,
-		pushQueue:         cfg.PushQueue,
-		broker:            cfg.Broker,
-		deviceStore:       cfg.DeviceStore,
 		localizer:         cfg.Localizer,
 		timezone:          cfg.Timezone,
 	}
@@ -122,7 +109,7 @@ func (p *Pipeline) isOwner(author string) bool {
 // Process handles a single message:
 //   - ForwardBatch → processForwardBatch (owner-less, handled by payload).
 //   - DM/GroupDirect → ChatService.HandleMessage (tool calling loop, reply via ReplyFn).
-//   - Group/Batch → classifier → extractor → TaskService + notifiers.
+//   - Group/Batch → classifier → extractor → persistence + created-task notifiers.
 func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 	// ForwardBatch carries its own auth context (DM chat_id from TelegramChannel).
 	if msg.Kind == model.MessageKindForwardBatch {
@@ -137,6 +124,19 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 
 	if msg.Kind == model.MessageKindDM || msg.Kind == model.MessageKindGroupDirect {
 		return p.processChat(ctx, msg)
+	}
+
+	if msg.Kind == model.MessageKindGroup {
+		if p.autoTasks == nil {
+			return fmt.Errorf("processing group message: AutoTaskService is not configured")
+		}
+		processed, err := p.autoTasks.Processed(ctx, autoInputKey(msg.Source, msg.ID, msg.Text))
+		if err != nil {
+			return fmt.Errorf("checking group input receipt: %w", err)
+		}
+		if processed {
+			return nil
+		}
 	}
 
 	classifier := p.classifiers[msg.Kind]
@@ -154,6 +154,15 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 	switch class {
 	case model.ClassSkip:
 		p.logger.DebugContext(ctx, "message classified as skip", "msg_id", msg.ID)
+		if msg.Kind == model.MessageKindGroup {
+			_, err := p.autoTasks.Submit(ctx, model.AutoTaskSubmission{
+				InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text)},
+				SourceText: msg.Text,
+			})
+			if err != nil {
+				return fmt.Errorf("saving skipped group input: %w", err)
+			}
+		}
 		return nil
 	case model.ClassPromise:
 		p.logger.InfoContext(ctx, "message classified as promise",
@@ -222,9 +231,8 @@ func (p *Pipeline) processChat(ctx context.Context, msg model.Message) error {
 	return nil
 }
 
-// processPromise handles a promise message:
-// extracts tasks, saves via TaskService, dispatches to notifiers.
-// Returns true when at least one task was extracted (regardless of persistence outcome).
+// processPromise extracts tasks and submits Telegram candidates for durable decisions.
+// Returns true only when tasks were actually created.
 func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool, error) {
 	extractor := p.extractors[msg.Kind]
 	if extractor == nil {
@@ -246,7 +254,7 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 	if err != nil {
 		return false, fmt.Errorf("extracting task: %w", err)
 	}
-	if len(extracted) == 0 {
+	if len(extracted) == 0 && msg.Kind != model.MessageKindGroup {
 		p.logger.InfoContext(ctx, "no tasks extracted: low model confidence", "msg_id", msg.ID)
 		return false, nil
 	}
@@ -282,6 +290,25 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 		})
 	}
 
+	if msg.Kind == model.MessageKindGroup {
+		result, err := p.autoTasks.Submit(ctx, model.AutoTaskSubmission{
+			InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text)},
+			ProjectID:  projectID,
+			Tasks:      taskReqs,
+			SourceText: msg.Text,
+		})
+		if err != nil {
+			return false, fmt.Errorf("submitting group task candidates: %w", err)
+		}
+		if len(result.Created) > 0 {
+			for i := range result.Created {
+				result.Created[i].SourceMessage = msg
+			}
+			p.dispatchNotifiers(ctx, result.Created)
+		}
+		return len(result.Created) > 0, nil
+	}
+
 	tasksToNotify := extracted
 	if p.tasks != nil {
 		created, createErr := p.tasks.CreateTasks(ctx, model.CreateTasksRequest{
@@ -299,208 +326,153 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 	return true, nil
 }
 
-// processForwardBatch handles MessageKindForwardBatch:
-//  1. Parses project hint from trigger text.
-//  2. Formats the forward batch for LLM.
-//  3. Classifies with ForwardClassifier.
-//  4. If skip → clears buffer (tx), replies "no promises found".
-//  5. If promise → extracts tasks with ForwardExtractor.
-//  6. Creates tasks + event + push in one atomic tx with buffer deletion.
-//  7. Optionally deletes Telegram messages via DeleteFn.
-//  8. Replies with extracted task list.
+// processForwardBatch submits one buffer snapshot; inference never holds a transaction.
 func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) error {
 	payload := msg.ForwardBatch
 	if payload == nil {
 		p.logger.WarnContext(ctx, "processForwardBatch: nil ForwardBatchPayload")
 		return nil
 	}
-	if p.forwardClassifier == nil || p.db == nil || p.taskStore == nil || p.forwardBuffer == nil {
-		p.logger.WarnContext(ctx, "processForwardBatch: missing critical dependencies, skipping",
-			"chat_id", payload.ChatID)
+	if p.forwardClassifier == nil || p.autoTasks == nil || p.taskStore == nil || p.forwardBuffer == nil {
+		return fmt.Errorf("processing forward batch: required dependencies are not configured")
+	}
+
+	// Keep every snapshot identity for atomic receipts and deletion, but never
+	// expose already processed forwards to the classifier or extractor again.
+	source := msg.Source
+	source.ID = payload.ChatID
+	keys := make([]string, 0, len(payload.Forwards))
+	ids := make([]string, 0, len(payload.Forwards))
+	unprocessed := make([]model.ForwardEntry, 0, len(payload.Forwards))
+	for _, entry := range payload.Forwards {
+		key := autoInputKey(source, entry.MessageID, entry.Text)
+		processed, err := p.autoTasks.Processed(ctx, key)
+		if err != nil {
+			return fmt.Errorf("checking forward input receipt: %w", err)
+		}
+		keys = append(keys, key)
+		ids = append(ids, entry.MessageID)
+		if !processed {
+			unprocessed = append(unprocessed, entry)
+		}
+	}
+	if len(keys) == 0 {
 		return nil
 	}
 
-	// 1. Resolve target project.
 	hint, _ := parseTriggerProjectHint(payload.TriggerText)
 	projectID := p.taskStore.DefaultProjectID()
 	projectName := "Inbox"
-	projectSlug := ""
 	var projectNotFoundWarning string
-
 	if hint != "" && p.projects != nil {
 		proj, err := p.projects.ResolveProjectRef(ctx, hint)
-		if err != nil {
-			p.logger.WarnContext(ctx, "processForwardBatch: project hint not found",
-				"hint", hint, "error", err, "chat_id", payload.ChatID)
-			projectNotFoundWarning = p.localizeMsg("forward.project_not_found",
-				map[string]any{"Hint": hint})
+		if err != nil || proj == nil {
+			p.logger.WarnContext(ctx, "forward project hint not found", "hint", hint, "error", err)
+			projectNotFoundWarning = p.localizeMsg("forward.project_not_found", map[string]any{"Hint": hint})
 		} else {
 			projectID = proj.ID
 			projectName = proj.Name
-			projectSlug = proj.Slug
 		}
+	} else if proj, err := p.taskStore.GetProject(ctx, projectID); err == nil && proj != nil {
+		projectName = proj.Name
 	}
 
-	// Get Inbox project details when not overridden by a hint.
-	if projectSlug == "" {
-		proj, err := p.taskStore.GetProject(ctx, projectID)
-		if err == nil && proj != nil {
-			projectName = proj.Name
-			projectSlug = proj.Slug
-		}
-	}
-
-	// 2. Format batch for LLM.
 	tz := p.timezone
 	if tz == nil {
 		tz = time.UTC
 	}
-	formatted := FormatForwardBatch(payload.Forwards, payload.Counterpart, tz)
-
-	syntheticMsg := model.Message{
-		Text:   formatted,
-		Kind:   model.MessageKindForwardBatch,
-		Source: msg.Source,
-	}
-
-	// 3. Classify.
-	class, err := p.forwardClassifier.Classify(ctx, syntheticMsg)
-	if err != nil {
-		return fmt.Errorf("classifying forward batch: %w", err)
-	}
-
-	if class == model.ClassSkip {
-		p.logger.InfoContext(ctx, "processForwardBatch: classified as skip, clearing buffer",
-			"chat_id", payload.ChatID)
-		return p.skipForwardBatch(ctx, payload)
-	}
-
-	// 4. Extract.
-	if p.forwardExtractor == nil {
-		p.logger.WarnContext(ctx, "processForwardBatch: no ForwardExtractor configured")
-		return p.skipForwardBatch(ctx, payload)
-	}
-	extracted, err := p.forwardExtractor.Extract(ctx, syntheticMsg, nil)
-	if err != nil {
-		return fmt.Errorf("extracting forward tasks: %w", err)
-	}
-	if len(extracted) == 0 {
-		p.logger.InfoContext(ctx, "processForwardBatch: no tasks extracted, treating as skip",
-			"chat_id", payload.ChatID)
-		return p.skipForwardBatch(ctx, payload)
-	}
-
-	// 5. Get active device IDs before opening the transaction.
-	activeIDs, err := p.getActiveDeviceIDs(ctx)
-	if err != nil {
-		p.logger.WarnContext(ctx, "processForwardBatch: ListActiveIDs failed", "error", err)
-	}
-
-	// 6. Transactional write: CreateTaskTx × N + events + push + DeleteBatchTx.
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("beginning forward batch tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	created := make([]model.Task, 0, len(extracted))
-	pendingEvents := make([]model.Event, 0, len(extracted))
-
-	for i := range extracted {
-		task := &model.Task{
-			ProjectID:   projectID,
-			ProjectSlug: projectSlug,
-			Summary:     extracted[i].Summary,
-			Details:     extracted[i].Details,
-			Topic:       extracted[i].Topic,
-			Deadline:    extracted[i].Deadline,
-		}
-		if err := p.taskStore.CreateTaskTx(ctx, tx, task); err != nil {
-			return fmt.Errorf("creating forward task: %w", err)
-		}
-		ev, err := p.insertForwardEventTx(ctx, tx, task, activeIDs)
+	formatted := FormatForwardBatch(unprocessed, payload.Counterpart, tz)
+	var requests []model.CreateTaskRequest
+	if len(unprocessed) > 0 {
+		syntheticMsg := model.Message{Text: formatted, Kind: model.MessageKindForwardBatch, Source: source}
+		class, err := p.forwardClassifier.Classify(ctx, syntheticMsg)
 		if err != nil {
-			return err
+			return fmt.Errorf("classifying forward batch: %w", err)
 		}
-		pendingEvents = append(pendingEvents, ev)
-		created = append(created, *task)
-	}
-
-	if err := p.forwardBuffer.DeleteBatchTx(ctx, tx, payload.ChatID); err != nil {
-		return fmt.Errorf("deleting forward buffer in tx: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing forward batch tx: %w", err)
-	}
-
-	// 6b. Broker fan-out after commit.
-	if p.broker != nil {
-		for _, ev := range pendingEvents {
-			p.broker.Notify(ev)
+		switch class {
+		case model.ClassSkip:
+		case model.ClassPromise:
+			if p.forwardExtractor == nil {
+				return fmt.Errorf("extracting forward batch: ForwardExtractor is not configured")
+			}
+			extracted, err := p.forwardExtractor.Extract(ctx, syntheticMsg, nil)
+			if err != nil {
+				return fmt.Errorf("extracting forward tasks: %w", err)
+			}
+			for _, task := range extracted {
+				requests = append(requests, model.CreateTaskRequest{
+					ProjectID: projectID,
+					Summary:   task.Summary,
+					Details:   task.Details,
+					Topic:     task.Topic,
+					Deadline:  task.Deadline,
+					Source:    source,
+				})
+			}
+		default:
+			return fmt.Errorf("classifying forward batch: unexpected classification %q", class)
 		}
 	}
 
-	// 7. Delete Telegram messages (best-effort).
-	if len(created) > 0 && payload.DeleteFn != nil {
-		ids := make([]string, 0, len(payload.Forwards)+1)
-		for _, f := range payload.Forwards {
-			ids = append(ids, f.MessageID)
-		}
+	result, err := p.autoTasks.Submit(ctx, model.AutoTaskSubmission{
+		InputKeys:  keys,
+		ProjectID:  projectID,
+		Tasks:      requests,
+		SourceText: formatted,
+		Finalize: func(ctx context.Context, tx *sql.Tx) error {
+			if err := p.forwardBuffer.DeleteEntriesTx(ctx, tx, payload.ChatID, ids); err != nil {
+				return fmt.Errorf("deleting forward snapshot: %w", err)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("submitting forward task candidates: %w", err)
+	}
+
+	// Deleting Telegram messages is best effort and only follows actual creation.
+	if len(result.Created) > 0 && payload.DeleteFn != nil {
+		deleteIDs := append([]string(nil), ids...)
 		if payload.TriggerID != "" {
-			ids = append(ids, payload.TriggerID)
+			deleteIDs = append(deleteIDs, payload.TriggerID)
 		}
-		if err := payload.DeleteFn(ctx, ids); err != nil {
-			p.logger.WarnContext(ctx, "processForwardBatch: DeleteFn failed, tasks already saved",
-				"error", err, "chat_id", payload.ChatID)
+		if err := payload.DeleteFn(ctx, deleteIDs); err != nil {
+			p.logger.WarnContext(ctx, "deleting Telegram forwards after commit", "error", err, "chat_id", payload.ChatID)
 		}
 	}
 
-	// 8. Reply.
 	if payload.ReplyFn != nil {
+		reply := func(text string) {
+			if err := payload.ReplyFn(ctx, text); err != nil {
+				p.logger.WarnContext(ctx, "sending forward outcome reply", "error", err, "chat_id", payload.ChatID)
+			}
+		}
 		if projectNotFoundWarning != "" {
-			_ = payload.ReplyFn(ctx, projectNotFoundWarning)
+			reply(projectNotFoundWarning)
 		}
-		lines := make([]string, len(created))
-		for i, t := range created {
-			lines[i] = "— " + t.Summary
+		if len(result.Created) > 0 {
+			lines := make([]string, len(result.Created))
+			for i, task := range result.Created {
+				lines[i] = "— " + task.Summary
+			}
+			reply(p.localizeMsg("forward.extracted_tasks", map[string]any{
+				"Count": len(result.Created), "Project": projectName, "Tasks": strings.Join(lines, "\n"),
+			}, len(result.Created)))
 		}
-		replyText := p.localizeMsg("forward.extracted_tasks", map[string]any{
-			"Count":   len(created),
-			"Project": projectName,
-			"Tasks":   strings.Join(lines, "\n"),
-		}, len(created))
-		_ = payload.ReplyFn(ctx, replyText)
+		if len(requests) == 0 && len(unprocessed) > 0 && !result.Replay && len(result.Pending) == 0 && result.Duplicates == 0 && len(result.Created) == 0 {
+			reply(p.localizeMsg("forward.no_promises_found", nil))
+		} else {
+			reply(p.localizeMsg("auto_tasks.outcome", map[string]any{
+				"Created": len(result.Created), "Pending": len(result.Pending), "Duplicates": result.Duplicates,
+			}))
+		}
 	}
-
 	return nil
 }
 
-// skipForwardBatch clears the forward buffer for the chat in a transaction and
-// sends the "no promises found" reply. DeleteFn is intentionally NOT called on
-// skip: the user's Telegram messages are left intact.
-func (p *Pipeline) skipForwardBatch(ctx context.Context, payload *model.ForwardBatchPayload) error {
-	if p.db != nil && p.forwardBuffer != nil {
-		tx, txErr := p.db.BeginTx(ctx, nil)
-		if txErr != nil {
-			p.logger.WarnContext(ctx, "skipForwardBatch: begin tx failed",
-				"error", txErr, "chat_id", payload.ChatID)
-		} else {
-			defer tx.Rollback() //nolint:errcheck
-			if delErr := p.forwardBuffer.DeleteBatchTx(ctx, tx, payload.ChatID); delErr != nil {
-				p.logger.WarnContext(ctx, "skipForwardBatch: DeleteBatchTx failed",
-					"error", delErr, "chat_id", payload.ChatID)
-			} else if commitErr := tx.Commit(); commitErr != nil {
-				p.logger.WarnContext(ctx, "skipForwardBatch: commit failed",
-					"error", commitErr, "chat_id", payload.ChatID)
-			}
-		}
-	}
-
-	if payload.ReplyFn != nil {
-		_ = payload.ReplyFn(ctx, p.localizeMsg("forward.no_promises_found", nil))
-	}
-	return nil
+// autoInputKey separates message edits and source accounts without persisting raw text.
+func autoInputKey(source model.Source, messageID, text string) string {
+	return fmt.Sprintf("%q/%q/%q/%q/%x", source.Kind, source.AccountID, source.ID, messageID, sha256.Sum256([]byte(text)))
 }
 
 // localizeMsg translates msgID using the pipeline's localizer.
@@ -510,81 +482,6 @@ func (p *Pipeline) localizeMsg(msgID string, data any, count ...int) string {
 		return msgID
 	}
 	return localei18n.Translate(p.localizer, msgID, data, count...)
-}
-
-// forwardTaskSnap is the per-task JSON object inside a task_created event payload.
-// Field names deliberately match usecase.taskSnapshot for protocol compatibility.
-type forwardTaskSnap struct {
-	ID          string     `json:"id"`
-	Number      int        `json:"number"`
-	ProjectID   string     `json:"project_id"`
-	ProjectSlug string     `json:"project_slug,omitempty"`
-	Summary     string     `json:"summary"`
-	Details     string     `json:"details,omitempty"`
-	Topic       string     `json:"topic,omitempty"`
-	Status      string     `json:"status"`
-	Deadline    *time.Time `json:"deadline,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-}
-
-type forwardEventPayload struct {
-	Task forwardTaskSnap `json:"task"`
-}
-
-// insertForwardEventTx records a task_created event within tx and enqueues push
-// jobs for offline devices. Returns a zero Event when EventStore is nil.
-func (p *Pipeline) insertForwardEventTx(ctx context.Context, tx *sql.Tx, task *model.Task, activeIDs []string) (model.Event, error) {
-	if p.eventStore == nil {
-		return model.Event{}, nil
-	}
-
-	snap := forwardTaskSnap{
-		ID:          task.ID,
-		Number:      task.Number,
-		ProjectID:   task.ProjectID,
-		ProjectSlug: task.ProjectSlug,
-		Summary:     task.Summary,
-		Details:     task.Details,
-		Topic:       task.Topic,
-		Status:      task.Status,
-		Deadline:    task.Deadline,
-		CreatedAt:   task.CreatedAt,
-		UpdatedAt:   task.UpdatedAt,
-	}
-	raw, err := json.Marshal(forwardEventPayload{Task: snap})
-	if err != nil {
-		return model.Event{}, fmt.Errorf("marshaling forward task event: %w", err)
-	}
-
-	ev := model.Event{Kind: model.EventTaskCreated, EntityID: task.ID, Payload: raw}
-	seq, err := p.eventStore.Insert(ctx, tx, ev)
-	if err != nil {
-		return model.Event{}, fmt.Errorf("inserting forward task event: %w", err)
-	}
-	ev.Seq = seq
-
-	if p.pushQueue != nil && p.broker != nil {
-		for _, deviceID := range activeIDs {
-			if p.broker.IsActive(deviceID) {
-				continue
-			}
-			if err := p.pushQueue.Enqueue(ctx, tx, deviceID, seq); err != nil {
-				return model.Event{}, fmt.Errorf("enqueuing push for device %s: %w", deviceID, err)
-			}
-		}
-	}
-
-	return ev, nil
-}
-
-// getActiveDeviceIDs returns device IDs for push queue routing.
-// Returns nil when DeviceStore is not configured.
-func (p *Pipeline) getActiveDeviceIDs(ctx context.Context) ([]string, error) {
-	if p.deviceStore == nil {
-		return nil, nil
-	}
-	return p.deviceStore.ListActiveIDs(ctx)
 }
 
 func (p *Pipeline) reactPending(ctx context.Context, msg model.Message) {

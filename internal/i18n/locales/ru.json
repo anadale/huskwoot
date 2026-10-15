@@ -118,5 +118,14 @@
     "other": "Извлёк {{.Count}} задач в проект «{{.Project}}»:\n{{.Tasks}}"
   },
   "forward.no_promises_found": "Обещаний от тебя в этой переписке не нашёл, сообщения оставил",
-  "forward.project_not_found": "Проект «{{.Hint}}» не найден, положил задачи в Inbox"
+  "forward.project_not_found": "Проект «{{.Hint}}» не найден, положил задачи в Inbox",
+  "auto_tasks.outcome": "Создано задач: {{.Created}}. Ожидают решения: {{.Pending}}. Пропущено дублей: {{.Duplicates}}.",
+  "auto_tasks.question": "Добавить эту задачу?\n\n{{.Summary}}{{if .Details}}\nПодробности: {{.Details}}{{end}}{{if .Deadline}}\nСрок: {{.Deadline}}{{end}}{{if .Project}}\nПроект: {{.Project}}{{end}}{{if .MatchSummary}}\n\nПохожая задача: {{.MatchSummary}}{{end}}{{if .MatchRef}}\nСсылка: {{.MatchRef}}{{end}}\n\nПричина проверки: {{.Reason}}",
+  "auto_tasks.approve": "👍 Добавить",
+  "auto_tasks.reject": "👎 Не добавлять",
+  "auto_tasks.created": "Задача добавлена.",
+  "auto_tasks.rejected": "Задача не добавлена.",
+  "auto_tasks.unavailable": "Этот вопрос о задаче недоступен.",
+  "auto_tasks.retry": "Не удалось сохранить решение. Попробуй ещё раз.",
+  "auto_tasks.comparison_unavailable": "Не удалось надёжно сравнить с существующими задачами."
 }

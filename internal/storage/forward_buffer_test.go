@@ -164,7 +164,7 @@ func TestSQLiteForwardBuffer_LoadBatch_SelfAuthoredRoundtrip(t *testing.T) {
 
 	now := time.Now().UTC().Truncate(time.Second)
 	cases := []struct {
-		msgID       string
+		msgID        string
 		selfAuthored bool
 	}{
 		{"msg1", true},
@@ -205,7 +205,7 @@ func TestSQLiteForwardBuffer_LoadBatch_Empty(t *testing.T) {
 	}
 }
 
-func TestSQLiteForwardBuffer_DeleteBatchTx_CommitDeletes(t *testing.T) {
+func TestSQLiteForwardBuffer_DeleteEntriesTx_CommitDeletesOnlySnapshot(t *testing.T) {
 	ctx := context.Background()
 	buf, db := newTestForwardBuffer(t)
 
@@ -225,9 +225,9 @@ func TestSQLiteForwardBuffer_DeleteBatchTx_CommitDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	if err := buf.DeleteBatchTx(ctx, tx, "chat1"); err != nil {
+	if err := buf.DeleteEntriesTx(ctx, tx, "chat1", []string{"msg1"}); err != nil {
 		tx.Rollback() //nolint:errcheck
-		t.Fatalf("DeleteBatchTx: %v", err)
+		t.Fatalf("DeleteEntriesTx: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
@@ -237,8 +237,8 @@ func TestSQLiteForwardBuffer_DeleteBatchTx_CommitDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadBatch chat1: %v", err)
 	}
-	if len(batch1) != 0 {
-		t.Errorf("chat1 should be empty after commit, got %d entries", len(batch1))
+	if len(batch1) != 1 || batch1[0].MessageID != "msg2" {
+		t.Errorf("chat1 should preserve the new arrival, got %v", batch1)
 	}
 
 	batch2, err := buf.LoadBatch(ctx, "chat2")
@@ -250,7 +250,7 @@ func TestSQLiteForwardBuffer_DeleteBatchTx_CommitDeletes(t *testing.T) {
 	}
 }
 
-func TestSQLiteForwardBuffer_DeleteBatchTx_RollbackPreservesData(t *testing.T) {
+func TestSQLiteForwardBuffer_DeleteEntriesTx_RollbackPreservesData(t *testing.T) {
 	ctx := context.Background()
 	buf, db := newTestForwardBuffer(t)
 
@@ -264,9 +264,9 @@ func TestSQLiteForwardBuffer_DeleteBatchTx_RollbackPreservesData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTx: %v", err)
 	}
-	if err := buf.DeleteBatchTx(ctx, tx, "chat1"); err != nil {
+	if err := buf.DeleteEntriesTx(ctx, tx, "chat1", []string{"msg1"}); err != nil {
 		tx.Rollback() //nolint:errcheck
-		t.Fatalf("DeleteBatchTx: %v", err)
+		t.Fatalf("DeleteEntriesTx: %v", err)
 	}
 	tx.Rollback() //nolint:errcheck
 

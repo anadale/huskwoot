@@ -263,8 +263,8 @@ type ForwardBuffer interface {
 	LastReceivedAt(ctx context.Context, chatID string) (time.Time, bool, error)
 	// LoadBatch returns all entries for the given chat ordered by OriginalDate ASC, id ASC.
 	LoadBatch(ctx context.Context, chatID string) ([]ForwardEntry, error)
-	// DeleteBatchTx deletes all entries for the given chat within the provided transaction.
-	DeleteBatchTx(ctx context.Context, tx *sql.Tx, chatID string) error
+	// DeleteEntriesTx deletes only the supplied snapshot message IDs in the transaction.
+	DeleteEntriesTx(ctx context.Context, tx *sql.Tx, chatID string, messageIDs []string) error
 	// ListPendingChats returns chat IDs whose MAX(received_at) is strictly before the given threshold.
 	ListPendingChats(ctx context.Context, before time.Time) ([]string, error)
 }
@@ -329,4 +329,35 @@ type Broker interface {
 	IsActive(deviceID string) bool
 	// Notify fans the event out to all subscribers. Slow subscribers are dropped.
 	Notify(ev Event)
+}
+
+// TaskDuplicateChecker compares a candidate with the complete supplied reference set.
+type TaskDuplicateChecker interface {
+	Compare(ctx context.Context, task CreateTaskRequest, sourceText string, references []TaskReference) (TaskAssessment, error)
+}
+
+// AutoTaskService accepts automatically extracted tasks without affecting explicit
+// task creation through agent tools or the HTTP API.
+type AutoTaskService interface {
+	Processed(ctx context.Context, inputKey string) (bool, error)
+	Submit(ctx context.Context, submission AutoTaskSubmission) (AutoTaskResult, error)
+	PendingQuestions(ctx context.Context, limit int) ([]TaskCandidate, error)
+	MarkQuestionSent(ctx context.Context, candidateID string, chatID int64, messageID int) error
+	GetCandidate(ctx context.Context, candidateID string) (*TaskCandidate, error)
+	Decide(ctx context.Context, candidateID string, approve bool) (TaskCandidateDecision, error)
+}
+
+// AutoTaskStore persists automatic extraction receipts and candidate decisions.
+// Transactional reads never acquire another database connection.
+type AutoTaskStore interface {
+	Processed(ctx context.Context, inputKey string) (bool, error)
+	ProcessedTx(ctx context.Context, tx *sql.Tx, inputKey string) (bool, error)
+	RecordInputTx(ctx context.Context, tx *sql.Tx, inputKey string, at time.Time) error
+	ReferencesTx(ctx context.Context, tx *sql.Tx, projectID string, closedSince time.Time) ([]TaskReference, error)
+	InsertCandidateTx(ctx context.Context, tx *sql.Tx, candidate TaskCandidate) error
+	UpdateCandidateTx(ctx context.Context, tx *sql.Tx, candidate TaskCandidate) error
+	GetCandidate(ctx context.Context, candidateID string) (*TaskCandidate, error)
+	GetCandidateTx(ctx context.Context, tx *sql.Tx, candidateID string) (*TaskCandidate, error)
+	PendingQuestions(ctx context.Context, limit int) ([]TaskCandidate, error)
+	MarkQuestionSent(ctx context.Context, candidateID string, chatID int64, messageID int) error
 }

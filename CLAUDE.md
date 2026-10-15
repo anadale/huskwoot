@@ -26,7 +26,7 @@ internal/pipeline/            — orchestration (Pipeline.Process)
 internal/agent/               — agent: tool-calling loop, tools
 internal/sink/                — TelegramNotifier, ReactionNotifier, TelegramSummaryDeliverer
 internal/channel/             — TelegramChannel, IMAPChannel
-internal/usecase/             — use-case layer (TaskService, ProjectService, ChatService, PairingService)
+internal/usecase/             — use-case layer (TaskService, AutoTaskService, ProjectService, ChatService, PairingService)
 internal/dateparse/           — date and deadline parsing
 internal/i18n/                — i18n bundle, localizer, locale JSON files (ru/en)
 internal/reminder/            — Scheduler for periodic digests
@@ -56,13 +56,17 @@ api/openapi.yaml              — OpenAPI 3.1, source of truth for the REST API
 
 ### Message processing flow
 
-```
-Channel.Watch() → Message{Kind, ReactFn, ReplyFn, HistoryFn}
-    → Pipeline.Process(msg)
-        DM / GroupDirect → ChatService.HandleMessage → msg.ReplyFn(reply.Text)
-        Group / Batch →
-            Classifier.Classify → Skip | Promise
-            Promise → Extractor.Extract → TaskService.CreateTasks → notifiers
+```mermaid
+flowchart TD
+    Channel[Channel.Watch] --> P[Pipeline.Process]
+    P -->|DM / GroupDirect| Chat[ChatService.HandleMessage]
+    P -->|Group / ForwardBatch| AutoExtract[Classifier / Extractor]
+    AutoExtract --> Auto[AutoTaskService.Submit]
+    Auto --> Decisions[(receipts / candidates / tasks / events / push)]
+    P -->|Batch| Extract[Classifier / Extractor]
+    Extract --> Tasks[TaskService.CreateTasks]
+    Tasks --> Notify[notifiers]
+    Auto -->|Created| Notify
 ```
 
 DM voice/audio messages bypass the pipeline inline path: `TelegramChannel` enqueues them to `voice_queue` immediately (cursor saved, no transcription in the polling goroutine). `transcribe.Worker` claims jobs asynchronously, dispatches download via `VoiceDownloader` and transcription via `Transcriber`, then passes the result to the appropriate `VoiceConsumer`. For Telegram jobs, `telegramVoiceConsumer` (in `internal/channel/telegram_voice_consumer.go`) calls `BuildVoiceMessage` and `Pipeline.Process(MessageKindDM)`; for client jobs, `clientVoiceConsumer` (in `internal/usecase/`) emits `chat_message_created` SSE events and calls `ChatService.HandleMessage`.
@@ -93,6 +97,18 @@ The use-case layer owns `*sql.DB` and transactions. Write-method pattern:
 
 Atomicity of "entity + event + push_queue" is guaranteed by a single transaction. `Broker` does not write to the DB.
 
+### Защита от дублей автоматических задач
+
+`AutoTaskService` применяется только к автоматическому извлечению из Telegram Group/ForwardBatch. Явные команды агента, REST API и IMAP сохраняют прежнее поведение. Общие типы — `internal/model/auto_tasks.go`, интерфейсы — `internal/model/interfaces.go`, реализация — `internal/usecase/auto_tasks.go`.
+
+Smart-модель сравнивает кандидата со всеми открытыми задачами проекта, закрытыми за последние 14 дней и pending/rejected-кандидатами. Кандидаты одного извлечения также учитываются. `Task.Confidence` не используется как оценка дубля. При пустом наборе references задача создаётся без дополнительного AI-запроса.
+
+`same` с оценкой не ниже `tasks.duplicate_threshold` (по умолчанию 0.95), без конфликта и с open/pending/rejected reference пропускается. `different` ниже `tasks.review_threshold` (0.70), без конфликта создаётся. Остальное, включая ошибку сравнения, сохраняется как pending. Закрытое совпадение не разрешает автоматический пропуск.
+
+Владелец получает личный вопрос с inline-кнопками 👍/👎, а не с настоящими реакциями. `SetTaskCandidates` вызывается до старта `Watch`; `RunTaskQuestions` доставляет неотправленные вопросы. Callback обрабатывается до guard/history/forward/agent и проверяет владельца, личный чат и сообщение самого бота. `Decide` атомарно фиксирует первое решение; повтор не создаёт задачу.
+
+Receipts, решения, задачи, события, push и `Finalize` буфера атомарны. AI вызывается вне транзакции; revision событий перепроверяется перед записью. Ключ receipt включает account/chat/message и hash текста. Group проходит синхронный intake до подтверждения update; DM/GroupDirect и IMAP остаются в очереди.
+
 ### Forward batch flow (Telegram 1:1 promises)
 
 Allows the owner to forward arbitrary messages from a private 1:1 Telegram chat into DM with the bot. The bot accumulates them in SQLite, then on timeout or user trigger extracts promises the owner made and creates tasks.
@@ -121,20 +137,22 @@ ForwardDispatcher (single-goroutine consumer)
 
 Pipeline `processForwardBatch`:
 1. Parse `triggerText` via `parseTriggerProjectHint` → resolve project or fallback Inbox.
-2. Format buffer via `FormatForwardBatch` → labeled block `[я, …]` / `[name, …]`.
+2. Exclude forwards with saved input receipts, then format the remaining snapshot via `FormatForwardBatch` → labeled block `[я, …]` / `[name, …]`.
 3. `ForwardClassifier.Classify` → `promise` | `skip`.
-   - `skip`: tx → `DeleteBatchTx`; reply "no promises found"; Telegram forwards are NOT deleted.
+   - `skip`: `AutoTaskService.Submit` with no tasks persists receipts and clears only the snapshot via `DeleteEntriesTx`; reply "no promises found"; Telegram forwards are NOT deleted.
 4. `ForwardExtractor.Extract` → `[]model.Task`.
-5. Single tx: `CreateTaskTx` × N + `EventStore.Insert` × N + `PushQueue.Enqueue` × N + `DeleteBatchTx`. Commit.
+5. `AutoTaskService.Submit` compares candidates; one transaction saves decisions, tasks/events/push for new obligations, input receipts, and deletes only snapshot entries via `Finalize` + `DeleteEntriesTx`. Commit.
 6. `Broker.Notify(events)` after commit.
-7. If `DeleteForwardsAfterExtract && len(tasks) > 0`: call `payload.DeleteFn`; errors → `slog.Warn` only.
-8. Reply with task list.
+7. If `DeleteForwardsAfterExtract && len(result.Created) > 0`: call `payload.DeleteFn`; errors → `slog.Warn` only.
+8. Reply with created tasks and counts of pending candidates and skipped duplicates.
 
-Transactional invariant: "tasks + buffer clear" are atomic. On crash between commit and Telegram delete, tasks are saved and forwards remain in DM (acceptable). Sweeper handles restart recovery.
+Transactional invariant: "decisions + tasks + snapshot buffer clear" are atomic. New forwards arriving during inference remain buffered. On crash between commit and Telegram delete, results are saved and forwards may remain in DM. Sweeper handles restart recovery.
 
 ### TelegramChannel.Watch internals
 
 **Cursor contract (at-least-once):** The update cursor is saved once per batch after the full batch is processed. If `processRawUpdate` returns `false` for update N, the cursor advances only to update N−1. This ensures at-least-once delivery: on crash mid-batch, updates from that batch are redelivered on restart. Pipeline idempotency absorbs duplicates.
+
+Для Group `watchHandler` ждёт `Pipeline.Process` до подтверждения входа. Ошибка Group handler или сохранения callback возвращает `false`; повтор выполняется с context-aware задержкой. Нельзя заменить Group intake одним enqueue в `msgCh`: тогда ошибка сохранения возникает уже после продвижения cursor.
 
 **Backoff on getUpdates errors:** Starts at 1 second, doubles on each consecutive error up to 30 seconds max (`1s → 2s → 4s … 30s`). If the Telegram API returns `RetryAfter`, that duration is used directly. Resets to 1 second on the first successful response.
 
@@ -163,7 +181,8 @@ Stores:
 - `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
 - `push.SQLitePushQueue` — push job queue. Table `push_queue`. `ON DELETE CASCADE` on `event_seq` (retention deletes pending jobs together with events).
-- `storage.SQLiteForwardBuffer` — accumulates forwarded Telegram messages pending extraction. Table `forward_buffer` with `UNIQUE(chat_id, message_id)` for idempotency. Methods: `Append` (INSERT OR IGNORE), `LastReceivedAt`, `LoadBatch` (ordered by `original_date ASC`), `DeleteBatchTx` (tx-aware), `ListPendingChats(before time.Time)` (chats where `MAX(received_at) < before`).
+- `storage.SQLiteForwardBuffer` — accumulates forwarded Telegram messages pending extraction. Table `forward_buffer` with `UNIQUE(chat_id, message_id)` for idempotency while buffered. Methods: `Append` (INSERT OR IGNORE), `LastReceivedAt`, `LoadBatch` (ordered by `original_date ASC`), `DeleteEntriesTx(ctx, tx, chatID, messageIDs)` (deletes only the processed snapshot), `ListPendingChats(before time.Time)`.
+- `storage.SQLiteAutoTaskStore` — tables `auto_task_inputs` and `auto_task_candidates` (migration `015_auto_tasks.sql`); durable receipts and candidate states `pending`/`created`/`rejected`/`duplicate`, including pending question delivery and terminal decision replay.
 - `storage.SQLiteVoiceQueue` — pending voice transcription jobs. Table `voice_queue` (recreated by migration `012_voice_queue_sources.sql`). Fields: `source_kind` (`'telegram'` | `'client'`), `payload` (Telegram `file_id` or client relative path `<uuid>.<ext>`), `mime_type`, `duration_ms`, `device_id` (client-only), `client_job_id` (UUID v4, client-only), `project_id` (optional project hint UUID, client-only), `chat_id`/`message_id` (Telegram-only, nullable). Indexes: `idx_voice_queue_pending` on `next_attempt_at`; partial UNIQUE `idx_voice_queue_telegram_uniq` on `(chat_id, message_id) WHERE source_kind='telegram'`; partial UNIQUE `idx_voice_queue_client_job_id` on `client_job_id WHERE client_job_id IS NOT NULL`. Methods: `Enqueue` (INSERT OR IGNORE), `Claim(now)` (next job whose `next_attempt_at <= now`, nil if empty), `Complete` (DELETE on success), `Reschedule(nextAt, lastErr)` (UPDATE attempts++ on failure), `HasClientPayload(ctx, payload) (bool, error)` (used by orphan sweep; filters by `source_kind='client'`). `transcribe.Worker` applies backoff 30s → 2m → 10m and drops after 4th attempt.
 
 Human-readable task reference: `<slug>#<number>` (method `Task.DisplayID()`).

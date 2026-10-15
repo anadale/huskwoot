@@ -263,6 +263,29 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	}
 	agentLoc := huskwootI18n.NewLocalizer(agentBundle, cfg.User.Language)
 
+	var autoTasks model.AutoTaskService
+	if tgChannel != nil {
+		checker, err := ai.NewTaskDuplicateChecker(aiComps.smartClient, cfg.User.Language)
+		if err != nil {
+			return fmt.Errorf("initializing task duplicate checker: %w", err)
+		}
+		autoTasks = usecase.NewAutoTaskService(usecase.AutoTaskServiceDeps{
+			DB:                 db,
+			Tasks:              taskStore,
+			Events:             eventStore,
+			Devices:            deviceStore,
+			Queue:              pushQueue,
+			Broker:             broker,
+			Store:              storage.NewSQLiteAutoTaskStore(db),
+			Checker:            checker,
+			DuplicateThreshold: cfg.Tasks.DuplicateThreshold,
+			ReviewThreshold:    cfg.Tasks.ReviewThreshold,
+			Logger:             logger,
+			Now:                nowFn,
+		})
+		tgChannel.SetTaskCandidates(autoTasks)
+	}
+
 	agentTools := []agent.Tool{
 		agent.NewCreateProjectTool(projectSvc, agentLoc),
 		agent.NewListProjectsTool(projectSvc, agentLoc),
@@ -305,6 +328,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		Tasks:       taskSvc,
 		Projects:    projectSvc,
 		Chat:        chatSvc,
+		AutoTasks:   autoTasks,
 		Classifiers: buildClassifiers(aiComps),
 		Extractors:  buildExtractors(aiComps),
 		Notifiers:   notifiers,
@@ -313,18 +337,17 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		ForwardClassifier: forwardClassifier,
 		ForwardExtractor:  forwardExtractor,
 		ForwardBuffer:     forwardBuffer,
-		DB:                db,
 		TaskStore:         taskStore,
-		EventStore:        eventStore,
-		PushQueue:         pushQueue,
-		Broker:            broker,
-		DeviceStore:       deviceStore,
 		Localizer:         agentLoc,
 		Timezone:          loc,
 	})
 
 	msgCh := make(chan model.Message, 100)
 	watchHandler := func(ctx context.Context, msg model.Message) error {
+		// Do not acknowledge group updates until their durable intake transaction commits.
+		if msg.Kind == model.MessageKindGroup {
+			return pipe.Process(ctx, msg)
+		}
 		select {
 		case msgCh <- msg:
 			return nil
@@ -495,7 +518,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 				UserName:       cfg.User.UserName,
 				TelegramUserID: cfg.User.TelegramUserID,
 			},
-			BuildVersion: version,
+			BuildVersion:   version,
 			DateTime:       cfg.DateTime,
 			VoiceQueue:     voiceQueue,
 			UploadsDir:     uploadsDir,
@@ -536,6 +559,14 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		logger.Info("reminders active", "slots", slotNames, "send_when_empty", cfg.Reminders.SendWhenEmpty)
 	} else {
 		logger.Debug("reminders disabled")
+	}
+
+	if tgChannel != nil {
+		go func() {
+			if err := tgChannel.RunTaskQuestions(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				logger.Error("task question sender exited with error", "error", err)
+			}
+		}()
 	}
 
 	for _, ch := range channels {

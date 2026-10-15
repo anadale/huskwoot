@@ -43,6 +43,7 @@ type rawUpdate struct {
 	EditedMessage   *tgbotapi.Message           `json:"edited_message"`
 	MyChatMember    *tgbotapi.ChatMemberUpdated `json:"my_chat_member"`
 	MessageReaction *rawMessageReaction         `json:"message_reaction"`
+	CallbackQuery   *tgbotapi.CallbackQuery     `json:"callback_query"`
 }
 
 // rawMessageReaction contains the subset of MessageReactionUpdated fields needed for guard.
@@ -96,8 +97,8 @@ type TelegramChannelConfig struct {
 	// Voice messages exceeding this duration get a "voice.too_long" reply.
 	// 0 means no duration check.
 	MaxVoiceDuration time.Duration
-	// Localizer provides translated strings for voice-related replies.
-	// nil means voice replies are suppressed (no message sent to the user).
+	// Localizer provides translated strings for voice and task-question replies.
+	// nil suppresses voice replies; task questions use the configured language.
 	Localizer *goI18n.Localizer
 	// DownloadFileFn downloads a Telegram file by file ID.
 	// NewTelegramChannel sets a real implementation; override in tests to inject mock bytes.
@@ -165,9 +166,11 @@ type TelegramChannel struct {
 	history    model.History
 	historyCfg HistoryConfig
 	// botID is the numeric bot user ID parsed from cfg.BotID. 0 if unset or invalid.
-	botID     int64
-	pending   map[int64]*pendingApproval
-	pendingMu sync.Mutex
+	botID          int64
+	pending        map[int64]*pendingApproval
+	pendingMu      sync.Mutex
+	taskCandidates model.AutoTaskService
+	taskLocalizer  *goI18n.Localizer
 	// sleeper is called on getUpdates errors to pause before the next retry.
 	// Default: context-aware sleep using time.After. Override in tests.
 	sleeper func(context.Context, time.Duration) error
@@ -299,7 +302,7 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 
 	allowedUpdates := "[]"
 	if len(w.ownerIDs) > 0 {
-		b, _ := json.Marshal([]string{"message", "edited_message", "my_chat_member", "message_reaction"})
+		b, _ := json.Marshal([]string{"message", "edited_message", "my_chat_member", "message_reaction", "callback_query"})
 		allowedUpdates = string(b)
 	}
 
@@ -348,8 +351,10 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 		}
 
 		lastGoodUpdateID := -1
+		retryUpdate := false
 		for _, upd := range updates {
 			if ok := w.processRawUpdate(ctx, upd, handler); !ok {
+				retryUpdate = true
 				break
 			}
 			offset = upd.UpdateID + 1
@@ -360,6 +365,11 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 				slog.Error("saving batch cursor", "error", err, "update_id", lastGoodUpdateID)
 			}
 		}
+		if retryUpdate {
+			if err := w.sleeper(ctx, backoff); err != nil {
+				return err
+			}
+		}
 	}
 }
 
@@ -368,6 +378,10 @@ func (w *TelegramChannel) Watch(ctx context.Context, handler func(context.Contex
 // Returns false when processing failed in a way that requires a retry — the Watch loop
 // stops advancing the cursor so the update is replayed after a restart.
 func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, handler func(context.Context, model.Message) error) bool {
+	if upd.CallbackQuery != nil {
+		return w.handleTaskCallback(ctx, upd.CallbackQuery)
+	}
+
 	if upd.MyChatMember != nil {
 		w.handleJoin(ctx, upd.MyChatMember)
 		return true
@@ -483,6 +497,9 @@ func (w *TelegramChannel) processRawUpdate(ctx context.Context, upd rawUpdate, h
 
 	if err := handler(ctx, msg); err != nil {
 		slog.Error("message processing failed", "error", err, "update_id", upd.UpdateID)
+		if msg.Kind == model.MessageKindGroup {
+			return false
+		}
 	}
 	return true
 }

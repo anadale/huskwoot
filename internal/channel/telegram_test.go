@@ -102,9 +102,9 @@ func (m *mockBot) MakeRequest(endpoint string, params tgbotapi.Params) (*tgbotap
 
 // mockStateStore implements model.StateStore in memory for testing.
 type mockStateStore struct {
-	mu               sync.Mutex
-	cursors          map[string]*model.Cursor
-	saveCursorCalls  int
+	mu              sync.Mutex
+	cursors         map[string]*model.Cursor
+	saveCursorCalls int
 }
 
 func newMockStateStore() *mockStateStore {
@@ -2575,7 +2575,7 @@ func (m *mockForwardBufferFull) LoadBatch(_ context.Context, _ string) ([]model.
 	return nil, nil
 }
 
-func (m *mockForwardBufferFull) DeleteBatchTx(_ context.Context, _ *sql.Tx, _ string) error {
+func (m *mockForwardBufferFull) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error {
 	return nil
 }
 
@@ -3228,35 +3228,93 @@ func TestWatch_BatchCursorStopsAtFirstFalse(t *testing.T) {
 	}
 }
 
-// TestWatch_HandlerErrorStillSavesCursor verifies that a handler error does not block
-// cursor advancement — under the at-least-once semantics, handler errors are logged but
-// the update is considered processed and the cursor advances.
-func TestWatch_HandlerErrorStillSavesCursor(t *testing.T) {
-	const groupID int64 = -100
+// A failed group handler must retain its update until durable processing succeeds.
+func TestWatch_GroupHandlerFailureRetriesWithoutAcknowledging(t *testing.T) {
 	bot := newMockBot(0)
 	state := newMockStateStore()
-
-	chat := makeChat(groupID, "Чат")
-	user := makeUser(1, "u", "", "")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	bot.cancelFn = cancel
-	bot.setUpdates([]rawUpdate{makeRawUpdate(7, makeMessage(1, chat, user, "тест", 1000))})
-
-	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
-	_ = w.Watch(ctx, func(_ context.Context, _ model.Message) error {
-		return errors.New("pipeline error")
-	})
-
-	state.mu.Lock()
-	cursor := state.cursors[telegramStateKey]
-	state.mu.Unlock()
-
-	if cursor == nil {
-		t.Fatal("cursor must be saved even when handler returns error")
+	chat := makeChat(-100, "Group")
+	user := makeUser(1, "user", "", "")
+	update := func(id int) rawUpdate {
+		return makeRawUpdate(id, makeMessage(id, chat, user, "Promise", 1000))
 	}
-	if cursor.MessageID != "7" {
-		t.Errorf("cursor: want %q, got %q", "7", cursor.MessageID)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := 0
+	bot.makeReqResponder = func(endpoint string, params tgbotapi.Params) (*tgbotapi.APIResponse, error) {
+		if endpoint != "getUpdates" {
+			t.Fatalf("unexpected request %s", endpoint)
+		}
+		requests++
+		var batch []rawUpdate
+		switch requests {
+		case 1:
+			batch = []rawUpdate{update(6), update(7), update(8)}
+		case 2:
+			if params["offset"] != "7" {
+				t.Fatalf("failed update acknowledged by offset %s", params["offset"])
+			}
+			cursor, _ := state.GetCursor(ctx, telegramStateKey)
+			if cursor == nil || cursor.MessageID != "6" {
+				t.Fatalf("cursor advanced past failed update: %v", cursor)
+			}
+			batch = []rawUpdate{update(7), update(8)}
+		default:
+			if params["offset"] != "9" {
+				t.Fatalf("successful retry not acknowledged: offset=%s", params["offset"])
+			}
+			cancel()
+		}
+		data, err := json.Marshal(batch)
+		return &tgbotapi.APIResponse{Ok: true, Result: data}, err
+	}
+	w := newTelegramChannel(bot, TelegramChannelConfig{OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	waits := 0
+	w.sleeper = func(ctx context.Context, delay time.Duration) error {
+		if delay <= 0 {
+			t.Fatal("failed processing retried without delay")
+		}
+		waits++
+		return ctx.Err()
+	}
+	attempts := make(map[string]int)
+	completed := make(map[string]int)
+	err := w.Watch(ctx, func(_ context.Context, msg model.Message) error {
+		attempts[msg.ID]++
+		if msg.ID == "7" && attempts[msg.ID] == 1 {
+			return errors.New("database unavailable")
+		}
+		completed[msg.ID]++
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Watch error=%v", err)
+	}
+	if waits != 1 || attempts["7"] != 2 {
+		t.Fatalf("waits=%d, failed update attempts=%d", waits, attempts["7"])
+	}
+	for _, id := range []string{"6", "7", "8"} {
+		if completed[id] != 1 {
+			t.Fatalf("update %s completed %d times", id, completed[id])
+		}
+	}
+	cursor, _ := state.GetCursor(context.Background(), telegramStateKey)
+	if cursor == nil || cursor.MessageID != "8" {
+		t.Fatalf("final cursor=%v", cursor)
+	}
+}
+
+func TestWatch_DMHandlerErrorStillSavesCursor(t *testing.T) {
+	bot := newMockBot(0)
+	state := newMockStateStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bot.cancelFn = cancel
+	bot.setUpdates([]rawUpdate{makeRawUpdate(7, makeMessage(1, makePrivateChat(12345), makeUser(12345, "owner", "", ""), "Hello", 1000))})
+	w := newTelegramChannel(bot, TelegramChannelConfig{OwnerIDs: []string{"12345"}, OnJoin: "monitor"}, state, nil, nil, HistoryConfig{})
+	_ = w.Watch(ctx, func(context.Context, model.Message) error { return errors.New("agent unavailable") })
+	cursor, _ := state.GetCursor(context.Background(), telegramStateKey)
+	if cursor == nil || cursor.MessageID != "7" {
+		t.Fatalf("DM handler error changed cursor behavior: %v", cursor)
 	}
 }
 

@@ -239,9 +239,8 @@ func (p PushConfig) Enabled() bool {
 	return p.RelayURL != "" && p.InstanceID != "" && p.InstanceSecret != ""
 }
 
-// TasksConfig describes retention windows and schedule for the closed-task
-// cleanup. The cleanup runs at most once per day at CleanupTime in the user
-// timezone (DateTime.Timezone).
+// TasksConfig describes automatic extraction thresholds and the daily cleanup
+// of closed tasks in the user's timezone (DateTime.Timezone).
 type TasksConfig struct {
 	// ClosedRetentionRaw is the period after closed_at before a done/cancelled
 	// task is physically deleted. Go duration string (e.g. "336h" = 14 days).
@@ -255,6 +254,13 @@ type TasksConfig struct {
 	// CleanupHour and CleanupMinute are the parsed components of CleanupTime.
 	CleanupHour   int `toml:"-"`
 	CleanupMinute int `toml:"-"`
+	// DuplicateThresholdRaw overrides the minimum sameness score for skipping a duplicate.
+	DuplicateThresholdRaw *float64 `toml:"duplicate_threshold"`
+	// ReviewThresholdRaw overrides the score below which a distinct obligation may be created.
+	ReviewThresholdRaw *float64 `toml:"review_threshold"`
+	// DuplicateThreshold and ReviewThreshold are normalized scores in (0, 1].
+	DuplicateThreshold float64 `toml:"-"`
+	ReviewThreshold    float64 `toml:"-"`
 }
 
 // DevicesConfig describes retention windows for client devices.
@@ -547,6 +553,19 @@ const defaultTaskCleanupTime = "04:00"
 // validateTasks validates and normalizes the [tasks] section.
 func (c *Config) validateTasks() error {
 	t := &c.Tasks
+	t.DuplicateThreshold = 0.95
+	t.ReviewThreshold = 0.70
+	if t.DuplicateThresholdRaw != nil {
+		t.DuplicateThreshold = *t.DuplicateThresholdRaw
+	}
+	if t.ReviewThresholdRaw != nil {
+		t.ReviewThreshold = *t.ReviewThresholdRaw
+	}
+	if math.IsNaN(t.DuplicateThreshold) || math.IsNaN(t.ReviewThreshold) ||
+		t.ReviewThreshold <= 0 || t.DuplicateThreshold > 1 ||
+		t.ReviewThreshold >= t.DuplicateThreshold {
+		return fmt.Errorf("tasks thresholds must satisfy 0 < review_threshold < duplicate_threshold <= 1")
+	}
 
 	if t.ClosedRetentionRaw == "" {
 		t.ClosedRetention = defaultTaskClosedRetention

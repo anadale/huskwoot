@@ -153,6 +153,21 @@ default = "evening"  # time-of-day marker used when a date is given without expl
 # # Time after revoke before the row is DELETEd from the store (default: 2160h = 90 days).
 # retention_period = "2160h"
 
+# Automatic Telegram task deduplication and closed-task cleanup.
+# Explicit agent/API creation and IMAP extraction are unaffected.
+# Scores are model estimates, not calibrated probabilities.
+#
+# [tasks]
+# # Skip only a same-obligation match without conflicts (default: 0.95).
+# duplicate_threshold = 0.95
+# # Create a distinct obligation below this score; otherwise ask the owner (default: 0.70).
+# # Required: 0 < review_threshold < duplicate_threshold <= 1.
+# review_threshold = 0.70
+# # Closed-task retention; "0s" disables the daily cleanup (default: 336h).
+# closed_retention = "336h"
+# # Local time in datetime.timezone (default: 04:00).
+# cleanup_time = "04:00"
+
 # Regular summaries of open tasks (optional).
 # Uncomment the [reminders.schedule] section to enable this feature.
 # Without it the bot will not send summaries on its own.

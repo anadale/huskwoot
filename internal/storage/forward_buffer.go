@@ -96,14 +96,20 @@ func (b *SQLiteForwardBuffer) LoadBatch(ctx context.Context, chatID string) ([]m
 	return entries, nil
 }
 
-// DeleteBatchTx deletes all entries for the given chat within the provided transaction.
-func (b *SQLiteForwardBuffer) DeleteBatchTx(ctx context.Context, tx *sql.Tx, chatID string) error {
-	_, err := tx.ExecContext(ctx,
-		`DELETE FROM forward_buffer WHERE chat_id = ?`,
-		chatID,
-	)
+// DeleteEntriesTx deletes only snapshot entries, preserving later arrivals in the chat.
+func (b *SQLiteForwardBuffer) DeleteEntriesTx(ctx context.Context, tx *sql.Tx, chatID string, messageIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	stmt, err := tx.PrepareContext(ctx, `DELETE FROM forward_buffer WHERE chat_id = ? AND message_id = ?`)
 	if err != nil {
-		return fmt.Errorf("deleting forward batch for chat %s: %w", chatID, err)
+		return fmt.Errorf("preparing forward snapshot deletion for chat %s: %w", chatID, err)
+	}
+	defer stmt.Close()
+	for _, messageID := range messageIDs {
+		if _, err := stmt.ExecContext(ctx, chatID, messageID); err != nil {
+			return fmt.Errorf("deleting forward entry (chat=%s msg=%s): %w", chatID, messageID, err)
+		}
 	}
 	return nil
 }

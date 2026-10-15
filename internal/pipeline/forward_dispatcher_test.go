@@ -43,7 +43,7 @@ func (m *mockBufferForDispatcher) LoadBatch(_ context.Context, chatID string) ([
 	return m.batches[chatID], nil
 }
 
-func (m *mockBufferForDispatcher) DeleteBatchTx(_ context.Context, _ *sql.Tx, _ string) error {
+func (m *mockBufferForDispatcher) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error {
 	return nil
 }
 
@@ -224,7 +224,7 @@ func (s *serialCheckBuffer) LoadBatch(_ context.Context, chatID string) ([]model
 	}
 	return s.batches[chatID], nil
 }
-func (s *serialCheckBuffer) DeleteBatchTx(_ context.Context, _ *sql.Tx, _ string) error { return nil }
+func (s *serialCheckBuffer) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error { return nil }
 func (s *serialCheckBuffer) ListPendingChats(_ context.Context, _ time.Time) ([]string, error) {
 	return nil, nil
 }
