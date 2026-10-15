@@ -32,9 +32,9 @@ flowchart TD
 | `MessageKindBatch` | Email from IMAP |
 | `MessageKindGroup` | Regular message in a Telegram group |
 | `MessageKindGroupDirect` | @mention or reply to a bot message; detected by `TelegramChannelConfig.BotID` |
-| `MessageKindForwardBatch` | Снимок пересланных сообщений из личного чата с ботом |
+| `MessageKindForwardBatch` | Snapshot of forwarded messages from the private chat with the bot |
 
-Реакции (`msg.ReactFn`): ✍️ после классификации Promise; 👍 для Group — только если действительно создана задача. Ожидающий решения кандидат не считается созданной задачей. При `reaction_enabled: false` callback равен `nil`.
+Reactions (`msg.ReactFn`): ✍️ after Promise classification; for Group, 👍 only when a task was actually created. A candidate awaiting a decision does not count as a created task. The callback is `nil` when `reaction_enabled: false`.
 
 `HistoryFn` is set for Group/GroupDirect/DM (when `history != nil`); `nil` for IMAP.
 
@@ -69,8 +69,8 @@ flowchart TD
 - `Extractor` — extracts structured tasks from a promise (`Extract`)
 - `MetaStore` — channel metadata (`Get`, `SetTx`)
 - `TaskStore` — project and task reads plus caller-owned transactional writes
-- `TaskDuplicateChecker` — оценка совпадения конкретного обязательства с переданными references
-- `AutoTaskService` — обработка автоматического извлечения, receipts и идемпотентных решений владельца
+- `TaskDuplicateChecker` — scores whether a specific obligation matches the supplied references
+- `AutoTaskService` — handles automatic extraction, receipts, and idempotent owner decisions
 - `Notifier` — sends a notification about a batch of tasks (`Notify`)
 - `History` — stores message history (`Add`, `RecentActivity`)
 - `StateStore` — persists read position (`GetCursor`, `SaveCursor`)
@@ -89,7 +89,7 @@ All data is stored in a single `huskwoot.db`. `storage.OpenDB` enables WAL mode,
 | `SQLiteDeviceStore` | — | Devices and bearer tokens |
 | `SQLiteEventStore` | `events` | Domain events with monotonic `seq` (AUTOINCREMENT) |
 | `SQLitePushQueue` | `push_queue` | Push jobs; `ON DELETE CASCADE` on `event_seq` |
-| `SQLiteAutoTaskStore` | `auto_task_inputs`, `auto_task_candidates` | Receipts входов и сохранённые кандидаты/решения |
+| `SQLiteAutoTaskStore` | `auto_task_inputs`, `auto_task_candidates` | Input receipts and persisted candidates/decisions |
 
 Human-readable task reference: `<slug>#<number>` (method `Task.DisplayID()`).
 
@@ -103,19 +103,19 @@ The use-case layer owns `*sql.DB` and transactions. Write method pattern:
 
 Atomicity of "entity + event + push_queue" is guaranteed by a single transaction. `Broker` does not write to the DB.
 
-### Автоматические задачи Telegram
+### Automatic Telegram Tasks
 
-`AutoTaskService.Submit` сравнивает кандидатов вне SQLite-транзакции. References включают все открытые задачи целевого проекта, закрытые за последние 14 дней и ожидающие/отклонённые кандидаты. Новые кандидаты одного извлечения последовательно добавляются к набору сравнения.
+`AutoTaskService.Submit` compares candidates outside the SQLite transaction. References include all open tasks in the target project, tasks closed within the last 14 days, and pending/rejected candidates. New candidates from the same extraction are added to the comparison set sequentially.
 
-Перед записью сервис перепроверяет revision событий. Если во время AI-запроса другой путь создал или изменил задачу, сравнение выполняется заново. `Submit` и `Decide` сериализованы в одном экземпляре сервиса; сетевой запрос не занимает единственное SQLite-соединение.
+Before writing, the service rechecks the event revision. If another path created or changed a task during the AI request, comparison runs again. `Submit` and `Decide` are serialized within a single service instance; the network request does not occupy the sole SQLite connection.
 
-В одной транзакции сохраняются receipts исходных сообщений, решения кандидатов, новые задачи, events и push queue. `Finalize` пересылок удаляет только message IDs обработанного снимка; новые сообщения не затрагиваются. Ключ receipt включает тип источника, account, chat, message ID и SHA-256 текста, поэтому повтор доставки пропускается, а правка сообщения проходит новую смысловую проверку.
+Source message receipts, candidate decisions, new tasks, events, and the push queue are persisted in one transaction. For forwarded messages, `Finalize` deletes only the message IDs in the processed snapshot; new messages are unaffected. A receipt key includes the source kind, account, chat, message ID, and SHA-256 of the text, so redelivery is skipped while an edited message undergoes a new semantic comparison.
 
-Состояния кандидата: `pending`, `created`, `rejected`, `duplicate`. До решения владельца `pending` отсутствует в `tasks`. Первый положительный ответ атомарно создаёт задачу и меняет состояние; повторный ответ возвращает сохранённый результат. Отказ также окончателен.
+Candidate states are `pending`, `created`, `rejected`, and `duplicate`. Until the owner decides, a `pending` candidate is absent from `tasks`. The first affirmative answer atomically creates a task and changes the state; subsequent answers return the persisted result. Rejection is also final.
 
-`RunTaskQuestions` доставляет неотправленные вопросы владельцу в личный чат. В callback передаётся стабильный UUID кандидата; проверяются владелец и личное сообщение, отправленное самим ботом. Сбой между отправкой в Telegram и сохранением message ID может повторить вопрос, но не создаёт вторую задачу. Настоящие emoji reactions для этого сценария не используются.
+`RunTaskQuestions` delivers unsent questions to the owner's private chat. The callback carries the candidate's stable UUID; validation checks the owner and the private message sent by the bot itself. A failure between sending to Telegram and saving the message ID may repeat the question, but does not create a second task. Actual emoji reactions are not used for this interaction.
 
-Group обрабатывается синхронно до подтверждения update. Ошибка обязательного сохранения не продвигает cursor; повтор выполняется с context-aware задержкой. DM/GroupDirect и IMAP сохраняют прежнюю очередь обработки.
+Group processing is synchronous, before the update is acknowledged, so polling may wait for the group's AI request. A failure to persist required data prevents cursor advancement; retries use a context-aware delay. DM/GroupDirect and IMAP retain their existing processing queue.
 
 ## Agent Tools
 

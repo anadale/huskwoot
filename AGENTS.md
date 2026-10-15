@@ -3,6 +3,7 @@
 ## General
 
 - All comments MUST be in English.
+- Project documentation, commit and release messages, and project communication MUST be in English. Language-specific i18n locale resources and paired prompts MUST remain in their declared target languages.
 - All code MUST be formatted with `gofmt`.
 - All code MUST be idiomatic Go.
 
@@ -97,17 +98,17 @@ The use-case layer owns `*sql.DB` and transactions. Write-method pattern:
 
 Atomicity of "entity + event + push_queue" is guaranteed by a single transaction. `Broker` does not write to the DB.
 
-### Защита от дублей автоматических задач
+### Automatic task deduplication
 
-`AutoTaskService` применяется только к автоматическому извлечению из Telegram Group/ForwardBatch. Явные команды агента, REST API и IMAP сохраняют прежнее поведение. Общие типы — `internal/model/auto_tasks.go`, интерфейсы — `internal/model/interfaces.go`, реализация — `internal/usecase/auto_tasks.go`.
+`AutoTaskService` applies only to automatic extraction from Telegram Group/ForwardBatch. Explicit agent commands, the REST API, and IMAP retain their existing behavior. Shared types live in `internal/model/auto_tasks.go`, interfaces in `internal/model/interfaces.go`, and the implementation in `internal/usecase/auto_tasks.go`.
 
-Smart-модель сравнивает кандидата со всеми открытыми задачами проекта, закрытыми за последние 14 дней и pending/rejected-кандидатами. Кандидаты одного извлечения также учитываются. `Task.Confidence` не используется как оценка дубля. При пустом наборе references задача создаётся без дополнительного AI-запроса.
+The smart model compares a candidate against all open tasks in the project, tasks closed within the last 14 days, and pending/rejected candidates. Candidates from the same extraction are also considered. `Task.Confidence` is not used as a duplicate score. When the reference set is empty, the task is created without an additional AI request.
 
-`same` с оценкой не ниже `tasks.duplicate_threshold` (по умолчанию 0.95), без конфликта и с open/pending/rejected reference пропускается. `different` ниже `tasks.review_threshold` (0.70), без конфликта создаётся. Остальное, включая ошибку сравнения, сохраняется как pending. Закрытое совпадение не разрешает автоматический пропуск.
+A `same` result with a score at or above `tasks.duplicate_threshold` (default 0.95), no conflict, and an open/pending/rejected reference is skipped. A `different` result below `tasks.review_threshold` (0.70) with no conflict is created. All other results, including comparison errors, are saved as pending. A match against a closed task does not permit automatic skipping.
 
-Владелец получает личный вопрос с inline-кнопками 👍/👎, а не с настоящими реакциями. `SetTaskCandidates` вызывается до старта `Watch`; `RunTaskQuestions` доставляет неотправленные вопросы. Callback обрабатывается до guard/history/forward/agent и проверяет владельца, личный чат и сообщение самого бота. `Decide` атомарно фиксирует первое решение; повтор не создаёт задачу.
+The owner receives a DM question with inline 👍/👎 buttons, not actual reactions. `SetTaskCandidates` is called before `Watch` starts; `RunTaskQuestions` delivers unsent questions. Callbacks are handled before guard/history/forward/agent processing and validate the owner, private chat, and bot-authored message. `Decide` atomically records the first decision; repeated callbacks do not create another task.
 
-Receipts, решения, задачи, события, push и `Finalize` буфера атомарны. AI вызывается вне транзакции; revision событий перепроверяется перед записью. Ключ receipt включает account/chat/message и hash текста. Group проходит синхронный intake до подтверждения update; DM/GroupDirect и IMAP остаются в очереди.
+Receipts, decisions, tasks, events, push jobs, and buffer `Finalize` are atomic. AI calls run outside the transaction; the event revision is rechecked before writing. The receipt key includes account/chat/message and a text hash. Group messages complete synchronous intake before the update is acknowledged; DM/GroupDirect and IMAP remain queued.
 
 ### Forward batch flow (Telegram 1:1 promises)
 
@@ -137,7 +138,7 @@ ForwardDispatcher (single-goroutine consumer)
 
 Pipeline `processForwardBatch`:
 1. Parse `triggerText` via `parseTriggerProjectHint` → resolve project or fallback Inbox.
-2. Exclude forwards with saved input receipts, then format the remaining snapshot via `FormatForwardBatch` → labeled block `[я, …]` / `[name, …]`.
+2. Exclude forwards with saved input receipts, then format the remaining snapshot via `FormatForwardBatch` → a labeled block identifying the owner or the sender by name.
 3. `ForwardClassifier.Classify` → `promise` | `skip`.
    - `skip`: `AutoTaskService.Submit` with no tasks persists receipts and clears only the snapshot via `DeleteEntriesTx`; reply "no promises found"; Telegram forwards are NOT deleted.
 4. `ForwardExtractor.Extract` → `[]model.Task`.
@@ -152,7 +153,7 @@ Transactional invariant: "decisions + tasks + snapshot buffer clear" are atomic.
 
 **Cursor contract (at-least-once):** The update cursor is saved once per batch after the full batch is processed. If `processRawUpdate` returns `false` for update N, the cursor advances only to update N−1. This ensures at-least-once delivery: on crash mid-batch, updates from that batch are redelivered on restart. Pipeline idempotency absorbs duplicates.
 
-Для Group `watchHandler` ждёт `Pipeline.Process` до подтверждения входа. Ошибка Group handler или сохранения callback возвращает `false`; повтор выполняется с context-aware задержкой. Нельзя заменить Group intake одним enqueue в `msgCh`: тогда ошибка сохранения возникает уже после продвижения cursor.
+For Group messages, `watchHandler` waits for `Pipeline.Process` before acknowledging the input. A Group handler error or callback persistence error returns `false`; retries use a context-aware delay. Group intake MUST NOT be replaced with a simple enqueue to `msgCh`: persistence errors would then occur after the cursor has advanced.
 
 **Backoff on getUpdates errors:** Starts at 1 second, doubles on each consecutive error up to 30 seconds max (`1s → 2s → 4s … 30s`). If the Telegram API returns `RetryAfter`, that duration is used directly. Resets to 1 second on the first successful response.
 
@@ -162,7 +163,7 @@ Transactional invariant: "decisions + tasks + snapshot buffer clear" are atomic.
 
 - `SimpleClassifier` (Batch) — `promise` or `skip`
 - `GroupClassifier` (Group) — `promise` or `skip`
-- `ForwardClassifier` (ForwardBatch) — `promise` or `skip`; focuses on promises made by the owner (`[я, …]` lines)
+- `ForwardClassifier` (ForwardBatch) — `promise` or `skip`; focuses on promises made by the owner (lines labeled as the owner)
 
 ### MetaStore and project binding
 
