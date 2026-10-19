@@ -41,7 +41,7 @@ func (s *pipelineAutoTasks) Submit(ctx context.Context, in model.AutoTaskSubmiss
 		}
 	} else {
 		for _, r := range in.Tasks {
-			result.Created = append(result.Created, model.Task{Summary: r.Summary, Details: r.Details, Topic: r.Topic, Deadline: r.Deadline, Source: r.Source, ProjectID: in.ProjectID})
+			result.Created = append(result.Created, model.Task{Summary: r.Summary, Details: r.Details, Topic: r.Topic, Deadline: r.Deadline, Priority: r.Priority, Source: r.Source, SourceDetails: r.SourceDetails, ProjectID: in.ProjectID})
 		}
 	}
 	if in.Finalize != nil {

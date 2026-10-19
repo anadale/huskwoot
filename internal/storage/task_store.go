@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -310,10 +312,17 @@ func (s *SQLiteTaskStore) FindProjectByName(ctx context.Context, name string) (*
 
 // CreateTaskTx creates a new task within the given transaction.
 // Atomically increments the project's task_counter and assigns the number to the task.
-// Populates ID, Number, Status, CreatedAt, UpdatedAt.
+// Populates ID, Number, Status, CreatedAt, UpdatedAt and replaces SourceDetails
+// with its capped copy (see model.TaskSourceDetails.Capped).
 func (s *SQLiteTaskStore) CreateTaskTx(ctx context.Context, tx *sql.Tx, task *model.Task) error {
 	if task.ProjectID == "" {
 		return fmt.Errorf("CreateTask: project_id is required")
+	}
+
+	task.SourceDetails = task.SourceDetails.Capped()
+	sourceDetails, err := encodeSourceDetails(task.SourceDetails)
+	if err != nil {
+		return fmt.Errorf("CreateTask: %w", err)
 	}
 
 	var counter int
@@ -341,13 +350,14 @@ func (s *SQLiteTaskStore) CreateTaskTx(ctx context.Context, tx *sql.Tx, task *mo
 	task.UpdatedAt = now
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO tasks (id, project_id, number, summary, details, topic, status, deadline, created_at, updated_at, source_kind, source_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (id, project_id, number, summary, details, topic, status, deadline, created_at, updated_at, source_kind, source_id, priority, source_details)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		task.ID, task.ProjectID, task.Number,
 		task.Summary, task.Details, task.Topic, task.Status,
 		nullableTime(task.Deadline),
 		now.Format(time.RFC3339), now.Format(time.RFC3339),
 		task.Source.Kind, task.Source.ID,
+		int(task.Priority), sourceDetails,
 	); err != nil {
 		return fmt.Errorf("INSERT task %q: %w", task.Summary, err)
 	}
@@ -358,8 +368,7 @@ func (s *SQLiteTaskStore) CreateTaskTx(ctx context.Context, tx *sql.Tx, task *mo
 // GetTask returns a task by UUID. Returns nil, nil if not found.
 func (s *SQLiteTaskStore) GetTask(ctx context.Context, id string) (*model.Task, error) {
 	return s.scanTask(ctx, s.db.QueryRowContext(ctx,
-		`SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
-		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+		`SELECT `+taskSelectColumns+`
 		 FROM tasks t JOIN projects p ON t.project_id = p.id
 		 WHERE t.id = ?`, id,
 	), id)
@@ -368,8 +377,7 @@ func (s *SQLiteTaskStore) GetTask(ctx context.Context, id string) (*model.Task, 
 // GetTaskTx reads a task by UUID within the given transaction.
 func (s *SQLiteTaskStore) GetTaskTx(ctx context.Context, tx *sql.Tx, id string) (*model.Task, error) {
 	return s.scanTask(ctx, tx.QueryRowContext(ctx,
-		`SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
-		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+		`SELECT `+taskSelectColumns+`
 		 FROM tasks t JOIN projects p ON t.project_id = p.id
 		 WHERE t.id = ?`, id,
 	), id)
@@ -380,63 +388,114 @@ func (s *SQLiteTaskStore) GetTaskTx(ctx context.Context, tx *sql.Tx, id string) 
 func (s *SQLiteTaskStore) GetTaskByRef(ctx context.Context, projectSlug string, number int) (*model.Task, error) {
 	ref := fmt.Sprintf("%s#%d", projectSlug, number)
 	return s.scanTask(ctx, s.db.QueryRowContext(ctx,
-		`SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
-		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+		`SELECT `+taskSelectColumns+`
 		 FROM tasks t JOIN projects p ON t.project_id = p.id
 		 WHERE p.slug = ? AND t.number = ?`, projectSlug, number,
 	), ref)
 }
 
+// taskSelectColumns is the column list shared by every task SELECT
+// (FROM tasks t JOIN projects p). Its order matches scanTaskColumns.
+const taskSelectColumns = `t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
+		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id,
+		        t.priority, t.source_details`
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
 // scanTask scans a task row from a SELECT query with a JOIN on projects.
 func (s *SQLiteTaskStore) scanTask(ctx context.Context, row *sql.Row, ref any) (*model.Task, error) {
-	var task model.Task
-	var createdAtStr, updatedAtStr string
-	var deadlineStr, closedAtStr *string
-
-	err := row.Scan(
-		&task.ID, &task.ProjectID, &task.ProjectSlug, &task.Number,
-		&task.Summary, &task.Details, &task.Topic, &task.Status,
-		&deadlineStr, &closedAtStr,
-		&createdAtStr, &updatedAtStr,
-		&task.Source.Kind, &task.Source.ID,
-	)
+	task, err := scanTaskColumns(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("getting task %v: %w", ref, err)
 	}
+	return &task, nil
+}
 
+// scanTaskColumns scans and parses a single row selected with taskSelectColumns.
+// The sql.ErrNoRows error from a *sql.Row is returned unwrapped.
+func scanTaskColumns(row rowScanner) (model.Task, error) {
+	var task model.Task
+	var createdAtStr, updatedAtStr, sourceDetails string
+	var deadlineStr, closedAtStr *string
+	var priority int
+
+	if err := row.Scan(
+		&task.ID, &task.ProjectID, &task.ProjectSlug, &task.Number,
+		&task.Summary, &task.Details, &task.Topic, &task.Status,
+		&deadlineStr, &closedAtStr,
+		&createdAtStr, &updatedAtStr,
+		&task.Source.Kind, &task.Source.ID,
+		&priority, &sourceDetails,
+	); err != nil {
+		return model.Task{}, err
+	}
+
+	var err error
 	task.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
 	if err != nil {
-		return nil, fmt.Errorf("parsing created_at for task %v: %w", ref, err)
+		return model.Task{}, fmt.Errorf("parsing created_at: %w", err)
 	}
 	task.UpdatedAt, err = time.Parse(time.RFC3339, updatedAtStr)
 	if err != nil {
-		return nil, fmt.Errorf("parsing updated_at for task %v: %w", ref, err)
+		return model.Task{}, fmt.Errorf("parsing updated_at: %w", err)
 	}
 	if deadlineStr != nil {
 		dl, err := time.Parse(time.RFC3339, *deadlineStr)
 		if err != nil {
-			return nil, fmt.Errorf("parsing deadline for task %v: %w", ref, err)
+			return model.Task{}, fmt.Errorf("parsing deadline: %w", err)
 		}
 		task.Deadline = &dl
 	}
 	if closedAtStr != nil {
 		ca, err := parseClosedAt(*closedAtStr)
 		if err != nil {
-			return nil, fmt.Errorf("parsing closed_at for task %v: %w", ref, err)
+			return model.Task{}, fmt.Errorf("parsing closed_at: %w", err)
 		}
 		task.ClosedAt = &ca
 	}
-	return &task, nil
+	task.Priority = model.TaskPriority(priority)
+	task.SourceDetails = decodeSourceDetails(task.ID, sourceDetails)
+	return task, nil
+}
+
+// encodeSourceDetails serializes source details for the tasks.source_details
+// column; nil details are stored as an empty string.
+func encodeSourceDetails(d *model.TaskSourceDetails) (string, error) {
+	if d == nil {
+		return "", nil
+	}
+	data, err := json.Marshal(d)
+	if err != nil {
+		return "", fmt.Errorf("encoding source details: %w", err)
+	}
+	return string(data), nil
+}
+
+// decodeSourceDetails parses the tasks.source_details column. An empty value
+// yields nil; malformed JSON is logged and also yields nil so that a single
+// corrupted snapshot never fails a task read.
+func decodeSourceDetails(taskID, raw string) *model.TaskSourceDetails {
+	if raw == "" {
+		return nil
+	}
+	var d model.TaskSourceDetails
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		slog.Warn("ignoring malformed task source details", "task_id", taskID, "error", err)
+		return nil
+	}
+	return &d
 }
 
 // ListTasks returns tasks matching the filter.
 // projectID="" means all projects.
 func (s *SQLiteTaskStore) ListTasks(ctx context.Context, projectID string, filter model.TaskFilter) ([]model.Task, error) {
-	query := `SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
-	                 t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+	query := `SELECT ` + taskSelectColumns + `
 	          FROM tasks t JOIN projects p ON t.project_id = p.id WHERE 1=1`
 	var args []any
 
@@ -468,43 +527,10 @@ func (s *SQLiteTaskStore) ListTasks(ctx context.Context, projectID string, filte
 
 	var tasks []model.Task
 	for rows.Next() {
-		var task model.Task
-		var createdAtStr, updatedAtStr string
-		var deadlineStr, closedAtStr *string
-
-		if err := rows.Scan(
-			&task.ID, &task.ProjectID, &task.ProjectSlug, &task.Number,
-			&task.Summary, &task.Details, &task.Topic, &task.Status,
-			&deadlineStr, &closedAtStr,
-			&createdAtStr, &updatedAtStr,
-			&task.Source.Kind, &task.Source.ID,
-		); err != nil {
+		task, err := scanTaskColumns(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning task: %w", err)
 		}
-
-		task.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
-		if err != nil {
-			return nil, fmt.Errorf("parsing created_at: %w", err)
-		}
-		task.UpdatedAt, err = time.Parse(time.RFC3339, updatedAtStr)
-		if err != nil {
-			return nil, fmt.Errorf("parsing updated_at: %w", err)
-		}
-		if deadlineStr != nil {
-			dl, err := time.Parse(time.RFC3339, *deadlineStr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing deadline: %w", err)
-			}
-			task.Deadline = &dl
-		}
-		if closedAtStr != nil {
-			ca, err := parseClosedAt(*closedAtStr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing closed_at: %w", err)
-			}
-			task.ClosedAt = &ca
-		}
-
 		tasks = append(tasks, task)
 	}
 	if err := rows.Err(); err != nil {
@@ -569,6 +595,10 @@ func (s *SQLiteTaskStore) UpdateTaskTx(ctx context.Context, tx *sql.Tx, id strin
 			args = append(args, (*update.Deadline).Format(time.RFC3339))
 		}
 	}
+	if update.Priority != nil {
+		setClauses = append(setClauses, "priority = ?")
+		args = append(args, int(*update.Priority))
+	}
 
 	query := "UPDATE tasks SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
 	args = append(args, id)
@@ -632,8 +662,7 @@ func (s *SQLiteTaskStore) MoveTaskTx(ctx context.Context, tx *sql.Tx, taskID, ne
 // closed_at are skipped — their close time is unknown.
 func (s *SQLiteTaskStore) ListClosedOlderThan(ctx context.Context, cutoff time.Time) ([]model.Task, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT t.id, t.project_id, p.slug, t.number, t.summary, t.details, t.topic,
-		        t.status, t.deadline, t.closed_at, t.created_at, t.updated_at, t.source_kind, t.source_id
+		`SELECT `+taskSelectColumns+`
 		 FROM tasks t JOIN projects p ON t.project_id = p.id
 		 WHERE t.status IN ('done', 'cancelled')
 		   AND t.closed_at IS NOT NULL
@@ -648,43 +677,10 @@ func (s *SQLiteTaskStore) ListClosedOlderThan(ctx context.Context, cutoff time.T
 
 	var tasks []model.Task
 	for rows.Next() {
-		var task model.Task
-		var createdAtStr, updatedAtStr string
-		var deadlineStr, closedAtStr *string
-
-		if err := rows.Scan(
-			&task.ID, &task.ProjectID, &task.ProjectSlug, &task.Number,
-			&task.Summary, &task.Details, &task.Topic, &task.Status,
-			&deadlineStr, &closedAtStr,
-			&createdAtStr, &updatedAtStr,
-			&task.Source.Kind, &task.Source.ID,
-		); err != nil {
+		task, err := scanTaskColumns(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning closed task: %w", err)
 		}
-
-		task.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
-		if err != nil {
-			return nil, fmt.Errorf("parsing created_at: %w", err)
-		}
-		task.UpdatedAt, err = time.Parse(time.RFC3339, updatedAtStr)
-		if err != nil {
-			return nil, fmt.Errorf("parsing updated_at: %w", err)
-		}
-		if deadlineStr != nil {
-			dl, err := time.Parse(time.RFC3339, *deadlineStr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing deadline: %w", err)
-			}
-			task.Deadline = &dl
-		}
-		if closedAtStr != nil {
-			ca, err := parseClosedAt(*closedAtStr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing closed_at: %w", err)
-			}
-			task.ClosedAt = &ca
-		}
-
 		tasks = append(tasks, task)
 	}
 	if err := rows.Err(); err != nil {

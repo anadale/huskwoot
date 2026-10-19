@@ -112,19 +112,37 @@ func (h *tasksTestHarness) do(method, target string, body any) *httptest.Respons
 
 // taskResp describes the task snapshot in /v1/tasks/* responses.
 type taskResp struct {
-	ID          string     `json:"id"`
-	Number      int        `json:"number"`
-	Ref         string     `json:"ref"`
-	ProjectID   string     `json:"projectId"`
-	ProjectSlug string     `json:"projectSlug"`
-	Summary     string     `json:"summary"`
-	Details     string     `json:"details"`
-	Topic       string     `json:"topic"`
-	Status      string     `json:"status"`
-	Deadline    *time.Time `json:"deadline,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	ClosedAt    *time.Time `json:"closedAt,omitempty"`
+	ID          string          `json:"id"`
+	Number      int             `json:"number"`
+	Ref         string          `json:"ref"`
+	ProjectID   string          `json:"projectId"`
+	ProjectSlug string          `json:"projectSlug"`
+	Summary     string          `json:"summary"`
+	Details     string          `json:"details"`
+	Topic       string          `json:"topic"`
+	Status      string          `json:"status"`
+	Priority    int             `json:"priority"`
+	Deadline    *time.Time      `json:"deadline,omitempty"`
+	Source      *taskSourceResp `json:"source,omitempty"`
+	CreatedAt   time.Time       `json:"createdAt"`
+	UpdatedAt   time.Time       `json:"updatedAt"`
+	ClosedAt    *time.Time      `json:"closedAt,omitempty"`
+}
+
+// taskSourceResp describes the task source in /v1/tasks/* responses.
+type taskSourceResp struct {
+	Kind    string     `json:"kind"`
+	Name    string     `json:"name"`
+	Subject string     `json:"subject"`
+	Author  string     `json:"author"`
+	Text    string     `json:"text"`
+	At      *time.Time `json:"at"`
+	ReplyTo *struct {
+		Author string `json:"author"`
+		Text   string `json:"text"`
+	} `json:"replyTo"`
+	Link string `json:"link"`
+	Via  string `json:"via"`
 }
 
 type listResp struct {
@@ -360,6 +378,209 @@ func TestCreateTaskIntoInboxIfNoProjectID(t *testing.T) {
 	}
 	if resp.Status != "open" {
 		t.Fatalf("status=%q, want open", resp.Status)
+	}
+}
+
+func TestCreateTaskStoresClientSourceAndVia(t *testing.T) {
+	h := newTasksHarness(t)
+
+	rec := h.do(http.MethodPost, "/v1/tasks", map[string]any{"summary": "из REST"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp taskResp
+	decodeJSONResp(t, rec.Body, &resp)
+
+	task, err := h.taskSvc.GetTask(context.Background(), resp.ID)
+	if err != nil || task == nil {
+		t.Fatalf("GetTask: %v %v", task, err)
+	}
+	if task.Source.Kind != "client" || task.Source.ID != h.device.ID {
+		t.Errorf("source=%+v, want client source for device %q", task.Source, h.device.ID)
+	}
+	if task.SourceDetails == nil || task.SourceDetails.Via != model.SourceViaAPI {
+		t.Fatalf("source details=%+v, want via %q", task.SourceDetails, model.SourceViaAPI)
+	}
+	if task.SourceDetails.Text != "" || task.SourceDetails.Author != "" || task.SourceDetails.At != nil {
+		t.Errorf("source details=%+v, want only via", task.SourceDetails)
+	}
+}
+
+func TestGetTaskReturnsPriorityAndSource(t *testing.T) {
+	h := newTasksHarness(t)
+	ctx := context.Background()
+
+	at := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
+	task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{
+		Summary:  "починить деплой",
+		Priority: model.TaskPriorityMedium,
+		Source:   model.Source{Kind: "telegram", ID: "-1001234567890", Name: "Команда"},
+		SourceDetails: &model.TaskSourceDetails{
+			Name:    "Команда",
+			Author:  "Алиса",
+			Text:    "Завтра починю деплой",
+			At:      &at,
+			ReplyTo: &model.TaskSourceQuote{Author: "Боб", Text: "Кто починит деплой?"},
+			Link:    "https://t.me/c/1234567890/42",
+			Via:     model.SourceViaMessage,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	for _, target := range []string{"/v1/tasks/" + task.ID, "/v1/tasks/by-ref/inbox-1"} {
+		t.Run(target, func(t *testing.T) {
+			rec := h.do(http.MethodGet, target, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+			}
+			var resp taskResp
+			decodeJSONResp(t, rec.Body, &resp)
+			if resp.Priority != 2 {
+				t.Errorf("priority=%d, want 2", resp.Priority)
+			}
+			src := resp.Source
+			if src == nil {
+				t.Fatal("source is missing")
+			}
+			if src.Kind != "telegram" || src.Name != "Команда" || src.Author != "Алиса" ||
+				src.Text != "Завтра починю деплой" || src.Link != "https://t.me/c/1234567890/42" ||
+				src.Via != model.SourceViaMessage || src.Subject != "" {
+				t.Errorf("source=%+v", src)
+			}
+			if src.At == nil || !src.At.Equal(at) {
+				t.Errorf("source.at=%v, want %v", src.At, at)
+			}
+			if src.ReplyTo == nil || src.ReplyTo.Author != "Боб" || src.ReplyTo.Text != "Кто починит деплой?" {
+				t.Errorf("source.replyTo=%+v", src.ReplyTo)
+			}
+		})
+	}
+
+	rec := h.do(http.MethodGet, "/v1/tasks", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var list listResp
+	decodeJSONResp(t, rec.Body, &list)
+	if len(list.Tasks) != 1 || list.Tasks[0].Priority != 2 || list.Tasks[0].Source == nil ||
+		list.Tasks[0].Source.Author != "Алиса" {
+		t.Fatalf("list tasks=%+v, want the task with priority and source", list.Tasks)
+	}
+}
+
+func TestGetTaskWithoutSourceOmitsSourceAndKeepsPriority(t *testing.T) {
+	h := newTasksHarness(t)
+
+	task, err := h.taskSvc.CreateTask(context.Background(), model.CreateTaskRequest{Summary: "без источника"})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	rec := h.do(http.MethodGet, "/v1/tasks/"+task.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	decodeJSONResp(t, rec.Body, &raw)
+	if got := string(raw["priority"]); got != "0" {
+		t.Errorf("priority=%q, want 0 (always present)", got)
+	}
+	if v, ok := raw["source"]; ok {
+		t.Errorf("source=%s, want the key omitted", v)
+	}
+}
+
+func TestCreateTaskPriority(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]any
+		want model.TaskPriority
+	}{
+		{name: "without priority", body: map[string]any{"summary": "обычная"}, want: model.TaskPriorityNone},
+		{name: "explicit zero", body: map[string]any{"summary": "ноль", "priority": 0}, want: model.TaskPriorityNone},
+		{name: "low", body: map[string]any{"summary": "низкая", "priority": 1}, want: model.TaskPriorityLow},
+		{name: "high", body: map[string]any{"summary": "срочная", "priority": 3}, want: model.TaskPriorityHigh},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTasksHarness(t)
+
+			rec := h.do(http.MethodPost, "/v1/tasks", tc.body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status=%d, want 201; body=%s", rec.Code, rec.Body.String())
+			}
+			var resp taskResp
+			decodeJSONResp(t, rec.Body, &resp)
+			if resp.Priority != int(tc.want) {
+				t.Errorf("response priority=%d, want %d", resp.Priority, tc.want)
+			}
+			if resp.Source == nil || resp.Source.Kind != "client" || resp.Source.Via != model.SourceViaAPI {
+				t.Errorf("response source=%+v, want kind client via api", resp.Source)
+			}
+
+			task, err := h.taskSvc.GetTask(context.Background(), resp.ID)
+			if err != nil || task == nil {
+				t.Fatalf("GetTask: %v %v", task, err)
+			}
+			if task.Priority != tc.want {
+				t.Errorf("stored priority=%d, want %d", task.Priority, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateTaskPatchesPriority(t *testing.T) {
+	h := newTasksHarness(t)
+	ctx := context.Background()
+
+	task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "приоритет", Priority: model.TaskPriorityHigh})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	steps := []struct {
+		name       string
+		body       map[string]any
+		wantStatus int
+		want       model.TaskPriority
+	}{
+		{name: "lower to low", body: map[string]any{"priority": 1}, wantStatus: http.StatusOK, want: model.TaskPriorityLow},
+		{name: "out of range keeps value", body: map[string]any{"priority": 7}, wantStatus: http.StatusUnprocessableEntity, want: model.TaskPriorityLow},
+		{name: "wrong type keeps value", body: map[string]any{"priority": "high"}, wantStatus: http.StatusUnprocessableEntity, want: model.TaskPriorityLow},
+		{name: "with summary", body: map[string]any{"priority": 2, "summary": "приоритет 2"}, wantStatus: http.StatusOK, want: model.TaskPriorityMedium},
+		{name: "reset to zero", body: map[string]any{"priority": 0}, wantStatus: http.StatusOK, want: model.TaskPriorityNone},
+	}
+	for _, step := range steps {
+		rec := h.do(http.MethodPatch, "/v1/tasks/"+task.ID, step.body)
+		if rec.Code != step.wantStatus {
+			t.Fatalf("%s: status=%d, want %d; body=%s", step.name, rec.Code, step.wantStatus, rec.Body.String())
+		}
+		if rec.Code == http.StatusOK {
+			var resp taskResp
+			decodeJSONResp(t, rec.Body, &resp)
+			if resp.Priority != int(step.want) {
+				t.Errorf("%s: response priority=%d, want %d", step.name, resp.Priority, step.want)
+			}
+		} else {
+			var errResp struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			decodeJSONResp(t, rec.Body, &errResp)
+			if errResp.Error.Code != api.ErrorCodeUnprocessable {
+				t.Errorf("%s: error code=%q, want %q", step.name, errResp.Error.Code, api.ErrorCodeUnprocessable)
+			}
+		}
+		stored, err := h.taskSvc.GetTask(ctx, task.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("%s: GetTask: %v %v", step.name, stored, err)
+		}
+		if stored.Priority != step.want {
+			t.Errorf("%s: stored priority=%d, want %d", step.name, stored.Priority, step.want)
+		}
 	}
 }
 
@@ -617,6 +838,19 @@ func TestTasksValidationErrors(t *testing.T) {
 		{"not found by id", http.MethodGet, "/v1/tasks/unknown-uuid", nil, http.StatusNotFound},
 		{"move without project_id", http.MethodPost, "/v1/tasks/any-id/move", map[string]string{"projectId": ""}, http.StatusUnprocessableEntity},
 		{"patch unknown field", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"garbage": "new"}, http.StatusBadRequest},
+		{"unknown field with priority", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": 1, "garbage": true}, http.StatusBadRequest},
+		{"patch unknown field with priority", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": 1, "garbage": "new"}, http.StatusBadRequest},
+		{"priority above range", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": 4}, http.StatusUnprocessableEntity},
+		{"priority below range", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": -1}, http.StatusUnprocessableEntity},
+		{"priority string", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": "high"}, http.StatusUnprocessableEntity},
+		{"priority fraction", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": 1.5}, http.StatusUnprocessableEntity},
+		{"priority null", http.MethodPost, "/v1/tasks", map[string]any{"summary": "X", "priority": nil}, http.StatusUnprocessableEntity},
+		{"patch priority above range", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": 4}, http.StatusUnprocessableEntity},
+		{"patch priority below range", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": -1}, http.StatusUnprocessableEntity},
+		{"patch priority string", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": "2"}, http.StatusUnprocessableEntity},
+		{"patch priority fraction", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": 2.5}, http.StatusUnprocessableEntity},
+		{"patch priority bool", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": true}, http.StatusUnprocessableEntity},
+		{"patch priority null", http.MethodPatch, "/v1/tasks/any-id", map[string]any{"priority": nil}, http.StatusUnprocessableEntity},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

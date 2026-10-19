@@ -982,6 +982,14 @@ func (m *mockHistory) AddTx(_ context.Context, _ *sql.Tx, source string, entry m
 	return "mock-message-id", m.addErr
 }
 
+func (m *mockHistory) SetTaskIDs(_ context.Context, _ string, _ []string) error {
+	return nil
+}
+
+func (m *mockHistory) ListClient(_ context.Context, _, _ string, _ int) ([]model.HistoryEntry, string, error) {
+	return nil, "", nil
+}
+
 func (m *mockHistory) Recent(_ context.Context, _ string, _ int) ([]model.HistoryEntry, error) {
 	return m.recentResult, m.recentErr
 }

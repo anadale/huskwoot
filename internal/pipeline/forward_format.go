@@ -11,15 +11,18 @@ import (
 
 // FormatForwardBatch formats a slice of forwarded messages as a conversation
 // block suitable for LLM input. Messages are sorted by OriginalDate ascending,
-// with ReceivedAt as a stable tie-breaker.
+// with ReceivedAt as a stable tie-breaker, and every message is prefixed with
+// its 1-based number in that order so the extractor can point at the message
+// that contains a promise. The sorted entries are returned alongside the text:
+// entry i corresponds to message number i+1.
 //
 // Format:
 //
 //	Переписка между мной и {counterpart}:
 //
-//	[я, YYYY-MM-DD HH:MM] text
-//	[Name, YYYY-MM-DD HH:MM] text
-func FormatForwardBatch(forwards []model.ForwardEntry, counterpart string, loc *time.Location) string {
+//	[1] [я, YYYY-MM-DD HH:MM] text
+//	[2] [Name, YYYY-MM-DD HH:MM] text
+func FormatForwardBatch(forwards []model.ForwardEntry, counterpart string, loc *time.Location) (string, []model.ForwardEntry) {
 	if loc == nil {
 		loc = time.UTC
 	}
@@ -43,7 +46,7 @@ func FormatForwardBatch(forwards []model.ForwardEntry, counterpart string, loc *
 	var sb strings.Builder
 	sb.WriteString(header)
 	sb.WriteString("\n")
-	for _, e := range sorted {
+	for i, e := range sorted {
 		sb.WriteString("\n")
 
 		var author string
@@ -56,7 +59,7 @@ func FormatForwardBatch(forwards []model.ForwardEntry, counterpart string, loc *
 		}
 
 		ts := e.OriginalDate.In(loc).Format("2006-01-02 15:04")
-		sb.WriteString(fmt.Sprintf("[%s, %s] ", author, ts))
+		sb.WriteString(fmt.Sprintf("[%d] [%s, %s] ", i+1, author, ts))
 
 		if e.Text == "" {
 			sb.WriteString("[голосовое/вложение]")
@@ -65,5 +68,5 @@ func FormatForwardBatch(forwards []model.ForwardEntry, counterpart string, loc *
 		}
 	}
 
-	return sb.String()
+	return sb.String(), sorted
 }

@@ -78,8 +78,8 @@ func TestForwardDispatcher_EmptyBuffer_PipelineNotCalled(t *testing.T) {
 	}()
 
 	d.Submit(model.ForwardDispatchSignal{
-		ChatID: "chat-empty",
-		Source: "test",
+		ChatID:  "chat-empty",
+		Source:  "test",
 		ReplyFn: func(_ context.Context, _ string) error { return nil },
 	})
 
@@ -224,7 +224,9 @@ func (s *serialCheckBuffer) LoadBatch(_ context.Context, chatID string) ([]model
 	}
 	return s.batches[chatID], nil
 }
-func (s *serialCheckBuffer) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error { return nil }
+func (s *serialCheckBuffer) DeleteEntriesTx(_ context.Context, _ *sql.Tx, _ string, _ []string) error {
+	return nil
+}
 func (s *serialCheckBuffer) ListPendingChats(_ context.Context, _ time.Time) ([]string, error) {
 	return nil, nil
 }

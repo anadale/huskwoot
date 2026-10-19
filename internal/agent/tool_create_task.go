@@ -40,6 +40,7 @@ func (t *createTaskTool) Parameters() map[string]any {
 			"project_id": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_create_task_param_project_id", nil)},
 			"project":    map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_create_task_param_project", nil)},
 			"deadline":   map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_create_task_param_deadline", nil)},
+			"priority":   priorityParam(huskwootI18n.Translate(t.loc, "tool_create_task_param_priority", nil)),
 		},
 		"required": []string{"summary"},
 	}
@@ -48,14 +49,20 @@ func (t *createTaskTool) DMOnly() bool { return false }
 
 func (t *createTaskTool) Execute(ctx context.Context, args string) (string, error) {
 	var params struct {
-		Summary   string `json:"summary"`
-		Details   string `json:"details"`
-		ProjectID string `json:"project_id"`
-		Project   string `json:"project"`
-		Deadline  string `json:"deadline"`
+		Summary   string          `json:"summary"`
+		Details   string          `json:"details"`
+		ProjectID string          `json:"project_id"`
+		Project   string          `json:"project"`
+		Deadline  string          `json:"deadline"`
+		Priority  json.RawMessage `json:"priority"`
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		return "", fmt.Errorf("parsing create_task args: %w", err)
+	}
+
+	priority, _, err := parsePriorityArg(params.Priority, t.loc)
+	if err != nil {
+		return "", err
 	}
 
 	pid := params.ProjectID
@@ -103,6 +110,15 @@ func (t *createTaskTool) Execute(ctx context.Context, args string) (string, erro
 		ProjectID: pid,
 		Summary:   params.Summary,
 		Details:   params.Details,
+		Priority:  priority,
+	}
+	if origin, ok := OriginMessageFromContext(ctx); ok {
+		via := model.SourceViaChat
+		if origin.VoiceJobID != "" {
+			via = model.SourceViaVoice
+		}
+		req.Source = origin.Source
+		req.SourceDetails = model.SourceDetailsFromMessage(origin, via)
 	}
 
 	if params.Deadline != "" {
@@ -124,11 +140,14 @@ func (t *createTaskTool) Execute(ctx context.Context, args string) (string, erro
 		return "", err
 	}
 
-	result, _ := json.Marshal(map[string]any{
+	data := map[string]any{
 		"id":         task.ID,
 		"display_id": task.DisplayID(),
 		"summary":    task.Summary,
-	})
+	}
+	addPriority(data, task.Priority)
+
+	result, _ := json.Marshal(data)
 	return string(result), nil
 }
 

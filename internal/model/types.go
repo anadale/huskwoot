@@ -2,8 +2,10 @@ package model
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 // MessageKind describes the type/context of a message.
@@ -162,6 +164,93 @@ type Message struct {
 	// uses it as the default project for new tasks if the message does not explicitly name another.
 	// Set only for client voice jobs that include a projectId in the request metadata.
 	ProjectHint *Project
+	// VoiceJobID is the voice job the message was transcribed from.
+	// Set by the client voice consumer; empty everywhere else.
+	VoiceJobID string
+}
+
+// TaskPriority is the task importance: 0 none, 1 low, 2 medium, 3 high.
+type TaskPriority int
+
+const (
+	// TaskPriorityNone means the priority is not set.
+	TaskPriorityNone TaskPriority = 0
+	// TaskPriorityLow is the lowest explicit priority.
+	TaskPriorityLow TaskPriority = 1
+	// TaskPriorityMedium is the medium priority.
+	TaskPriorityMedium TaskPriority = 2
+	// TaskPriorityHigh is the highest priority.
+	TaskPriorityHigh TaskPriority = 3
+)
+
+// Valid reports whether the priority is within the supported 0–3 range.
+func (p TaskPriority) Valid() bool {
+	return p >= TaskPriorityNone && p <= TaskPriorityHigh
+}
+
+const (
+	// MaxSourceTextRunes is the cap for TaskSourceDetails.Text.
+	MaxSourceTextRunes = 1000
+	// MaxSourceReplyTextRunes is the cap for TaskSourceDetails.ReplyTo.Text.
+	MaxSourceReplyTextRunes = 500
+)
+
+// TaskSourceDetails is a snapshot of the message a task was created from.
+// It is stored as JSON in tasks.source_details at creation time.
+type TaskSourceDetails struct {
+	// Name is the chat title or mailbox; empty for client sources.
+	Name string `json:"name,omitempty"`
+	// Subject is the email subject.
+	Subject string `json:"subject,omitempty"`
+	// Author is the display name of the promise message author.
+	Author string `json:"author,omitempty"`
+	// Text is the promise message text, capped at MaxSourceTextRunes.
+	Text string `json:"text,omitempty"`
+	// At is the time of the promise message.
+	At *time.Time `json:"at,omitempty"`
+	// ReplyTo is the message the promise replied to (if any).
+	ReplyTo *TaskSourceQuote `json:"replyTo,omitempty"`
+	// Link is a deep link to the message when the channel can build one.
+	Link string `json:"link,omitempty"`
+	// Via is how the task was created: "message", "forward", "chat", "voice" or "api".
+	Via string `json:"via"`
+}
+
+// TaskSourceQuote is the author and text of a quoted message.
+type TaskSourceQuote struct {
+	// Author is the display name of the quoted message author.
+	Author string `json:"author,omitempty"`
+	// Text is the quoted message text, capped at MaxSourceReplyTextRunes.
+	Text string `json:"text,omitempty"`
+}
+
+// Capped returns a copy of the details with Text and ReplyTo.Text truncated to
+// MaxSourceTextRunes and MaxSourceReplyTextRunes. Returns nil for nil details.
+func (d *TaskSourceDetails) Capped() *TaskSourceDetails {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	out.Text = capRunes(d.Text, MaxSourceTextRunes)
+	if d.ReplyTo != nil {
+		quote := *d.ReplyTo
+		quote.Text = capRunes(quote.Text, MaxSourceReplyTextRunes)
+		out.ReplyTo = &quote
+	}
+	if d.At != nil {
+		at := *d.At
+		out.At = &at
+	}
+	return &out
+}
+
+// capRunes truncates s to at most limit runes, ending with "…" when truncated.
+func capRunes(s string, limit int) string {
+	if limit <= 0 || utf8.RuneCountInString(s) <= limit {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:limit-1]) + "…"
 }
 
 // Task describes a task extracted from a user promise.
@@ -187,11 +276,19 @@ type Task struct {
 	Deadline *time.Time
 	// Confidence is the model's confidence in the extracted task (0.0–1.0).
 	Confidence float64
+	// Priority is the task importance (0–3); 0 means not set.
+	Priority TaskPriority
 	// Source is the technical identifier of the source channel.
 	Source Source
+	// SourceDetails is a persisted snapshot of the message the task was created from
+	// (nil when unknown).
+	SourceDetails *TaskSourceDetails
 	// SourceMessage is the original message containing the promise.
 	// Contains Subject (email subject for IMAP) and ReactFn/ReplyFn callbacks.
 	SourceMessage Message
+	// ForwardIndex is the 1-based number of the message with the promise inside a
+	// forward batch; 0 when unknown. In-memory only, never persisted.
+	ForwardIndex int
 	// CreatedAt is the time the task record was created.
 	CreatedAt time.Time
 	// UpdatedAt is the time the task was last updated.
@@ -248,6 +345,8 @@ type TaskUpdate struct {
 	Status *string
 	// Deadline is the new due date (nil means no change; pointer to nil clears the deadline).
 	Deadline **time.Time
+	// Priority is the new priority (nil means no change).
+	Priority *TaskPriority
 	// ClosedAt is the task close time (nil means no change; pointer to nil clears the field).
 	ClosedAt **time.Time
 }
@@ -264,15 +363,54 @@ type ProjectUpdate struct {
 	Aliases *[]string
 }
 
+// Client chat history roles. Channel history rows keep an empty role.
+const (
+	// HistoryRoleUser marks a message sent by the user from a client device.
+	HistoryRoleUser = "user"
+	// HistoryRoleAgent marks an agent reply.
+	HistoryRoleAgent = "agent"
+	// HistoryRoleSystem marks a service record such as a voice recognition failure.
+	// System rows are never fed into the agent context.
+	HistoryRoleSystem = "system"
+)
+
+// Client chat history message kinds.
+const (
+	// HistoryKindText is a plain text message; the default for every row.
+	HistoryKindText = "text"
+	// HistoryKindVoice is a transcript of a voice message.
+	HistoryKindVoice = "voice"
+	// HistoryKindError is a failure notice (for example, a voice job that could not be processed).
+	HistoryKindError = "error"
+)
+
 // HistoryEntry describes a single message history record stored in the store.
 type HistoryEntry struct {
+	// MessageID is the stored message identifier (UUID v4). Filled on read;
+	// ignored on write (the store generates it).
+	MessageID string
 	// AuthorName is the author's display name.
 	AuthorName string
 	// Text is the message body.
 	Text string
 	// Timestamp is the time the message was created.
 	Timestamp time.Time
+	// Role is HistoryRoleUser, HistoryRoleAgent or HistoryRoleSystem for client
+	// chat rows; empty for channel history.
+	Role string
+	// Kind is HistoryKindText, HistoryKindVoice or HistoryKindError; empty means HistoryKindText.
+	Kind string
+	// AudioJobID is the client voice job the row belongs to; empty for text messages.
+	AudioJobID string
+	// AudioDurationMs is the voice message length in milliseconds; 0 when unknown or not a voice row.
+	AudioDurationMs int64
+	// TaskIDs lists the UUIDs of tasks touched by an agent reply, without duplicates.
+	TaskIDs []string
 }
+
+// ErrHistoryCursorNotFound is returned by History.ListClient when the before
+// cursor does not name a message of the requested source.
+var ErrHistoryCursorNotFound = errors.New("history cursor not found")
 
 // Summary holds the content of a periodic digest, grouped into sections.
 type Summary struct {

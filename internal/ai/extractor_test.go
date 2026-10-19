@@ -1136,3 +1136,172 @@ func TestForwardExtractor_LowConfidenceFiltered(t *testing.T) {
 		t.Errorf("len(tasks) = %d, want 0 (low confidence filtered)", len(tasks))
 	}
 }
+
+func TestForwardExtractor_MessageIndex(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    int
+	}{
+		{name: "number", message: `,"message":2`, want: 2},
+		{name: "numeric string", message: `,"message":"3"`, want: 3},
+		{name: "missing", message: ``, want: 0},
+		{name: "null", message: `,"message":null`, want: 0},
+		{name: "negative", message: `,"message":-1`, want: 0},
+		{name: "fraction", message: `,"message":1.5`, want: 0},
+		{name: "non-numeric string", message: `,"message":"first"`, want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := `[{"summary":"Отправить слайды по проекту","context":"Обещано: Вася.","topic":"","project":"","deadline":null,"confidence":0.9` + tc.message + `}]`
+			e, err := ai.NewForwardExtractor(&mockCompleter{response: resp}, "ru", dateparse.Config{})
+			if err != nil {
+				t.Fatalf("NewForwardExtractor: %v", err)
+			}
+			tasks, err := e.Extract(context.Background(), model.Message{Text: "текст"}, nil)
+			if err != nil {
+				t.Fatalf("Extract() error: %v", err)
+			}
+			if len(tasks) != 1 {
+				t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+			}
+			if tasks[0].ForwardIndex != tc.want {
+				t.Errorf("ForwardIndex = %d, want %d", tasks[0].ForwardIndex, tc.want)
+			}
+		})
+	}
+}
+
+func TestTaskExtractor_IgnoresMessageIndex(t *testing.T) {
+	mock := &mockCompleter{response: `[{"summary":"Подготовить отчёт по Q1","context":"","topic":"","project":"","deadline":null,"message":4,"confidence":0.9}]`}
+	e := newTestExtractor(t, mock)
+	tasks, err := e.Extract(context.Background(), model.Message{Text: "подготовлю отчёт"}, nil)
+	if err != nil {
+		t.Fatalf("Extract() error: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+	}
+	if tasks[0].ForwardIndex != 0 {
+		t.Errorf("ForwardIndex = %d, want 0 for the message extractor", tasks[0].ForwardIndex)
+	}
+}
+
+func TestForwardExtractor_SystemPromptAsksForMessageNumber(t *testing.T) {
+	for _, lang := range []string{"ru", "en"} {
+		t.Run(lang, func(t *testing.T) {
+			cap := &capturingCompleter{response: `[]`}
+			e, err := ai.NewForwardExtractor(cap, lang, dateparse.Config{})
+			if err != nil {
+				t.Fatalf("NewForwardExtractor: %v", err)
+			}
+			if _, err := e.Extract(context.Background(), model.Message{Text: "[1] [я, 2026-04-25 14:30] Пришлю документы."}, nil); err != nil {
+				t.Fatalf("Extract() error: %v", err)
+			}
+			if !strings.Contains(cap.systemPrompt, `"message": 1`) {
+				t.Errorf("system prompt does not ask for the message number, got: %s", cap.systemPrompt)
+			}
+			if !strings.Contains(cap.systemPrompt, "[1], [2]") {
+				t.Errorf("system prompt does not explain message numbering, got: %s", cap.systemPrompt)
+			}
+		})
+	}
+}
+
+func TestExtractors_Priority(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority string
+		want     model.TaskPriority
+	}{
+		{name: "high", priority: `,"priority":3`, want: model.TaskPriorityHigh},
+		{name: "medium", priority: `,"priority":2`, want: model.TaskPriorityMedium},
+		{name: "explicit zero", priority: `,"priority":0`, want: model.TaskPriorityNone},
+		{name: "numeric string", priority: `,"priority":"3"`, want: model.TaskPriorityHigh},
+		{name: "missing", priority: ``, want: model.TaskPriorityNone},
+		{name: "null", priority: `,"priority":null`, want: model.TaskPriorityNone},
+		{name: "above range", priority: `,"priority":5`, want: model.TaskPriorityNone},
+		{name: "negative", priority: `,"priority":-1`, want: model.TaskPriorityNone},
+		{name: "fraction", priority: `,"priority":2.5`, want: model.TaskPriorityNone},
+		{name: "word", priority: `,"priority":"high"`, want: model.TaskPriorityNone},
+	}
+	extractors := []struct {
+		name string
+		new  func(t *testing.T, c ai.Completer) model.Extractor
+	}{
+		{name: "message", new: func(t *testing.T, c ai.Completer) model.Extractor {
+			e, err := ai.NewTaskExtractor(c, ai.ExtractorConfig{UserName: "Григорий", Now: func() time.Time { return fixedNow }})
+			if err != nil {
+				t.Fatalf("NewTaskExtractor: %v", err)
+			}
+			return e
+		}},
+		{name: "forward", new: func(t *testing.T, c ai.Completer) model.Extractor {
+			e, err := ai.NewForwardExtractor(c, "ru", dateparse.Config{})
+			if err != nil {
+				t.Fatalf("NewForwardExtractor: %v", err)
+			}
+			return e
+		}},
+	}
+	for _, ex := range extractors {
+		for _, tc := range tests {
+			t.Run(ex.name+"/"+tc.name, func(t *testing.T) {
+				resp := `[{"summary":"Поправить деплой на проде","context":"","topic":"","project":"","deadline":null,"confidence":0.9` + tc.priority + `}]`
+				e := ex.new(t, &mockCompleter{response: resp})
+				tasks, err := e.Extract(context.Background(), ownerMsg("срочно поправлю деплой"), nil)
+				if err != nil {
+					t.Fatalf("Extract() error: %v", err)
+				}
+				if len(tasks) != 1 {
+					t.Fatalf("len(tasks) = %d, want 1", len(tasks))
+				}
+				if tasks[0].Priority != tc.want {
+					t.Errorf("Priority = %d, want %d", tasks[0].Priority, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestExtractors_SystemPromptsAskForPriority(t *testing.T) {
+	tests := []struct {
+		lang    string
+		section string
+	}{
+		{lang: "ru", section: "Правила формирования priority:"},
+		{lang: "en", section: "Rules for priority:"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.lang, func(t *testing.T) {
+			msgCap := &capturingCompleter{response: `[]`}
+			msgExtractor, err := ai.NewTaskExtractor(msgCap, ai.ExtractorConfig{UserName: "Григорий", Language: tc.lang, Now: func() time.Time { return fixedNow }})
+			if err != nil {
+				t.Fatalf("NewTaskExtractor: %v", err)
+			}
+			if _, err := msgExtractor.Extract(context.Background(), ownerMsg("срочно поправлю деплой"), nil); err != nil {
+				t.Fatalf("message Extract() error: %v", err)
+			}
+
+			fwdCap := &capturingCompleter{response: `[]`}
+			fwdExtractor, err := ai.NewForwardExtractor(fwdCap, tc.lang, dateparse.Config{})
+			if err != nil {
+				t.Fatalf("NewForwardExtractor: %v", err)
+			}
+			if _, err := fwdExtractor.Extract(context.Background(), model.Message{Text: "[1] [я, 2026-04-25 14:30] Срочно пришлю документы."}, nil); err != nil {
+				t.Fatalf("forward Extract() error: %v", err)
+			}
+
+			for name, prompt := range map[string]string{"message": msgCap.systemPrompt, "forward": fwdCap.systemPrompt} {
+				for _, want := range []string{tc.section, `"priority": 0`, "ASAP", "urgent"} {
+					if !strings.Contains(prompt, want) {
+						t.Errorf("%s system prompt does not contain %q, got:\n%s", name, want, prompt)
+					}
+				}
+				if strings.Contains(prompt, "{{") {
+					t.Errorf("%s system prompt has unrendered template actions:\n%s", name, prompt)
+				}
+			}
+		})
+	}
+}

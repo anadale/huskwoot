@@ -42,15 +42,30 @@ type History interface {
 	// AddTx inserts a record within the caller-owned transaction and returns
 	// the generated messageID (UUID v4). The caller is responsible for commit/rollback.
 	// TTL and MaxMessages cleanup are NOT performed — use Add for standalone writes.
+	// Client chat sources ("client:<device id>") are capped per source in the same
+	// transaction: the oldest rows beyond the cap are deleted.
 	AddTx(ctx context.Context, tx *sql.Tx, source string, entry HistoryEntry) (messageID string, err error)
 
+	// SetTaskIDs merges ids into the task ids of the message with messageID,
+	// keeping the stored order and skipping duplicates.
+	SetTaskIDs(ctx context.Context, messageID string, ids []string) error
+
 	// Recent returns the last limit records from the given source channel.
+	// System records (Role == HistoryRoleSystem) are skipped.
 	Recent(ctx context.Context, source string, limit int) ([]HistoryEntry, error)
 
 	// RecentActivity returns records from the most recent activity wave:
 	// looks for a stretch of records after a pause >= silenceGap.
 	// If no such stretch is found, returns the last fallbackLimit records.
+	// System records (Role == HistoryRoleSystem) are skipped.
 	RecentActivity(ctx context.Context, source string, silenceGap time.Duration, fallbackLimit int) ([]HistoryEntry, error)
+
+	// ListClient returns one page of a client chat history: the newest limit
+	// records of source older than the message before (exclusive; empty means
+	// from the newest record), ordered oldest to newest, system records included.
+	// nextBefore is the cursor for the next (older) page; empty on the last page.
+	// Returns ErrHistoryCursorNotFound when before is not a message of source.
+	ListClient(ctx context.Context, source, before string, limit int) (entries []HistoryEntry, nextBefore string, err error)
 }
 
 // GuardStore persists pending guard approvals so they survive service restarts.

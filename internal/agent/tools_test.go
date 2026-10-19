@@ -102,6 +102,7 @@ func (m *mockTaskService) CreateTask(_ context.Context, req model.CreateTaskRequ
 		Details:     req.Details,
 		Status:      "open",
 		Deadline:    req.Deadline,
+		Priority:    req.Priority,
 		CreatedAt:   time.Now(),
 		UpdatedAt:   time.Now(),
 	}
@@ -208,24 +209,24 @@ type mockProjectService struct {
 	resolveProjectRefResult *model.Project
 	resolveProjectRefErr    error
 
-	updateProjectResult    *model.Project
-	updateProjectErr       error
-	lastUpdateProjectID    string
-	lastUpdateProjectUpd   model.ProjectUpdate
+	updateProjectResult  *model.Project
+	updateProjectErr     error
+	lastUpdateProjectID  string
+	lastUpdateProjectUpd model.ProjectUpdate
 
 	lastEnsureChannelID string
 	lastEnsureName      string
 	lastCreateReq       model.CreateProjectRequest
 
-	addAliasResult     *model.Project
-	addAliasErr        error
-	lastAddProjectID   string
-	lastAddAlias       string
+	addAliasResult   *model.Project
+	addAliasErr      error
+	lastAddProjectID string
+	lastAddAlias     string
 
-	removeAliasResult  *model.Project
-	removeAliasErr     error
+	removeAliasResult   *model.Project
+	removeAliasErr      error
 	lastRemoveProjectID string
-	lastRemoveAlias    string
+	lastRemoveAlias     string
 }
 
 func (m *mockProjectService) CreateProject(_ context.Context, req model.CreateProjectRequest) (*model.Project, error) {
@@ -501,6 +502,108 @@ func TestCreateTaskTool_Execute_WithDeadline(t *testing.T) {
 	wantDL, _ := time.Parse(time.RFC3339, deadline)
 	if !tasks.lastCreateReq.Deadline.Equal(wantDL) {
 		t.Errorf("deadline = %v, want %v", tasks.lastCreateReq.Deadline, wantDL)
+	}
+}
+
+func TestCreateTaskTool_Execute_SourceFromOriginMessage(t *testing.T) {
+	at := time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		origin     model.Message
+		wantSource model.Source
+		wantVia    string
+		wantName   string
+		wantAuthor string
+	}{
+		{
+			name: "client chat",
+			origin: model.Message{
+				ID:         "device-1:1",
+				Kind:       model.MessageKindDM,
+				Source:     model.Source{Kind: "client", ID: "device-1", AccountID: "client:device-1"},
+				Author:     "device-1",
+				AuthorName: "device-1",
+				Text:       "создай задачу купить билеты",
+				Timestamp:  at,
+			},
+			wantSource: model.Source{Kind: "client", ID: "device-1", AccountID: "client:device-1"},
+			wantVia:    model.SourceViaChat,
+		},
+		{
+			name: "client voice",
+			origin: model.Message{
+				ID:         "device-1:2",
+				Kind:       model.MessageKindDM,
+				Source:     model.Source{Kind: "client", ID: "device-1", AccountID: "client:device-1"},
+				Author:     "device-1",
+				AuthorName: "device-1",
+				Text:       "напомни позвонить маме",
+				Timestamp:  at,
+				VoiceJobID: "voice-job-1",
+			},
+			wantSource: model.Source{Kind: "client", ID: "device-1", AccountID: "client:device-1"},
+			wantVia:    model.SourceViaVoice,
+		},
+		{
+			name: "telegram DM",
+			origin: model.Message{
+				ID:         "55",
+				Kind:       model.MessageKindDM,
+				Source:     model.Source{Kind: "telegram", ID: "dm", Name: "DM", AccountID: "personal"},
+				Author:     "1001",
+				AuthorName: "Gregory",
+				Text:       "добавь задачу оплатить счёт",
+				Timestamp:  at,
+			},
+			wantSource: model.Source{Kind: "telegram", ID: "dm", Name: "DM", AccountID: "personal"},
+			wantVia:    model.SourceViaChat,
+			wantName:   "DM",
+			wantAuthor: "Gregory",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tasks := &mockTaskService{}
+			tool := agent.NewCreateTaskTool(tasks, &mockProjectService{}, newTestDateparser("ru"), newTestLocalizer("ru"))
+			ctx := agent.WithOriginMessage(context.Background(), tc.origin)
+
+			if _, err := tool.Execute(ctx, `{"summary":"задача"}`); err != nil {
+				t.Fatalf("Execute() returned error: %v", err)
+			}
+
+			req := tasks.lastCreateReq
+			if req.Source != tc.wantSource {
+				t.Errorf("Source = %+v, want %+v", req.Source, tc.wantSource)
+			}
+			d := req.SourceDetails
+			if d == nil {
+				t.Fatal("SourceDetails = nil")
+			}
+			if d.Via != tc.wantVia {
+				t.Errorf("Via = %q, want %q", d.Via, tc.wantVia)
+			}
+			if d.Text != tc.origin.Text {
+				t.Errorf("Text = %q, want %q", d.Text, tc.origin.Text)
+			}
+			if d.At == nil || !d.At.Equal(at) {
+				t.Errorf("At = %v, want %v", d.At, at)
+			}
+			if d.Name != tc.wantName || d.Author != tc.wantAuthor {
+				t.Errorf("name/author = %q/%q, want %q/%q", d.Name, d.Author, tc.wantName, tc.wantAuthor)
+			}
+		})
+	}
+}
+
+func TestCreateTaskTool_Execute_WithoutOriginMessage_NoSource(t *testing.T) {
+	tasks := &mockTaskService{}
+	tool := agent.NewCreateTaskTool(tasks, &mockProjectService{}, newTestDateparser("ru"), newTestLocalizer("ru"))
+
+	if _, err := tool.Execute(context.Background(), `{"summary":"задача"}`); err != nil {
+		t.Fatalf("Execute() returned error: %v", err)
+	}
+	if tasks.lastCreateReq.Source != (model.Source{}) || tasks.lastCreateReq.SourceDetails != nil {
+		t.Errorf("source = %+v / %+v, want empty", tasks.lastCreateReq.Source, tasks.lastCreateReq.SourceDetails)
 	}
 }
 
@@ -1353,7 +1456,7 @@ func TestGetTaskTool_Metadata(t *testing.T) {
 
 func TestCancelTaskTool_Execute_Normal(t *testing.T) {
 	tasks := &mockTaskService{
-		getTaskResult: &model.Task{ID: "task-uuid-4", Number: 4, ProjectSlug: "inbox", Status: "open"},
+		getTaskResult:    &model.Task{ID: "task-uuid-4", Number: 4, ProjectSlug: "inbox", Status: "open"},
 		updateTaskResult: &model.Task{ID: "task-uuid-4", Number: 4, ProjectSlug: "inbox", Status: "cancelled"},
 	}
 	tool := agent.NewCancelTaskTool(tasks, newTestLocalizer("ru"))

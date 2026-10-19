@@ -14,12 +14,12 @@ import (
 // --- stubs ---
 
 type stubQueue struct {
-	mu             sync.Mutex
-	jobs           []model.VoiceJob
-	nextID         int64
-	completedIDs   []int64
-	rescheduled    []rescheduleCall
-	rescheduleErr  error
+	mu            sync.Mutex
+	jobs          []model.VoiceJob
+	nextID        int64
+	completedIDs  []int64
+	rescheduled   []rescheduleCall
+	rescheduleErr error
 }
 
 type rescheduleCall struct {

@@ -36,13 +36,13 @@ type mockTaskStoreForTasks struct {
 	tasks      map[string]*model.Task
 	counter    int
 
-	createTaskErr    error
-	updateTaskErr    error
-	moveTaskErr      error
-	getTaskErr       error
-	getProjectErr    error
-	listTasksErr     error
-	getProjectCalls  int
+	createTaskErr   error
+	updateTaskErr   error
+	moveTaskErr     error
+	getTaskErr      error
+	getProjectErr   error
+	listTasksErr    error
+	getProjectCalls int
 
 	createCalled int
 	updateCalled int
@@ -185,6 +185,9 @@ func (m *mockTaskStoreForTasks) UpdateTaskTx(_ context.Context, _ *sql.Tx, id st
 	}
 	if upd.Deadline != nil {
 		t.Deadline = *upd.Deadline
+	}
+	if upd.Priority != nil {
+		t.Priority = *upd.Priority
 	}
 	if upd.ClosedAt != nil {
 		t.ClosedAt = *upd.ClosedAt
@@ -1065,5 +1068,282 @@ func TestTaskService_OtherTaskEvents_PayloadWrapsInTaskKey(t *testing.T) {
 		if len(changed) != 0 {
 			t.Fatalf("event[%d] %s: changedFields=%v, want nil (not task_updated)", i, ev.Kind, changed)
 		}
+	}
+}
+
+// sampleSourceDetails returns a fully populated source details snapshot.
+func sampleSourceDetails() *model.TaskSourceDetails {
+	at := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
+	return &model.TaskSourceDetails{
+		Name:    "Команда",
+		Subject: "Отчёт",
+		Author:  "Алиса",
+		Text:    "Сделаю отчёт к пятнице",
+		At:      &at,
+		ReplyTo: &model.TaskSourceQuote{Author: "Боб", Text: "Когда будет отчёт?"},
+		Link:    "https://t.me/c/123/45",
+		Via:     "message",
+	}
+}
+
+// assertSourcePayload checks that a task snapshot carries the source kind and
+// every source details key with the expected values.
+func assertSourcePayload(t *testing.T, taskData map[string]any, wantKind string, want *model.TaskSourceDetails) {
+	t.Helper()
+	src, ok := taskData["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("task.source = %#v, want an object", taskData["source"])
+	}
+	wantStrings := map[string]string{
+		"kind":    wantKind,
+		"name":    want.Name,
+		"subject": want.Subject,
+		"author":  want.Author,
+		"text":    want.Text,
+		"at":      want.At.Format(time.RFC3339),
+		"link":    want.Link,
+		"via":     want.Via,
+	}
+	for key, value := range wantStrings {
+		if src[key] != value {
+			t.Errorf("task.source.%s = %#v, want %q", key, src[key], value)
+		}
+	}
+	reply, ok := src["replyTo"].(map[string]any)
+	if !ok {
+		t.Fatalf("task.source.replyTo = %#v, want an object", src["replyTo"])
+	}
+	if reply["author"] != want.ReplyTo.Author || reply["text"] != want.ReplyTo.Text {
+		t.Errorf("task.source.replyTo = %#v, want %+v", reply, *want.ReplyTo)
+	}
+}
+
+func TestTaskServiceCreateTaskPassesPriorityAndSourceDetails(t *testing.T) {
+	f := newTestFixture(t)
+	details := sampleSourceDetails()
+
+	task, err := f.svc.CreateTask(context.Background(), model.CreateTaskRequest{
+		Summary:       "отчёт",
+		Priority:      model.TaskPriorityHigh,
+		Source:        model.Source{Kind: "telegram", ID: "-100123"},
+		SourceDetails: details,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if task.Priority != model.TaskPriorityHigh {
+		t.Errorf("returned Priority = %d, want %d", task.Priority, model.TaskPriorityHigh)
+	}
+	if task.SourceDetails == nil || task.SourceDetails.Text != details.Text || task.SourceDetails.Via != "message" {
+		t.Errorf("returned SourceDetails = %+v, want %+v", task.SourceDetails, details)
+	}
+	stored := f.tasks.tasks[task.ID]
+	if stored.Priority != model.TaskPriorityHigh || stored.SourceDetails == nil || stored.SourceDetails.Author != details.Author {
+		t.Errorf("stored task = %+v, want priority and details passed to the store", stored)
+	}
+
+	evs := f.events.recorded()
+	if len(evs) != 1 {
+		t.Fatalf("events = %d, want 1", len(evs))
+	}
+	taskData, _ := parseTaskPayload(t, evs[0].Payload)
+	if taskData["priority"] != float64(model.TaskPriorityHigh) {
+		t.Errorf("task.priority = %#v, want %d", taskData["priority"], model.TaskPriorityHigh)
+	}
+	assertSourcePayload(t, taskData, "telegram", details)
+}
+
+func TestTaskServiceCreateTasksPassesPriorityPerTask(t *testing.T) {
+	f := newTestFixture(t)
+
+	created, err := f.svc.CreateTasks(context.Background(), model.CreateTasksRequest{
+		Tasks: []model.CreateTaskRequest{
+			{Summary: "без приоритета"},
+			{Summary: "средний", Priority: model.TaskPriorityMedium, SourceDetails: &model.TaskSourceDetails{Via: "forward"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateTasks: %v", err)
+	}
+	if len(created) != 2 {
+		t.Fatalf("created = %d, want 2", len(created))
+	}
+	if created[0].Priority != model.TaskPriorityNone || created[0].SourceDetails != nil {
+		t.Errorf("first task = %+v, want no priority and no details", created[0])
+	}
+	if created[1].Priority != model.TaskPriorityMedium || created[1].SourceDetails == nil || created[1].SourceDetails.Via != "forward" {
+		t.Errorf("second task = %+v, want medium priority and forward details", created[1])
+	}
+}
+
+func TestTaskServiceCreateTaskRejectsInvalidPriority(t *testing.T) {
+	tests := []struct {
+		name     string
+		priority model.TaskPriority
+	}{
+		{name: "negative", priority: -1},
+		{name: "above high", priority: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestFixture(t)
+			_, err := f.svc.CreateTasks(context.Background(), model.CreateTasksRequest{
+				Tasks: []model.CreateTaskRequest{
+					{Summary: "valid"},
+					{Summary: "invalid", Priority: tt.priority},
+				},
+			})
+			if !errors.Is(err, usecase.ErrInvalidTaskPriority) {
+				t.Fatalf("err = %v, want ErrInvalidTaskPriority", err)
+			}
+			if f.tasks.createCalled != 0 {
+				t.Errorf("store.CreateTaskTx called %d times, want 0", f.tasks.createCalled)
+			}
+			if n := len(f.events.recorded()); n != 0 {
+				t.Errorf("events recorded = %d, want 0", n)
+			}
+		})
+	}
+}
+
+func TestTaskService_UpdateTask_Priority(t *testing.T) {
+	tests := []struct {
+		name        string
+		original    model.TaskPriority
+		update      model.TaskPriority
+		wantErr     bool
+		wantChanged []string
+		want        model.TaskPriority
+	}{
+		{name: "raised", original: model.TaskPriorityNone, update: model.TaskPriorityHigh, wantChanged: []string{"priority"}, want: model.TaskPriorityHigh},
+		{name: "cleared", original: model.TaskPriorityMedium, update: model.TaskPriorityNone, wantChanged: []string{"priority"}, want: model.TaskPriorityNone},
+		{name: "unchanged", original: model.TaskPriorityMedium, update: model.TaskPriorityMedium, want: model.TaskPriorityMedium},
+		{name: "above high", original: model.TaskPriorityLow, update: 4, wantErr: true, want: model.TaskPriorityLow},
+		{name: "negative", original: model.TaskPriorityLow, update: -1, wantErr: true, want: model.TaskPriorityLow},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestFixture(t)
+			f.tasks.tasks["t1"] = &model.Task{
+				ID:          "t1",
+				ProjectID:   "inbox-uuid",
+				ProjectSlug: "inbox",
+				Number:      1,
+				Status:      "open",
+				Summary:     "задача",
+				Priority:    tt.original,
+			}
+
+			upd := tt.update
+			task, err := f.svc.UpdateTask(context.Background(), "t1", model.TaskUpdate{Priority: &upd})
+			if tt.wantErr {
+				if !errors.Is(err, usecase.ErrInvalidTaskPriority) {
+					t.Fatalf("err = %v, want ErrInvalidTaskPriority", err)
+				}
+				if f.tasks.updateCalled != 0 {
+					t.Errorf("store.UpdateTaskTx called %d times, want 0", f.tasks.updateCalled)
+				}
+				if n := len(f.events.recorded()); n != 0 {
+					t.Errorf("events recorded = %d, want 0", n)
+				}
+				if got := f.tasks.tasks["t1"].Priority; got != tt.want {
+					t.Errorf("stored Priority = %d, want %d", got, tt.want)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("UpdateTask: %v", err)
+			}
+			if task.Priority != tt.want {
+				t.Errorf("Priority = %d, want %d", task.Priority, tt.want)
+			}
+			evs := f.events.recorded()
+			if len(evs) != 1 {
+				t.Fatalf("events = %d, want 1", len(evs))
+			}
+			taskData, changed := parseTaskPayload(t, evs[0].Payload)
+			if taskData["priority"] != float64(tt.want) {
+				t.Errorf("task.priority = %#v, want %d", taskData["priority"], tt.want)
+			}
+			if fmt.Sprint(changed) != fmt.Sprint(tt.wantChanged) {
+				t.Errorf("changedFields = %v, want %v", changed, tt.wantChanged)
+			}
+		})
+	}
+}
+
+func TestTaskService_UpdateTask_PriorityChangedFieldsOrder(t *testing.T) {
+	f := newTestFixture(t)
+	f.tasks.tasks["t1"] = &model.Task{ID: "t1", ProjectID: "inbox-uuid", ProjectSlug: "inbox", Number: 1, Status: "open", Summary: "старая"}
+
+	summary := "новая"
+	priority := model.TaskPriorityLow
+	if _, err := f.svc.UpdateTask(context.Background(), "t1", model.TaskUpdate{Summary: &summary, Priority: &priority}); err != nil {
+		t.Fatalf("UpdateTask: %v", err)
+	}
+	_, changed := parseTaskPayload(t, f.events.recorded()[0].Payload)
+	if fmt.Sprint(changed) != "[summary priority]" {
+		t.Fatalf("changedFields = %v, want [summary priority]", changed)
+	}
+}
+
+func TestTaskSnapshotSourcePayload(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     model.Source
+		details    *model.TaskSourceDetails
+		wantSource bool
+		wantKeys   []string
+		absentKeys []string
+	}{
+		{
+			name:       "no kind and no details",
+			wantSource: false,
+		},
+		{
+			name:       "kind without details",
+			source:     model.Source{Kind: "imap", ID: "inbox"},
+			wantSource: true,
+			wantKeys:   []string{"kind"},
+			absentKeys: []string{"via", "text", "replyTo"},
+		},
+		{
+			name:       "details without kind",
+			details:    &model.TaskSourceDetails{Text: "сделаю", Via: "api"},
+			wantSource: true,
+			wantKeys:   []string{"text", "via"},
+			absentKeys: []string{"kind", "replyTo", "at", "link"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestFixture(t)
+			_, err := f.svc.CreateTask(context.Background(), model.CreateTaskRequest{
+				Summary:       "задача",
+				Source:        tt.source,
+				SourceDetails: tt.details,
+			})
+			if err != nil {
+				t.Fatalf("CreateTask: %v", err)
+			}
+			taskData, _ := parseTaskPayload(t, f.events.recorded()[0].Payload)
+			if p, ok := taskData["priority"]; !ok || p != float64(0) {
+				t.Errorf("task.priority = %#v (present=%v), want 0 always present", p, ok)
+			}
+			src, ok := taskData["source"].(map[string]any)
+			if ok != tt.wantSource {
+				t.Fatalf("task.source = %#v, want present=%v", taskData["source"], tt.wantSource)
+			}
+			for _, key := range tt.wantKeys {
+				if _, ok := src[key]; !ok {
+					t.Errorf("task.source.%s missing in %v", key, src)
+				}
+			}
+			for _, key := range tt.absentKeys {
+				if _, ok := src[key]; ok {
+					t.Errorf("task.source.%s = %#v, want absent", key, src[key])
+				}
+			}
+		})
 	}
 }

@@ -160,6 +160,7 @@ func (t *searchTasksTool) Execute(ctx context.Context, args string) (string, err
 		if task.Deadline != nil {
 			item["deadline"] = task.Deadline.Format(time.RFC3339)
 		}
+		addPriority(item, task.Priority)
 		result = append(result, item)
 	}
 

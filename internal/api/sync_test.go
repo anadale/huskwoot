@@ -3,11 +3,13 @@ package api_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/anadale/huskwoot/internal/api"
 	"github.com/anadale/huskwoot/internal/devices"
@@ -144,6 +146,83 @@ func TestSyncSnapshotReturnsProjectsAndOpenTasksAndLastSeq(t *testing.T) {
 	// 2 task_created + 1 task_completed + 1 project_created = seq must be >= 4.
 	if resp.LastSeq < 4 {
 		t.Fatalf("last_seq=%d, want >=4", resp.LastSeq)
+	}
+}
+
+func TestSyncSnapshotIncludesPriorityAndSource(t *testing.T) {
+	h := newSyncHarness(t)
+	ctx := context.Background()
+
+	at := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
+	if _, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{
+		Summary:  "ответить на письмо",
+		Priority: model.TaskPriorityHigh,
+		Source:   model.Source{Kind: "imap", ID: "owner@example.com"},
+		SourceDetails: &model.TaskSourceDetails{
+			Name:    "owner@example.com",
+			Subject: "Договор",
+			Author:  "Алиса",
+			Text:    "Пришлю договор до пятницы",
+			At:      &at,
+			Via:     model.SourceViaMessage,
+		},
+	}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "без источника"}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	rec := h.get("/v1/sync/snapshot")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		OpenTasks []map[string]json.RawMessage `json:"openTasks"`
+	}
+	decodeJSONResp(t, rec.Body, &resp)
+	if len(resp.OpenTasks) != 2 {
+		t.Fatalf("open_tasks len=%d, want 2", len(resp.OpenTasks))
+	}
+
+	bySummary := map[string]map[string]json.RawMessage{}
+	for _, task := range resp.OpenTasks {
+		var summary string
+		if err := json.Unmarshal(task["summary"], &summary); err != nil {
+			t.Fatalf("summary: %v", err)
+		}
+		bySummary[summary] = task
+	}
+
+	withSource := bySummary["ответить на письмо"]
+	if got := string(withSource["priority"]); got != "3" {
+		t.Errorf("priority=%s, want 3", got)
+	}
+	var src struct {
+		Kind    string     `json:"kind"`
+		Subject string     `json:"subject"`
+		Author  string     `json:"author"`
+		Text    string     `json:"text"`
+		At      *time.Time `json:"at"`
+		Via     string     `json:"via"`
+	}
+	if err := json.Unmarshal(withSource["source"], &src); err != nil {
+		t.Fatalf("source: %v (raw %s)", err, withSource["source"])
+	}
+	if src.Kind != "imap" || src.Subject != "Договор" || src.Author != "Алиса" ||
+		src.Text != "Пришлю договор до пятницы" || src.Via != model.SourceViaMessage {
+		t.Errorf("source=%+v", src)
+	}
+	if src.At == nil || !src.At.Equal(at) {
+		t.Errorf("source.at=%v, want %v", src.At, at)
+	}
+
+	plain := bySummary["без источника"]
+	if got := string(plain["priority"]); got != "0" {
+		t.Errorf("plain priority=%s, want 0", got)
+	}
+	if v, ok := plain["source"]; ok {
+		t.Errorf("plain source=%s, want the key omitted", v)
 	}
 }
 

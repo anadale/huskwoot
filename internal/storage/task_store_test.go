@@ -3,10 +3,12 @@ package storage_test
 import (
 	"context"
 	"database/sql"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/storage"
@@ -1648,4 +1650,263 @@ func TestListClosedOlderThan_EmptyTable(t *testing.T) {
 func ptrToPtrTime(t time.Time) **time.Time {
 	tp := &t
 	return &tp
+}
+
+// --- Priority and source details ---
+
+// equalSourceDetails compares source details, using time.Equal for At.
+func equalSourceDetails(a, b *model.TaskSourceDetails) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ac, bc := *a, *b
+	if (ac.At == nil) != (bc.At == nil) {
+		return false
+	}
+	if ac.At != nil && !ac.At.Equal(*bc.At) {
+		return false
+	}
+	ac.At, bc.At = nil, nil
+	return reflect.DeepEqual(ac, bc)
+}
+
+func TestSQLiteTaskStore_PrioritySourceDetails_RoundTrip(t *testing.T) {
+	at := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		priority      model.TaskPriority
+		details       *model.TaskSourceDetails
+		wantRawDetail string
+	}{
+		{
+			name:     "with details",
+			priority: model.TaskPriorityMedium,
+			details: &model.TaskSourceDetails{
+				Name:    "Команда разработки",
+				Subject: "Отчёт",
+				Author:  "Алиса",
+				Text:    "Сделаю отчёт к пятнице",
+				At:      &at,
+				ReplyTo: &model.TaskSourceQuote{Author: "Боб", Text: "Когда будет отчёт?"},
+				Link:    "https://t.me/c/1234567890/42",
+				Via:     "message",
+			},
+		},
+		{
+			name:     "minimal details",
+			priority: model.TaskPriorityHigh,
+			details:  &model.TaskSourceDetails{Via: "api"},
+		},
+		{
+			name:          "without details",
+			priority:      model.TaskPriorityNone,
+			details:       nil,
+			wantRawDetail: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, db := newTaskStore(t)
+			ctx := context.Background()
+
+			task := newTask(store.DefaultProjectID(), "Подготовить отчёт")
+			task.Priority = tt.priority
+			task.Source = model.Source{Kind: "telegram", ID: "-1001234567890"}
+			task.SourceDetails = tt.details
+			if err := createTaskHelper(t, db, store, task); err != nil {
+				t.Fatalf("CreateTask: %v", err)
+			}
+
+			var rawPriority int
+			var rawDetails string
+			if err := db.QueryRowContext(ctx,
+				`SELECT priority, source_details FROM tasks WHERE id = ?`, task.ID,
+			).Scan(&rawPriority, &rawDetails); err != nil {
+				t.Fatalf("reading raw columns: %v", err)
+			}
+			if rawPriority != int(tt.priority) {
+				t.Errorf("raw priority = %d, want %d", rawPriority, tt.priority)
+			}
+			if tt.details == nil && rawDetails != tt.wantRawDetail {
+				t.Errorf("raw source_details = %q, want %q", rawDetails, tt.wantRawDetail)
+			}
+			if tt.details != nil && rawDetails == "" {
+				t.Error("raw source_details is empty, want JSON")
+			}
+
+			readers := map[string]func() (*model.Task, error){
+				"GetTask": func() (*model.Task, error) { return store.GetTask(ctx, task.ID) },
+				"GetTaskTx": func() (*model.Task, error) {
+					var got *model.Task
+					err := withTx(t, db, func(tx *sql.Tx) error {
+						var err error
+						got, err = store.GetTaskTx(ctx, tx, task.ID)
+						return err
+					})
+					return got, err
+				},
+				"GetTaskByRef": func() (*model.Task, error) { return store.GetTaskByRef(ctx, "inbox", task.Number) },
+				"ListTasks": func() (*model.Task, error) {
+					tasks, err := store.ListTasks(ctx, "", model.TaskFilter{})
+					if err != nil || len(tasks) != 1 {
+						return nil, err
+					}
+					return &tasks[0], nil
+				},
+			}
+			for name, read := range readers {
+				got, err := read()
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				if got == nil {
+					t.Fatalf("%s: task not found", name)
+				}
+				if got.Priority != tt.priority {
+					t.Errorf("%s: Priority = %d, want %d", name, got.Priority, tt.priority)
+				}
+				if !equalSourceDetails(got.SourceDetails, tt.details) {
+					t.Errorf("%s: SourceDetails = %+v, want %+v", name, got.SourceDetails, tt.details)
+				}
+				if got.Source.Kind != "telegram" || got.Source.ID != "-1001234567890" {
+					t.Errorf("%s: Source = %+v, want telegram/-1001234567890", name, got.Source)
+				}
+			}
+
+			statusDone := "done"
+			if err := updateTaskHelper(t, db, store, task.ID, model.TaskUpdate{
+				Status: &statusDone, ClosedAt: ptrToPtrTime(time.Now().Add(-30 * 24 * time.Hour)),
+			}); err != nil {
+				t.Fatalf("UpdateTask: %v", err)
+			}
+			closed, err := store.ListClosedOlderThan(ctx, time.Now())
+			if err != nil {
+				t.Fatalf("ListClosedOlderThan: %v", err)
+			}
+			if len(closed) != 1 {
+				t.Fatalf("ListClosedOlderThan returned %d tasks, want 1", len(closed))
+			}
+			if closed[0].Priority != tt.priority {
+				t.Errorf("ListClosedOlderThan: Priority = %d, want %d", closed[0].Priority, tt.priority)
+			}
+			if !equalSourceDetails(closed[0].SourceDetails, tt.details) {
+				t.Errorf("ListClosedOlderThan: SourceDetails = %+v, want %+v", closed[0].SourceDetails, tt.details)
+			}
+		})
+	}
+}
+
+func TestSQLiteTaskStore_UpdateTask_Priority(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	task := newTask(store.DefaultProjectID(), "Позвонить клиенту")
+	task.Priority = model.TaskPriorityLow
+	if err := createTaskHelper(t, db, store, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	high := model.TaskPriorityHigh
+	none := model.TaskPriorityNone
+	summary := "Позвонить клиенту сегодня"
+	steps := []struct {
+		name string
+		upd  model.TaskUpdate
+		want model.TaskPriority
+	}{
+		{name: "raise to high", upd: model.TaskUpdate{Priority: &high}, want: model.TaskPriorityHigh},
+		{name: "other field keeps priority", upd: model.TaskUpdate{Summary: &summary}, want: model.TaskPriorityHigh},
+		{name: "reset to none", upd: model.TaskUpdate{Priority: &none}, want: model.TaskPriorityNone},
+	}
+	for _, step := range steps {
+		if err := updateTaskHelper(t, db, store, task.ID, step.upd); err != nil {
+			t.Fatalf("%s: UpdateTask: %v", step.name, err)
+		}
+		got, err := store.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatalf("%s: GetTask: %v", step.name, err)
+		}
+		if got.Priority != step.want {
+			t.Errorf("%s: Priority = %d, want %d", step.name, got.Priority, step.want)
+		}
+	}
+}
+
+func TestSQLiteTaskStore_CreateTask_CapsSourceTexts(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	longText := strings.Repeat("я", model.MaxSourceTextRunes+250)
+	longReply := strings.Repeat("ю", model.MaxSourceReplyTextRunes+250)
+	orig := &model.TaskSourceDetails{
+		Author:  "Алиса",
+		Text:    longText,
+		ReplyTo: &model.TaskSourceQuote{Author: "Боб", Text: longReply},
+		Via:     "message",
+	}
+	task := newTask(store.DefaultProjectID(), "Длинное обещание")
+	task.SourceDetails = orig
+	if err := createTaskHelper(t, db, store, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+
+	if orig.Text != longText || orig.ReplyTo.Text != longReply {
+		t.Error("CreateTaskTx mutated the caller's source details")
+	}
+
+	got, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	for name, d := range map[string]*model.TaskSourceDetails{"created": task.SourceDetails, "stored": got.SourceDetails} {
+		if d == nil {
+			t.Fatalf("%s: SourceDetails is nil", name)
+		}
+		if n := utf8.RuneCountInString(d.Text); n != model.MaxSourceTextRunes {
+			t.Errorf("%s: Text runes = %d, want %d", name, n, model.MaxSourceTextRunes)
+		}
+		if n := utf8.RuneCountInString(d.ReplyTo.Text); n != model.MaxSourceReplyTextRunes {
+			t.Errorf("%s: ReplyTo.Text runes = %d, want %d", name, n, model.MaxSourceReplyTextRunes)
+		}
+		if d.Author != "Алиса" || d.ReplyTo.Author != "Боб" {
+			t.Errorf("%s: authors changed: %+v", name, d)
+		}
+	}
+}
+
+func TestSQLiteTaskStore_InvalidSourceDetailsJSON_YieldsNil(t *testing.T) {
+	store, db := newTaskStore(t)
+	ctx := context.Background()
+
+	task := newTask(store.DefaultProjectID(), "Повреждённый снимок")
+	task.Priority = model.TaskPriorityMedium
+	task.SourceDetails = &model.TaskSourceDetails{Text: "текст", Via: "message"}
+	if err := createTaskHelper(t, db, store, task); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`UPDATE tasks SET source_details = ? WHERE id = ?`, `{"text": broken`, task.ID,
+	); err != nil {
+		t.Fatalf("corrupting source_details: %v", err)
+	}
+
+	got, err := store.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	if got.SourceDetails != nil {
+		t.Errorf("GetTask: SourceDetails = %+v, want nil", got.SourceDetails)
+	}
+	if got.Priority != model.TaskPriorityMedium {
+		t.Errorf("GetTask: Priority = %d, want %d", got.Priority, model.TaskPriorityMedium)
+	}
+
+	listed, err := store.ListTasks(ctx, "", model.TaskFilter{})
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(listed) != 1 || listed[0].SourceDetails != nil {
+		t.Errorf("ListTasks: got %+v, want one task with nil SourceDetails", listed)
+	}
 }

@@ -72,6 +72,7 @@ func (t *getTaskTool) Execute(ctx context.Context, args string) (string, error) 
 	if task.ClosedAt != nil {
 		data["closed_at"] = task.ClosedAt.Format(time.RFC3339)
 	}
+	addPriority(data, task.Priority)
 
 	result, _ := json.Marshal(data)
 	return string(result), nil

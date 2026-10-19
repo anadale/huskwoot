@@ -108,4 +108,3 @@ func TestNew(t *testing.T) {
 		})
 	}
 }
-

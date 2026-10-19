@@ -517,6 +517,12 @@ paths:
     get:
       tags: [chat]
       summary: Chat history for the current device
+      description: |
+        Returns one page of the agent chat of the current device (text and voice
+        messages, agent replies and voice failures), isolated from Telegram DMs.
+        A page holds the newest `limit` entries older than `before`, ordered
+        oldest to newest. To load older entries, pass the returned `nextBefore`
+        as `before`; `nextBefore` is omitted on the last page.
       parameters:
         - in: query
           name: limit
@@ -524,22 +530,30 @@ paths:
             type: integer
             minimum: 1
             maximum: 500
-          description: Maximum records. Default 50.
+          description: Maximum records per page. Default 50; larger values are capped at 500.
+        - in: query
+          name: before
+          schema:
+            type: string
+          description: |
+            Message id cursor (exclusive): the page holds entries older than this
+            message. Omit it to start from the newest entry. Must be the `id` of
+            an entry in this device's chat history.
       responses:
         "200":
-          description: History feed, isolated from Telegram DMs.
+          description: History page.
           content:
             application/json:
               schema:
-                type: object
-                required: [entries]
-                properties:
-                  entries:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ChatHistoryEntry"
+                $ref: "#/components/schemas/ChatHistoryResponse"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: |
+            `limit` is not a positive integer, or `before` is not the id of a
+            message in this device's chat history (code `bad_request`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
   /v1/chat/voice:
@@ -552,7 +566,9 @@ paths:
         immediately. The transcription result and agent reply are delivered via
         the /v1/events SSE stream as two consecutive `chat_message_created`
         events (role=user for the transcript, role=agent for the reply).
-        On transcription failure a `voice_failed` event is emitted instead.
+        On transcription failure a `voice_failed` event is emitted instead, and
+        the failure is kept in GET /v1/chat/history as an entry with role
+        `system` and kind `error`.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -1058,7 +1074,7 @@ components:
             Each alias is validated and normalized (lowercased, trimmed) by the server.
     Task:
       type: object
-      required: [id, number, ref, projectId, projectSlug, summary, status, createdAt, updatedAt]
+      required: [id, number, ref, projectId, projectSlug, summary, status, priority, createdAt, updatedAt]
       properties:
         id:
           type: string
@@ -1083,10 +1099,17 @@ components:
         status:
           type: string
           enum: [open, done, cancelled]
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: Task importance — 0 none, 1 low, 2 medium, 3 high. Always present; 0 when not set.
         deadline:
           type: string
           format: date-time
           nullable: true
+        source:
+          $ref: "#/components/schemas/TaskSource"
         createdAt:
           type: string
           format: date-time
@@ -1097,6 +1120,61 @@ components:
           type: string
           format: date-time
           nullable: true
+    TaskSource:
+      type: object
+      description: |
+        Where the task came from: the channel kind plus a snapshot of the promise
+        message taken when the task was created (later edits or history cleanup do
+        not change it). Omitted from Task when neither the kind nor the snapshot is
+        known (e.g. tasks created before the snapshot existed). Unknown fields are
+        omitted.
+      properties:
+        kind:
+          type: string
+          enum: [telegram, imap, client]
+          description: Channel kind of the source.
+        name:
+          type: string
+          description: Chat title or mailbox. Absent for client sources — the client knows its own device names.
+        subject:
+          type: string
+          description: Email subject (imap only).
+        author:
+          type: string
+          description: Display name of the promise message author.
+        text:
+          type: string
+          maxLength: 1000
+          description: Text of the promise message, truncated to 1000 characters.
+        at:
+          type: string
+          format: date-time
+          description: Time of the promise message.
+        replyTo:
+          $ref: "#/components/schemas/TaskSourceQuote"
+        link:
+          type: string
+          format: uri
+          description: Deep link to the message. Built only for Telegram supergroups and channels.
+        via:
+          type: string
+          enum: [message, forward, chat, voice, api]
+          description: |
+            How the task was created: message — extracted from a channel message
+            (Telegram group, email); forward — extracted from messages forwarded to
+            the bot; chat — by the agent from a text message; voice — by the agent
+            from a client voice message; api — via POST /v1/tasks.
+    TaskSourceQuote:
+      type: object
+      description: The message the promise message replied to.
+      properties:
+        author:
+          type: string
+          description: Display name of the quoted message author.
+        text:
+          type: string
+          maxLength: 500
+          description: Text of the quoted message, truncated to 500 characters.
     TasksPage:
       type: object
       required: [tasks]
@@ -1126,12 +1204,22 @@ components:
           type: string
           format: date-time
           nullable: true
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 3
+          default: 0
+          description: |
+            Task importance — 0 none, 1 low, 2 medium, 3 high. Values outside 0–3,
+            non-integers and null are rejected with 422.
     UpdateTaskRequest:
       type: object
       description: |
-        Supported fields: summary, details, status, deadline. summary is trimmed;
-        an empty string after trim is rejected with 422. deadline=null clears the
-        due date; an absent field leaves the value unchanged.
+        Supported fields: summary, details, status, deadline, priority. summary is
+        trimmed; an empty string after trim is rejected with 422. deadline=null
+        clears the due date. priority must be an integer 0–3 (0 clears it); other
+        values, including null, are rejected with 422. An absent field leaves the
+        value unchanged; unknown fields are rejected with 400.
       properties:
         summary:
           type: string
@@ -1144,6 +1232,11 @@ components:
           type: string
           format: date-time
           nullable: true
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 3
+          description: Task importance — 0 none, 1 low, 2 medium, 3 high.
     MoveTaskRequest:
       type: object
       required: [projectId]
@@ -1214,15 +1307,93 @@ components:
           items:
             type: string
             format: uuid
+    ChatHistoryResponse:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          description: Entries of the page, ordered oldest to newest.
+          items:
+            $ref: "#/components/schemas/ChatHistoryEntry"
+        nextBefore:
+          type: string
+          description: Cursor for the next (older) page, to pass as `before`. Omitted on the last page.
     ChatHistoryEntry:
       type: object
-      required: [authorName, text, timestamp]
+      required: [id, role, kind, text, createdAt, authorName, timestamp]
       properties:
-        authorName:
+        id:
           type: string
+          description: |
+            Message id; equals `messageId` of the matching `chat_message_created`
+            event and is the value accepted by the `before` cursor.
+        role:
+          type: string
+          enum: [user, agent, system]
+          description: |
+            `user` for messages from this device, `agent` for agent replies,
+            `system` for service records such as voice recognition failures.
+        kind:
+          type: string
+          enum: [text, voice, error]
+          description: |
+            `text` for typed messages and agent replies, `voice` for voice
+            transcripts, `error` for failure notices (with role `system`).
         text:
           type: string
+          description: Message text (typed text, transcript, agent reply or failure message).
+        createdAt:
+          type: string
+          format: date-time
+        audio:
+          $ref: "#/components/schemas/ChatHistoryAudio"
+        tasks:
+          type: array
+          description: |
+            Cards of the tasks an agent reply touched, resolved at read time.
+            Deleted tasks are omitted; the field is absent when no task remains.
+          items:
+            $ref: "#/components/schemas/ChatHistoryTask"
+        authorName:
+          type: string
+          description: |
+            Kept for older clients: "agent" for agent replies, "system" for
+            system records, the device id for user messages.
         timestamp:
+          type: string
+          format: date-time
+          description: Same as `createdAt`; kept for older clients.
+    ChatHistoryAudio:
+      type: object
+      required: [jobId, durationMs]
+      description: Voice job of a transcript or of a voice failure.
+      properties:
+        jobId:
+          type: string
+          format: uuid
+          description: The jobId returned by POST /v1/chat/voice.
+        durationMs:
+          type: integer
+          minimum: 0
+          description: Audio length in milliseconds; 0 when unknown.
+    ChatHistoryTask:
+      type: object
+      required: [id, ref, summary, status]
+      description: Compact card of a task touched by an agent reply (current state of the task).
+      properties:
+        id:
+          type: string
+          format: uuid
+        ref:
+          type: string
+          description: Human-readable ref of the form <slug>-<number>.
+        summary:
+          type: string
+        status:
+          type: string
+          enum: [open, done, cancelled]
+        deadline:
           type: string
           format: date-time
     PairingRequestBody:
@@ -1324,6 +1495,8 @@ components:
         SSE event emitted for every agent interaction: text chat (POST /v1/chat)
         and voice chat (POST /v1/chat/voice). Two events are emitted per turn:
         role=user (transcript or typed text) followed by role=agent (agent reply).
+        The fields mirror the matching GET /v1/chat/history entry, so clients can
+        render the message live without refetching the history.
       properties:
         messageId:
           type: string
@@ -1344,6 +1517,12 @@ components:
         role:
           type: string
           enum: [user, agent]
+        kind:
+          type: string
+          enum: [text, voice]
+          description: |
+            `voice` for a voice transcript, `text` for typed messages and agent
+            replies. Absent in events emitted by older servers; treat as `text`.
         text:
           type: string
           description: Message text (transcript for voice, typed text for chat).
@@ -1351,6 +1530,19 @@ components:
           type: string
           format: uuid
           description: Present only when the message originated from a voice job (POST /v1/chat/voice).
+        audioDurationMs:
+          type: integer
+          minimum: 0
+          description: Audio length in milliseconds; present on voice transcripts when the length is known.
+        taskIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: |
+            UUIDs of the tasks an agent reply touched; absent when none. For a
+            quick voice acknowledgement the list holds the tasks seen so far;
+            tasks touched later appear in GET /v1/chat/history.
         createdAt:
           type: string
           format: date-time
@@ -1368,6 +1560,7 @@ components:
           enum:
             - transcription_failed
             - invalid_audio
+            - unsupported_format
             - agent_failed
           description: Machine-readable failure reason.
         message:

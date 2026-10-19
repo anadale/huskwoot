@@ -200,7 +200,7 @@ func (s *Server) routes() http.Handler {
 			}
 
 			if s.cfg.Chat != nil {
-				ch := newChatHandler(s.cfg.Chat, s.cfg.History, s.cfg.DB, s.cfg.Events, s.cfg.Broker, s.cfg.ChatTimeout, s.logger)
+				ch := newChatHandler(s.cfg.Chat, s.cfg.Tasks, s.cfg.History, s.cfg.DB, s.cfg.Events, s.cfg.Broker, s.cfg.ChatTimeout, s.logger)
 				v1.Post("/chat", ch.post)
 				v1.Get("/chat/history", ch.getHistory)
 			}

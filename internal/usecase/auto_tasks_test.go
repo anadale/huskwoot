@@ -3,6 +3,7 @@ package usecase_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -549,5 +550,128 @@ func TestAutoTasks_EmptyReferenceSetCreatesWithoutReview(t *testing.T) {
 	result := h.submit(t, "first-obligation")
 	if len(result.Created) != 1 || len(result.Pending) != 0 || result.Duplicates != 0 {
 		t.Fatalf("empty-project result=%+v", result)
+	}
+}
+
+// assertPriorityAndDetails checks that a task keeps the priority and source
+// details of the sample request.
+func assertPriorityAndDetails(t *testing.T, label string, task *model.Task, want *model.TaskSourceDetails) {
+	t.Helper()
+	if task == nil {
+		t.Fatalf("%s: task is nil", label)
+	}
+	if task.Priority != model.TaskPriorityHigh {
+		t.Errorf("%s: Priority = %d, want %d", label, task.Priority, model.TaskPriorityHigh)
+	}
+	assertSameSourceDetails(t, label, task.SourceDetails, want)
+}
+
+func assertSameSourceDetails(t *testing.T, label string, got, want *model.TaskSourceDetails) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("%s: SourceDetails is nil", label)
+	}
+	if got.Name != want.Name || got.Subject != want.Subject || got.Author != want.Author ||
+		got.Text != want.Text || got.Link != want.Link || got.Via != want.Via {
+		t.Errorf("%s: SourceDetails = %+v, want %+v", label, *got, *want)
+	}
+	if got.At == nil || !got.At.Equal(*want.At) {
+		t.Errorf("%s: SourceDetails.At = %v, want %v", label, got.At, want.At)
+	}
+	if got.ReplyTo == nil || *got.ReplyTo != *want.ReplyTo {
+		t.Errorf("%s: SourceDetails.ReplyTo = %+v, want %+v", label, got.ReplyTo, *want.ReplyTo)
+	}
+}
+
+func (h *autoHarness) submitDetailed(t *testing.T, key string, details *model.TaskSourceDetails) model.AutoTaskResult {
+	t.Helper()
+	result, err := h.service.Submit(context.Background(), model.AutoTaskSubmission{
+		InputKeys: []string{key},
+		Tasks: []model.CreateTaskRequest{{
+			Summary:       "Send report",
+			Priority:      model.TaskPriorityHigh,
+			Source:        model.Source{Kind: "telegram", ID: "-100123", Name: "Team"},
+			SourceDetails: details,
+		}},
+		SourceText: "I will send the report",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestAutoTasks_CreatedTaskKeepsPriorityAndSourceDetails(t *testing.T) {
+	h := newAutoHarness(t, autoCheckerFunc(differentAutoChecker))
+	details := sampleSourceDetails()
+
+	result := h.submitDetailed(t, "urgent-message", details)
+	if len(result.Created) != 1 {
+		t.Fatalf("result = %+v, want one created task", result)
+	}
+	assertPriorityAndDetails(t, "result", &result.Created[0], details)
+
+	stored, err := h.tasks.GetTask(context.Background(), result.Created[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPriorityAndDetails(t, "stored", stored, details)
+
+	evs, err := h.events.SinceSeq(context.Background(), 0, 0)
+	if err != nil || len(evs) != 1 {
+		t.Fatalf("events = %v err = %v", evs, err)
+	}
+	var payload struct {
+		Task struct {
+			Priority model.TaskPriority `json:"priority"`
+			Source   struct {
+				Kind string `json:"kind"`
+				model.TaskSourceDetails
+			} `json:"source"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal(evs[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Task.Priority != model.TaskPriorityHigh || payload.Task.Source.Kind != "telegram" {
+		t.Errorf("event task = %+v, want priority 3 and source kind telegram", payload.Task)
+	}
+	assertSameSourceDetails(t, "event", &payload.Task.Source.TaskSourceDetails, details)
+}
+
+func TestAutoTasks_ApprovedCandidateKeepsPriorityAndSourceDetails(t *testing.T) {
+	h := newAutoHarness(t, autoCheckerFunc(func(context.Context, model.CreateTaskRequest, string, []model.TaskReference) (model.TaskAssessment, error) {
+		return model.TaskAssessment{Verdict: "uncertain", Score: .8, Reason: "The period is not specified"}, nil
+	}))
+	h.seedReference(t)
+	details := sampleSourceDetails()
+
+	result := h.submitDetailed(t, "uncertain-urgent", details)
+	if len(result.Created) != 0 || len(result.Pending) != 1 {
+		t.Fatalf("result = %+v, want one pending candidate", result)
+	}
+
+	candidate, err := h.service.GetCandidate(context.Background(), result.Pending[0].ID)
+	if err != nil || candidate == nil {
+		t.Fatalf("candidate = %+v err = %v", candidate, err)
+	}
+	if candidate.Task.Priority != model.TaskPriorityHigh {
+		t.Errorf("candidate payload Priority = %d, want %d", candidate.Task.Priority, model.TaskPriorityHigh)
+	}
+	assertSameSourceDetails(t, "candidate payload", candidate.Task.SourceDetails, details)
+
+	decision, err := h.service.Decide(context.Background(), candidate.ID, true)
+	if err != nil || decision.Task == nil {
+		t.Fatalf("approve = %+v err = %v", decision, err)
+	}
+	assertPriorityAndDetails(t, "approved", decision.Task, details)
+
+	stored, err := h.tasks.GetTask(context.Background(), decision.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPriorityAndDetails(t, "stored", stored, details)
+	if stored.Source.Kind != "telegram" || stored.Source.ID != "-100123" {
+		t.Errorf("stored Source = %+v, want telegram/-100123", stored.Source)
 	}
 }

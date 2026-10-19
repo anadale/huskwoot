@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -176,11 +177,13 @@ func (e *ForwardTaskExtractor) Extract(ctx context.Context, msg model.Message, _
 		}
 
 		task := model.Task{
-			Summary:    resp.Summary,
-			Details:    resp.Context,
-			Topic:      resp.Topic,
-			Confidence: resp.Confidence,
-			CreatedAt:  now,
+			Summary:      resp.Summary,
+			Details:      resp.Context,
+			Topic:        resp.Topic,
+			Confidence:   resp.Confidence,
+			Priority:     extractedPriority(resp.Priority),
+			ForwardIndex: max(int(resp.Message), 0),
+			CreatedAt:    now,
 		}
 
 		if resp.Deadline != nil && !strings.EqualFold(*resp.Deadline, "null") && *resp.Deadline != "" {
@@ -207,6 +210,40 @@ type extractorModelResponse struct {
 	Project    string  `json:"project"`
 	Deadline   *string `json:"deadline"`
 	Confidence float64 `json:"confidence"`
+	// Message is the 1-based number of the forwarded message with the promise;
+	// returned only by the forward extractor and ignored by the message extractor.
+	Message lenientInt `json:"message"`
+	// Priority is the optional task priority (0–3) inferred from explicit urgency.
+	Priority lenientInt `json:"priority"`
+}
+
+// extractedPriority converts the model's priority into a task priority.
+// Missing, malformed and out-of-range values become TaskPriorityNone, so an
+// unclear answer never raises the priority.
+func extractedPriority(n lenientInt) model.TaskPriority {
+	p := model.TaskPriority(n)
+	if !p.Valid() {
+		return model.TaskPriorityNone
+	}
+	return p
+}
+
+// lenientInt decodes an optional integer from model output: a JSON number or a
+// numeric string. Anything else (null, a fraction, a non-numeric value) becomes
+// 0 instead of failing the whole response.
+type lenientInt int
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (n *lenientInt) UnmarshalJSON(data []byte) error {
+	*n = 0
+	raw := strings.TrimSpace(string(data))
+	if unquoted, err := strconv.Unquote(raw); err == nil {
+		raw = strings.TrimSpace(unquoted)
+	}
+	if v, err := strconv.Atoi(raw); err == nil {
+		*n = lenientInt(v)
+	}
+	return nil
 }
 
 // extractorData holds data for rendering TaskExtractor prompts.
@@ -302,6 +339,7 @@ func (e *TaskExtractor) Extract(ctx context.Context, msg model.Message, history 
 			Details:       resp.Context,
 			Topic:         resp.Topic,
 			Confidence:    resp.Confidence,
+			Priority:      extractedPriority(resp.Priority),
 			Source:        msg.Source,
 			SourceMessage: msg,
 			CreatedAt:     msgTime,

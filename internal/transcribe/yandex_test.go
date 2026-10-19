@@ -31,15 +31,15 @@ func TestYandex_Transcribe(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		response    serverResponse
-		sleep       time.Duration
-		timeout     time.Duration
-		audio       model.AudioInput
-		wantText    string
-		wantErr     bool
+		name           string
+		response       serverResponse
+		sleep          time.Duration
+		timeout        time.Duration
+		audio          model.AudioInput
+		wantText       string
+		wantErr        bool
 		wantErrContain string
-		checkReq    func(t *testing.T, r *http.Request, body []byte)
+		checkReq       func(t *testing.T, r *http.Request, body []byte)
 	}{
 		{
 			name: "success",
@@ -355,7 +355,7 @@ func makeWAV(pcm []byte) []byte {
 	out[24], out[25], out[26], out[27] = 0x80, 0x3E, 0x00, 0x00
 	// byte rate = 32000 = 0x7D00
 	out[28], out[29], out[30], out[31] = 0x00, 0x7D, 0x00, 0x00
-	out[32] = 2 // block align
+	out[32] = 2  // block align
 	out[34] = 16 // bits per sample
 	copy(out[36:], "data")
 	out[40], out[41], out[42], out[43] = byte(dataSize), byte(dataSize>>8), byte(dataSize>>16), byte(dataSize>>24)

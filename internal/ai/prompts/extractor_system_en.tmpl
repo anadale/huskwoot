@@ -41,6 +41,11 @@ Rules for project:
 - If the text mentions a project or system from the list above — specify the exact name
 - If project is not mentioned or not recognized — leave empty string
 {{end}}
+Rules for priority:
+- 3 — only when urgency is stated explicitly in the promise or in the request it answers: "urgent", "ASAP", "as soon as possible", "on fire", "срочно", "горит"
+- 0 in all other cases. Do not infer priority from a close deadline, the importance of the topic, or the tone of the message
+- Do not use other values
+
 Deadline calculation:
 - Use the "Current date and time" value from the user prompt as the reference point.
 - If you can unambiguously calculate absolute time — return in ISO 8601 format with timezone.
@@ -48,6 +53,6 @@ Deadline calculation:
 - If no deadline is specified in the text at all — null.
 
 Return a JSON array without additional text. If there are no promises OR none of the found promises can be turned into an informative summary with a concrete object — return [].
-[{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
+[{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "ISO 8601 or null", "priority": 0, "confidence": 0.0-1.0}]
 
 Always respond in English.

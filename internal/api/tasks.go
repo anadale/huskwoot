@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/anadale/huskwoot/internal/model"
+	"github.com/anadale/huskwoot/internal/usecase"
 )
 
 const (
@@ -27,19 +28,41 @@ const (
 // taskDTO is the public task snapshot in JSON responses. Fields and their names
 // are kept in sync with the OpenAPI Task schema.
 type taskDTO struct {
-	ID          string     `json:"id"`
-	Number      int        `json:"number"`
-	Ref         string     `json:"ref"`
-	ProjectID   string     `json:"projectId"`
-	ProjectSlug string     `json:"projectSlug"`
-	Summary     string     `json:"summary"`
-	Details     string     `json:"details,omitempty"`
-	Topic       string     `json:"topic,omitempty"`
-	Status      string     `json:"status"`
-	Deadline    *time.Time `json:"deadline,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	ClosedAt    *time.Time `json:"closedAt,omitempty"`
+	ID          string         `json:"id"`
+	Number      int            `json:"number"`
+	Ref         string         `json:"ref"`
+	ProjectID   string         `json:"projectId"`
+	ProjectSlug string         `json:"projectSlug"`
+	Summary     string         `json:"summary"`
+	Details     string         `json:"details,omitempty"`
+	Topic       string         `json:"topic,omitempty"`
+	Status      string         `json:"status"`
+	Priority    int            `json:"priority"`
+	Deadline    *time.Time     `json:"deadline,omitempty"`
+	Source      *taskSourceDTO `json:"source,omitempty"`
+	CreatedAt   time.Time      `json:"createdAt"`
+	UpdatedAt   time.Time      `json:"updatedAt"`
+	ClosedAt    *time.Time     `json:"closedAt,omitempty"`
+}
+
+// taskSourceDTO is the task source in JSON responses (OpenAPI TaskSource): the
+// channel kind plus the snapshot of the message the task was created from.
+type taskSourceDTO struct {
+	Kind    string              `json:"kind,omitempty"`
+	Name    string              `json:"name,omitempty"`
+	Subject string              `json:"subject,omitempty"`
+	Author  string              `json:"author,omitempty"`
+	Text    string              `json:"text,omitempty"`
+	At      *time.Time          `json:"at,omitempty"`
+	ReplyTo *taskSourceQuoteDTO `json:"replyTo,omitempty"`
+	Link    string              `json:"link,omitempty"`
+	Via     string              `json:"via,omitempty"`
+}
+
+// taskSourceQuoteDTO is the quoted message in taskSourceDTO (OpenAPI TaskSourceQuote).
+type taskSourceQuoteDTO struct {
+	Author string `json:"author,omitempty"`
+	Text   string `json:"text,omitempty"`
 }
 
 func toTaskDTO(t *model.Task) taskDTO {
@@ -53,11 +76,35 @@ func toTaskDTO(t *model.Task) taskDTO {
 		Details:     t.Details,
 		Topic:       t.Topic,
 		Status:      t.Status,
+		Priority:    int(t.Priority),
 		Deadline:    t.Deadline,
+		Source:      toTaskSourceDTO(t),
 		CreatedAt:   t.CreatedAt,
 		UpdatedAt:   t.UpdatedAt,
 		ClosedAt:    t.ClosedAt,
 	}
+}
+
+// toTaskSourceDTO returns nil when the task has neither a source kind nor
+// source details, so the "source" key is omitted from the response.
+func toTaskSourceDTO(t *model.Task) *taskSourceDTO {
+	if t.Source.Kind == "" && t.SourceDetails == nil {
+		return nil
+	}
+	out := &taskSourceDTO{Kind: t.Source.Kind}
+	if d := t.SourceDetails; d != nil {
+		out.Name = d.Name
+		out.Subject = d.Subject
+		out.Author = d.Author
+		out.Text = d.Text
+		out.At = d.At
+		out.Link = d.Link
+		out.Via = d.Via
+		if d.ReplyTo != nil {
+			out.ReplyTo = &taskSourceQuoteDTO{Author: d.ReplyTo.Author, Text: d.ReplyTo.Text}
+		}
+	}
+	return out
 }
 
 // httpTaskRef builds a URL-safe reference in the form "<slug>-<number>" — the
@@ -74,6 +121,30 @@ type createTaskRequest struct {
 	Details   string     `json:"details,omitempty"`
 	Topic     string     `json:"topic,omitempty"`
 	Deadline  *time.Time `json:"deadline,omitempty"`
+	// Priority is kept raw so that a value of the wrong type is reported as
+	// 422 by parsePriority instead of a generic 400 decoding error.
+	Priority json.RawMessage `json:"priority,omitempty"`
+}
+
+// errInvalidPriority reports a priority that is not an integer in the 0–3 range.
+var errInvalidPriority = errors.New("priority must be an integer between 0 and 3")
+
+// parsePriority decodes a JSON priority value. Only integers in the 0–3 range
+// are accepted; null, fractions, strings and other types yield errInvalidPriority.
+func parsePriority(raw json.RawMessage) (model.TaskPriority, error) {
+	raw = bytes.TrimSpace(raw)
+	if bytes.Equal(raw, []byte("null")) {
+		return 0, errInvalidPriority
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, errInvalidPriority
+	}
+	p := model.TaskPriority(n)
+	if !p.Valid() {
+		return 0, errInvalidPriority
+	}
+	return p, nil
 }
 
 // moveTaskRequest is the request body for POST /v1/tasks/{id}/move.
@@ -214,17 +285,33 @@ func (h *tasksHandler) create(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, "summary field is required")
 		return
 	}
+	var priority model.TaskPriority
+	if len(req.Priority) > 0 {
+		p, err := parsePriority(req.Priority)
+		if err != nil {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, err.Error())
+			return
+		}
+		priority = p
+	}
 
 	task, err := h.service.CreateTask(r.Context(), model.CreateTaskRequest{
-		ProjectID: req.ProjectID,
-		Summary:   req.Summary,
-		Details:   req.Details,
-		Topic:     req.Topic,
-		Deadline:  req.Deadline,
+		ProjectID:     req.ProjectID,
+		Summary:       req.Summary,
+		Details:       req.Details,
+		Topic:         req.Topic,
+		Deadline:      req.Deadline,
+		Priority:      priority,
+		Source:        model.Source{Kind: chatSourceKind, ID: DeviceIDFromContext(r.Context())},
+		SourceDetails: &model.TaskSourceDetails{Via: model.SourceViaAPI},
 	})
 	if err != nil {
 		if isNotFoundErr(err) {
 			WriteError(w, http.StatusNotFound, ErrorCodeNotFound, "project not found")
+			return
+		}
+		if errors.Is(err, usecase.ErrInvalidTaskPriority) {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, errInvalidPriority.Error())
 			return
 		}
 		h.logError(r.Context(), "create task", err)
@@ -247,6 +334,10 @@ func (h *tasksHandler) update(w http.ResponseWriter, r *http.Request) {
 	}
 	upd, err := buildTaskUpdate(raw)
 	if err != nil {
+		if errors.Is(err, errInvalidPriority) {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, err.Error())
+			return
+		}
 		WriteError(w, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
 		return
 	}
@@ -258,6 +349,10 @@ func (h *tasksHandler) update(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if isNotFoundErr(err) {
 			WriteError(w, http.StatusNotFound, ErrorCodeNotFound, "task not found")
+			return
+		}
+		if errors.Is(err, usecase.ErrInvalidTaskPriority) {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, errInvalidPriority.Error())
 			return
 		}
 		h.logError(r.Context(), "update task", err)
@@ -404,10 +499,12 @@ var allowedTaskUpdateFields = map[string]bool{
 	"details":  true,
 	"status":   true,
 	"deadline": true,
+	"priority": true,
 }
 
 // buildTaskUpdate assembles a model.TaskUpdate from a raw JSON map, distinguishing
 // "field absent" from "field=null" (the latter is used to clear deadline).
+// An invalid priority yields errInvalidPriority, which the handler maps to 422.
 func buildTaskUpdate(raw map[string]json.RawMessage) (model.TaskUpdate, error) {
 	for k := range raw {
 		if !allowedTaskUpdateFields[k] {
@@ -456,6 +553,13 @@ func buildTaskUpdate(raw map[string]json.RawMessage) (model.TaskUpdate, error) {
 			ptr := &ts
 			upd.Deadline = &ptr
 		}
+	}
+	if v, ok := raw["priority"]; ok {
+		p, err := parsePriority(v)
+		if err != nil {
+			return model.TaskUpdate{}, err
+		}
+		upd.Priority = &p
 	}
 	return upd, nil
 }

@@ -49,13 +49,21 @@ const (
 )
 
 // withTouched returns a context carrying touched-ID sets for tasks and
-// projects. The sets are also returned directly so the caller can read them
-// after the processing chain completes.
+// projects. Sets already present in ctx are reused rather than shadowed, so a
+// caller that wraps the processing chain (the client voice consumer) observes
+// the IDs while the chain is still running. The sets are also returned
+// directly so the caller can read them after the processing chain completes.
 func withTouched(ctx context.Context) (context.Context, *touchedSet, *touchedSet) {
-	tasks := newTouchedSet()
-	projects := newTouchedSet()
-	ctx = context.WithValue(ctx, touchedTasksKey, tasks)
-	ctx = context.WithValue(ctx, touchedProjectsKey, projects)
+	tasks, ok := ctx.Value(touchedTasksKey).(*touchedSet)
+	if !ok || tasks == nil {
+		tasks = newTouchedSet()
+		ctx = context.WithValue(ctx, touchedTasksKey, tasks)
+	}
+	projects, ok := ctx.Value(touchedProjectsKey).(*touchedSet)
+	if !ok || projects == nil {
+		projects = newTouchedSet()
+		ctx = context.WithValue(ctx, touchedProjectsKey, projects)
+	}
 	return ctx, tasks, projects
 }
 

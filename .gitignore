@@ -11,5 +11,6 @@ data/
 
 .claude/
 .ralphex/progress
+.revmux/
 
 .gomodcache/

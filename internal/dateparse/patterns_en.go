@@ -84,9 +84,9 @@ func matchEnDayTime(s string, now time.Time, cfg Config) (time.Time, bool) {
 	}
 
 	type entry struct {
-		phrase  string
-		dayOff  int
-		hour    int // -1 = use cfg.TimeOfDay.Default
+		phrase string
+		dayOff int
+		hour   int // -1 = use cfg.TimeOfDay.Default
 	}
 
 	entries := []entry{

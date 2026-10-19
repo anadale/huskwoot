@@ -1336,17 +1336,17 @@ func TestLoad_TimeOfDayDefault(t *testing.T) {
 
 func TestLoad_TranscriberSection(t *testing.T) {
 	cases := []struct {
-		name        string
-		extra       string
-		wantErr     bool
-		wantMaxDur  time.Duration
+		name         string
+		extra        string
+		wantErr      bool
+		wantMaxDur   time.Duration
 		wantProvider string
 	}{
 		{
-			name:        "секция отсутствует — ok, дефолт 5m",
-			extra:       "",
-			wantErr:     false,
-			wantMaxDur:  5 * time.Minute,
+			name:         "секция отсутствует — ok, дефолт 5m",
+			extra:        "",
+			wantErr:      false,
+			wantMaxDur:   5 * time.Minute,
 			wantProvider: "",
 		},
 		{
@@ -1355,8 +1355,8 @@ func TestLoad_TranscriberSection(t *testing.T) {
 [transcriber]
 provider = ""
 `,
-			wantErr:     false,
-			wantMaxDur:  5 * time.Minute,
+			wantErr:      false,
+			wantMaxDur:   5 * time.Minute,
 			wantProvider: "",
 		},
 		{
@@ -1368,8 +1368,8 @@ provider = "whisper"
 binary = "/usr/local/bin/whisper-cli"
 model = "/var/models/ggml-base.bin"
 `,
-			wantErr:     false,
-			wantMaxDur:  5 * time.Minute,
+			wantErr:      false,
+			wantMaxDur:   5 * time.Minute,
 			wantProvider: "whisper",
 		},
 		{
@@ -1401,8 +1401,8 @@ provider = "yandex"
 api_key = "aqd-key"
 folder_id = "folder123"
 `,
-			wantErr:     false,
-			wantMaxDur:  5 * time.Minute,
+			wantErr:      false,
+			wantMaxDur:   5 * time.Minute,
 			wantProvider: "yandex",
 		},
 		{

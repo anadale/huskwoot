@@ -83,10 +83,10 @@ func TestUpdateProjectTool_Execute(t *testing.T) {
 			wantUpdSlugSet:          true,
 		},
 		{
-			name:                 "error — no fields provided",
-			args:                 `{"ref":"proj-uuid-1"}`,
+			name:                    "error — no fields provided",
+			args:                    `{"ref":"proj-uuid-1"}`,
 			resolveProjectRefResult: baseProject,
-			wantErr:              true,
+			wantErr:                 true,
 		},
 		{
 			name:                 "error — project not found",

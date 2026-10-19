@@ -258,3 +258,25 @@ func TestProjectAliasKeysPresent(t *testing.T) {
 		}
 	}
 }
+
+func TestTaskPriorityKeysPresent(t *testing.T) {
+	keys := []string{
+		"tool_create_task_param_priority",
+		"tool_update_task_param_priority",
+		"agent_priority_invalid",
+	}
+
+	for _, lang := range []string{"ru", "en"} {
+		bundle, err := i18n.NewBundle(lang)
+		if err != nil {
+			t.Fatalf("NewBundle(%s): %v", lang, err)
+		}
+		loc := i18n.NewLocalizer(bundle, lang)
+		for _, key := range keys {
+			got := i18n.Translate(loc, key, nil)
+			if got == key {
+				t.Errorf("locale %s: key %q is missing or untranslated", lang, key)
+			}
+		}
+	}
+}

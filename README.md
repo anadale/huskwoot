@@ -35,6 +35,7 @@ Send a message directly to your bot and get a full task management assistant pow
 Available in DM:
 - **Create and list projects** — organize tasks across areas of work
 - **Create tasks** — add tasks with summaries, deadlines, and project assignment
+- **Set priorities** — "make it urgent", "raise the priority", "remove the priority"; tasks with a priority are shown with `!`, `!!` or `!!!`. The agent sets a priority only when you ask for one explicitly
 - **List and filter tasks** — by project and status
 - **Complete and move tasks** — between projects
 - **Bind a chat to a project** — so tasks from a specific group go directly to the right project
@@ -44,7 +45,7 @@ Available in DM:
 In a private Telegram chat you can't add a bot — so commitments you make there get lost. Huskwoot solves this: forward any selection of messages from a 1:1 conversation into your DM with the bot. The bot accumulates them silently, extracts the promises **you** made, and checks for existing obligations before creating tasks.
 
 - **Trigger:** wait for the silence timeout (`forward_batch_timeout`) or send any non-forwarded message to kick off processing immediately. Include `#<project-slug-or-alias>` (e.g. `process #work` or just `#work`) to route tasks to a specific project; otherwise they go to Inbox.
-- **What's recognized:** only your promises — detected from Telegram forward metadata (`forward_from.id`). Your messages are labeled `[я, …]` (the localized marker for the owner); the other person's messages provide context.
+- **What's recognized:** only your promises — detected from Telegram forward metadata (`forward_from.id`). Your messages are labeled `[я, …]` (the localized marker for the owner); the other person's messages provide context. Messages are numbered in chronological order, so every task remembers the author, text and time of the forwarded message that contains the promise.
 - **Review:** the bot checks extracted promises for duplicates. New tasks appear in your list; uncertain candidates require a decision in DM.
 - **Cleanup:** set `delete_forwards_after_extract = true` to delete the processed forwarded messages and trigger from DM only when the batch immediately creates at least one task. The bot's confirmation remains. A skipped, pending-only, or duplicate-only batch leaves the Telegram messages intact.
 
@@ -126,6 +127,14 @@ Digests are sent only on working days (`weekdays`). Missed slots on restart are 
 Huskwoot exposes a REST API for mobile clients — projects, tasks, SSE event stream, and a secure device pairing flow via Telegram DM. Push notifications are delivered through an optional `huskwoot-push-relay` service.
 
 Mobile clients can send voice recordings via `POST /v1/chat/voice` (multipart upload). The server transcribes the audio asynchronously and delivers the transcript and the agent's reply as `chat_message_created` SSE events. The `GET /v1/me` response includes a `voiceEnabled` flag indicating whether transcription is configured.
+
+**Task priority.** Every task has a `priority` from 0 to 3 (none, low, medium, high). Set it with `POST /v1/tasks` or change it with `PATCH /v1/tasks/{id}`; values that are not integers in 0–3 (including `null`) are rejected with 422, and 0 clears the priority. The agent changes priority on request, and promises extracted from chats and email get priority 3 only when urgency is stated explicitly ("urgent", "ASAP", "срочно").
+
+**Task source.** Tasks carry a `source` object describing where the promise came from: the channel `kind` (`telegram`, `imap` or `client`), the chat title or email subject, the author and text of the promise message, the message it replied to, the time, a deep link (Telegram supergroups and channels only) and `via` — how the task was created (`message`, `forward`, `chat`, `voice` or `api`). The source is a snapshot taken when the task is created, so it survives history cleanup. Tasks created before source snapshots existed report at most `source.kind`.
+
+**Agent chat history.** `GET /v1/chat/history` returns the current device's conversation with the agent one page at a time, starting from the newest entries (each page is ordered oldest to newest): typed and voice messages (with the audio job id and duration), agent replies with cards of the tasks they touched, and voice recognition failures. Pass `limit` (default 50, at most 500) and the returned `nextBefore` as `before` to page back through older entries. The `chat_message_created` event carries the same `kind`, `audioDurationMs` and `taskIds`, so a client can render new messages without refetching the history. Voice failures are kept in the history but never reach the agent's context.
+
+These additions are backward compatible: older clients ignore the new response fields, and requests without the new fields behave as before. See the [OpenAPI specification](api/openapi.yaml) for the full contract.
 
 ---
 

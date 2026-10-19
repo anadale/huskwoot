@@ -1,8 +1,10 @@
 Extract the promises I made to the contact from a 1:1 conversation.
 
+Every message starts with its number in square brackets: [1], [2], …
+
 Author labels in the text:
-- [me, <date>] — my message
-- [<contact_name>, <date>] — the contact's message
+- [N] [me, <date>] — my message
+- [N] [<contact_name>, <date>] — the contact's message
 
 A promise means only lines labeled [me, ...]: when I personally commit to doing something
 specific for the contact.
@@ -34,6 +36,15 @@ Rules for topic:
 - Thematic area: component, system, meeting, or work domain
 - Leave empty string if unclear
 
+Rules for message:
+- The number N of the [N] [me, ...] message in which I made the promise — an integer
+- If the promise spans several of my messages — the number of the message with the commitment itself
+
+Rules for priority:
+- 3 — only when urgency is stated explicitly in my promise or in the contact's message it answers: "urgent", "ASAP", "as soon as possible", "on fire", "срочно", "горит"
+- 0 in all other cases. Do not infer priority from a close deadline, the importance of the topic, or the tone of the conversation
+- Do not use other values
+
 Deadline calculation:
 - Use the "Current date and time" value from the user prompt as the reference point.
 - If you can unambiguously calculate absolute time — return in ISO 8601 format with timezone.
@@ -42,6 +53,6 @@ Deadline calculation:
 - If no deadline is specified in the text at all — null.
 
 Return a JSON array without additional text. If there are no promises OR none of the found promises can be turned into an informative summary with a concrete object — return [].
-[{"summary": "what to do", "context": "Promised to: <name>. Context.", "topic": "topic or empty string", "project": "", "deadline": "ISO 8601 or null", "confidence": 0.0-1.0}]
+[{"summary": "what to do", "context": "Promised to: <name>. Context.", "topic": "topic or empty string", "project": "", "deadline": "ISO 8601 or null", "message": 1, "priority": 0, "confidence": 0.0-1.0}]
 
 Always respond in English.

@@ -62,14 +62,16 @@ func (t *listTasksTool) Execute(ctx context.Context, args string) (string, error
 	}
 
 	type taskItem struct {
-		ID          string `json:"id"`
-		DisplayID   string `json:"display_id"`
-		ProjectID   string `json:"project_id"`
-		ProjectSlug string `json:"project_slug"`
-		Summary     string `json:"summary"`
-		Status      string `json:"status"`
-		Deadline    string `json:"deadline,omitempty"`
-		ClosedAt    string `json:"closed_at,omitempty"`
+		ID           string `json:"id"`
+		DisplayID    string `json:"display_id"`
+		ProjectID    string `json:"project_id"`
+		ProjectSlug  string `json:"project_slug"`
+		Summary      string `json:"summary"`
+		Status       string `json:"status"`
+		Deadline     string `json:"deadline,omitempty"`
+		ClosedAt     string `json:"closed_at,omitempty"`
+		Priority     int    `json:"priority,omitempty"`
+		PriorityMark string `json:"priority_marker,omitempty"`
 	}
 	items := make([]taskItem, len(tasks))
 	for i, task := range tasks {
@@ -80,6 +82,10 @@ func (t *listTasksTool) Execute(ctx context.Context, args string) (string, error
 			ProjectSlug: task.ProjectSlug,
 			Summary:     task.Summary,
 			Status:      task.Status,
+		}
+		if marker := priorityMarker(task.Priority); marker != "" {
+			item.Priority = int(task.Priority)
+			item.PriorityMark = marker
 		}
 		if task.Deadline != nil {
 			item.Deadline = task.Deadline.Format(time.RFC3339)

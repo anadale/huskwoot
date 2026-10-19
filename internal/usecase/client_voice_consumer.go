@@ -30,10 +30,13 @@ type clientChatMessagePayload struct {
 		Kind string `json:"kind"`
 		ID   string `json:"id"`
 	} `json:"source"`
-	Role       string    `json:"role"`
-	Text       string    `json:"text"`
-	AudioJobID string    `json:"audioJobId,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
+	Role            string    `json:"role"`
+	Kind            string    `json:"kind"`
+	Text            string    `json:"text"`
+	AudioJobID      string    `json:"audioJobId,omitempty"`
+	AudioDurationMs int64     `json:"audioDurationMs,omitempty"`
+	TaskIDs         []string  `json:"taskIds,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 // clientVoiceFailedPayload is the JSON payload for voice_failed events.
@@ -60,6 +63,20 @@ type ClientVoiceConsumerDeps struct {
 // distinct from transcription failures.
 var errAgentFailed = errors.New("agent failed")
 
+// Default timings of the voice ack race in Consume.
+const (
+	// defaultClientVoiceAckGrace is how long Consume waits for the real agent
+	// reply after the first task mutation event before sending a synthetic one.
+	defaultClientVoiceAckGrace = 1500 * time.Millisecond
+	// defaultClientVoiceHardDeadline bounds the wait for the agent reply, both
+	// in the race and in the background drain after a synthetic reply.
+	defaultClientVoiceHardDeadline = 60 * time.Second
+)
+
+// clientVoiceSyntheticReply is the agent reply text sent when the agent has
+// already mutated a task but its real reply is late or empty.
+const clientVoiceSyntheticReply = "Готово"
+
 type clientVoiceConsumer struct {
 	db      *sql.DB
 	history model.History
@@ -69,6 +86,9 @@ type clientVoiceConsumer struct {
 	tasks   model.TaskStore
 	logger  *slog.Logger
 	now     func() time.Time
+
+	ackGrace     time.Duration
+	hardDeadline time.Duration
 }
 
 // NewClientVoiceConsumer creates a model.VoiceConsumer for HTTP API client voice jobs.
@@ -102,6 +122,9 @@ func NewClientVoiceConsumer(deps ClientVoiceConsumerDeps) model.VoiceConsumer {
 		tasks:   deps.Tasks,
 		logger:  logger,
 		now:     time.Now,
+
+		ackGrace:     defaultClientVoiceAckGrace,
+		hardDeadline: defaultClientVoiceHardDeadline,
 	}
 }
 
@@ -117,7 +140,16 @@ func (c *clientVoiceConsumer) Consume(ctx context.Context, job model.VoiceJob, t
 	now := c.now().UTC()
 
 	// tx1: persist user message + emit chat_message_created(user) with audioJobId
-	_, userEv, err := c.insertChatEvent(ctx, sourceID, job.DeviceID, "user", transcript, now, job.ClientJobID)
+	userEntry := model.HistoryEntry{
+		AuthorName:      job.DeviceID,
+		Text:            transcript,
+		Timestamp:       now,
+		Role:            model.HistoryRoleUser,
+		Kind:            model.HistoryKindVoice,
+		AudioJobID:      job.ClientJobID,
+		AudioDurationMs: job.Duration.Milliseconds(),
+	}
+	_, userEv, err := c.insertChatEvent(ctx, sourceID, job.DeviceID, userEntry, job.ClientJobID)
 	if err != nil {
 		return fmt.Errorf("client voice: user event: %w", err)
 	}
@@ -146,6 +178,7 @@ func (c *clientVoiceConsumer) Consume(ctx context.Context, job model.VoiceJob, t
 		Text:        transcript,
 		Timestamp:   now,
 		ProjectHint: projectHint,
+		VoiceJobID:  job.ClientJobID,
 	}
 	if c.history != nil {
 		msg.HistoryFn = func(hCtx context.Context) ([]model.HistoryEntry, error) {
@@ -153,24 +186,33 @@ func (c *clientVoiceConsumer) Consume(ctx context.Context, job model.VoiceJob, t
 		}
 	}
 
-	// Race: ChatService.HandleMessage блокируется до получения текстового reply
-	// от LLM (в т.ч. возможный second-turn после tool-call). Если агент создал
-	// задачу через tool-call, broker уже опубликовал task event; в этот момент
-	// у клиента всё, что важно для пользователя, готово, и нет смысла держать
-	// его overlay открытым ещё несколько секунд ради текстового reply.
+	// Race: ChatService.HandleMessage blocks until the LLM produces a text reply
+	// (possibly after a second turn following a tool call). Once the agent has
+	// mutated a task through a tool call, the broker has already published the
+	// task event; everything that matters to the user is ready, so there is no
+	// point in keeping the client overlay open for a few more seconds.
 	//
-	// Логика: запускаем HandleMessage в отдельной горутине и параллельно слушаем
-	// broker. Если за clientVoiceAckGrace после первого task event настоящий
-	// reply ещё не пришёл — отправляем synthetic agent reply («Готово») с тем
-	// же audioJobId; это закроет клиентскую сессию. Реальный reply, если придёт
-	// позже, будет проигнорирован клиентом через recentlyHandledMessageIds.
+	// HandleMessage runs in a separate goroutine while the broker is watched.
+	// The broker fans every event out to every subscriber, so a task event on
+	// this channel may come from another source (the Telegram pipeline, another
+	// device's REST call). Task events therefore only arm the ack timer; the
+	// task ids come from touched, the set scoped to this agent call that the
+	// task service fills through the context passed to HandleMessage (the chat
+	// service reuses it instead of creating its own). If the real reply has not
+	// arrived within ackGrace after a task event (or by the hard deadline) and
+	// the agent has touched a task, a synthetic agent reply ("Готово") with the
+	// same audioJobId and those task ids closes the client session; a late real
+	// reply is not sent, but its TasksTouched are merged into the synthetic
+	// history entry. If the agent has touched nothing, the event came from
+	// elsewhere and the race goes on.
+	agentCtx, touched, _ := withTouched(ctx)
 	ackEvents, ackUnsubscribe := c.broker.Subscribe(job.DeviceID)
 	defer ackUnsubscribe()
 
 	replyCh := make(chan model.ChatReply, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		reply, herr := c.chat.HandleMessage(ctx, msg)
+		reply, herr := c.chat.HandleMessage(agentCtx, msg)
 		if herr != nil {
 			errCh <- herr
 			return
@@ -178,11 +220,8 @@ func (c *clientVoiceConsumer) Consume(ctx context.Context, job model.VoiceJob, t
 		replyCh <- reply
 	}()
 
-	const ackGrace = 1500 * time.Millisecond
-	const hardDeadline = 60 * time.Second
-	deadline := time.After(hardDeadline)
+	deadline := time.After(c.hardDeadline)
 	var ackTimer <-chan time.Time
-	var taskFired bool
 
 raceLoop:
 	for {
@@ -194,31 +233,41 @@ raceLoop:
 				ackEvents = nil
 				continue
 			}
-			// Подписка открыта непосредственно перед HandleMessage, так что любой
-			// task-event, прилетевший в этот канал, гарантированно вызван текущим
-			// agent-вызовом. Не фильтруем по timestamp: recordEvent в task service
-			// не заполняет CreatedAt, поле остаётся zero и фильтр по времени
-			// отбрасывал валидные события.
-			if !taskFired && isTaskMutationEvent(ev.Kind) {
-				taskFired = true
-				ackTimer = time.After(ackGrace)
+			// Events are not filtered by timestamp: recordEvent in the task
+			// service leaves CreatedAt zero, and a time filter dropped valid
+			// events. Whether the event belongs to this agent call is decided
+			// by touched when the timer fires: the task service records the id
+			// right after notifying the broker.
+			if !isTaskMutationEvent(ev.Kind) {
+				continue
+			}
+			if ackTimer == nil {
+				ackTimer = time.After(c.ackGrace)
 			}
 		case <-ackTimer:
-			if err := c.emitAgentReply(ctx, sourceID, job.DeviceID, "Готово", job.ClientJobID); err != nil {
+			taskIDs := touched.values()
+			if len(taskIDs) == 0 {
+				// The event was not caused by this agent call; wait for the
+				// next task event, the real reply or the hard deadline.
+				ackTimer = nil
+				continue
+			}
+			msgID, err := c.emitAgentReply(ctx, sourceID, job.DeviceID, clientVoiceSyntheticReply, job.ClientJobID, taskIDs)
+			if err != nil {
 				c.Fail(ctx, job, fmt.Errorf("%w: client voice: persist agent reply: %w", errAgentFailed, err))
 				return nil
 			}
-			c.drainHandleMessage(replyCh, errCh, hardDeadline)
+			c.drainHandleMessage(msgID, replyCh, errCh)
 			break raceLoop
 		case reply := <-replyCh:
 			if reply.Text == "" && len(reply.TasksTouched) > 0 {
-				reply.Text = "Готово"
+				reply.Text = clientVoiceSyntheticReply
 			}
 			if reply.Text == "" {
 				c.Fail(ctx, job, fmt.Errorf("%w: client voice: agent returned empty reply", errAgentFailed))
 				return nil
 			}
-			if err := c.emitAgentReply(ctx, sourceID, job.DeviceID, reply.Text, job.ClientJobID); err != nil {
+			if _, err := c.emitAgentReply(ctx, sourceID, job.DeviceID, reply.Text, job.ClientJobID, reply.TasksTouched); err != nil {
 				c.Fail(ctx, job, fmt.Errorf("%w: client voice: persist agent reply: %w", errAgentFailed, err))
 				return nil
 			}
@@ -227,12 +276,13 @@ raceLoop:
 			c.Fail(ctx, job, fmt.Errorf("%w: client voice: chat: %w", errAgentFailed, herr))
 			return nil
 		case <-deadline:
-			if taskFired {
-				if err := c.emitAgentReply(ctx, sourceID, job.DeviceID, "Готово", job.ClientJobID); err != nil {
+			if taskIDs := touched.values(); len(taskIDs) > 0 {
+				msgID, err := c.emitAgentReply(ctx, sourceID, job.DeviceID, clientVoiceSyntheticReply, job.ClientJobID, taskIDs)
+				if err != nil {
 					c.Fail(ctx, job, fmt.Errorf("%w: client voice: persist agent reply: %w", errAgentFailed, err))
 					return nil
 				}
-				c.drainHandleMessage(replyCh, errCh, hardDeadline)
+				c.drainHandleMessage(msgID, replyCh, errCh)
 			} else {
 				c.Fail(ctx, job, fmt.Errorf("%w: client voice: agent timeout", errAgentFailed))
 			}
@@ -245,8 +295,9 @@ raceLoop:
 	return nil
 }
 
-// isTaskMutationEvent reports whether ev kind represents a task mutation worth
-// treating as an "agent did something" signal for the voice ack-fast path.
+// isTaskMutationEvent reports whether ev kind represents a task mutation that
+// arms the ack timer of the voice fast path. The event itself is not
+// attributed to the agent call: the touched set of the call decides that.
 func isTaskMutationEvent(kind model.EventKind) bool {
 	switch kind {
 	case model.EventTaskCreated, model.EventTaskUpdated,
@@ -258,41 +309,65 @@ func isTaskMutationEvent(kind model.EventKind) bool {
 	}
 }
 
-// emitAgentReply persists an agent chat message and notifies the broker.
-// Returns the persistence error so the caller can decide whether to escalate
-// to a voice_failed event (the user-facing client still expects a terminal
-// signal even when the agent reply itself fails to persist).
-func (c *clientVoiceConsumer) emitAgentReply(ctx context.Context, sourceID, deviceID, text, audioJobID string) error {
-	agentNow := c.now().UTC()
-	_, agentEv, agentErr := c.insertChatEvent(ctx, sourceID, deviceID, "agent", text, agentNow, audioJobID)
+// emitAgentReply persists an agent chat message with the touched task ids and
+// notifies the broker. Returns the stored message id. Returns the persistence
+// error so the caller can decide whether to escalate to a voice_failed event
+// (the user-facing client still expects a terminal signal even when the agent
+// reply itself fails to persist). audioJobID only correlates the live event
+// with the voice job; the history row is a plain text reply.
+func (c *clientVoiceConsumer) emitAgentReply(ctx context.Context, sourceID, deviceID, text, audioJobID string, taskIDs []string) (string, error) {
+	entry := model.HistoryEntry{
+		AuthorName: "agent",
+		Text:       text,
+		Timestamp:  c.now().UTC(),
+		Role:       model.HistoryRoleAgent,
+		Kind:       model.HistoryKindText,
+		TaskIDs:    taskIDs,
+	}
+	msgID, agentEv, agentErr := c.insertChatEvent(ctx, sourceID, deviceID, entry, audioJobID)
 	if agentErr != nil {
 		c.logger.WarnContext(ctx, "client voice: failed to persist agent reply event", "err", agentErr)
-		return agentErr
+		return "", agentErr
 	}
 	if c.broker != nil {
 		c.broker.Notify(agentEv)
 	}
-	return nil
+	return msgID, nil
 }
 
 // drainHandleMessage waits for HandleMessage to finish in the background after
-// a synthetic ack was already delivered to the client. Discards the reply but
-// honours the hard deadline so the goroutine cannot leak.
-func (c *clientVoiceConsumer) drainHandleMessage(replyCh chan model.ChatReply, errCh chan error, deadline time.Duration) {
+// a synthetic reply (messageID) was already delivered to the client. The reply
+// text is discarded, but its TasksTouched are merged into the synthetic entry so
+// the history links to every task the agent touched. The wait and the merge use
+// a background context bounded by the hard deadline, so the goroutine cannot
+// leak and survives the cancellation of the job context.
+func (c *clientVoiceConsumer) drainHandleMessage(messageID string, replyCh <-chan model.ChatReply, errCh <-chan error) {
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), c.hardDeadline)
+		defer cancel()
 		select {
-		case <-replyCh:
+		case reply := <-replyCh:
+			if len(reply.TasksTouched) == 0 {
+				return
+			}
+			if err := c.history.SetTaskIDs(ctx, messageID, reply.TasksTouched); err != nil {
+				c.logger.WarnContext(ctx, "client voice: failed to merge late touched tasks into the synthetic reply",
+					"message_id", messageID, "err", err)
+			}
 		case <-errCh:
-		case <-time.After(deadline):
+		case <-ctx.Done():
 		}
 	}()
 }
 
-// Fail emits a voice_failed SSE event for a permanently-dropped client voice job.
+// Fail emits a voice_failed SSE event for a permanently-dropped client voice job
+// and, in the same transaction, stores a system error row (role "system", kind
+// "error") with the user-facing message in the device's chat history.
 // The error code is derived from the cause type:
-//   - ErrEmptyTranscript → "invalid_audio"
-//   - errAgentFailed     → "agent_failed"
-//   - all other causes   → "transcription_failed"
+//   - ErrEmptyTranscript   → "invalid_audio"
+//   - ErrUnsupportedFormat → "unsupported_format"
+//   - errAgentFailed       → "agent_failed"
+//   - all other causes     → "transcription_failed"
 func (c *clientVoiceConsumer) Fail(ctx context.Context, job model.VoiceJob, cause error) {
 	code := "transcription_failed"
 	var userMsg string
@@ -334,6 +409,22 @@ func (c *clientVoiceConsumer) Fail(ctx context.Context, job model.VoiceJob, caus
 	}
 	defer tx.Rollback() //nolint:errcheck
 
+	// The failure is also kept in the chat history as a system row so that a
+	// reconnecting client sees it. A history error must not suppress the
+	// voice_failed event: the client still needs a terminal signal.
+	failureEntry := model.HistoryEntry{
+		AuthorName:      model.HistoryRoleSystem,
+		Text:            userMsg,
+		Timestamp:       now,
+		Role:            model.HistoryRoleSystem,
+		Kind:            model.HistoryKindError,
+		AudioJobID:      job.ClientJobID,
+		AudioDurationMs: job.Duration.Milliseconds(),
+	}
+	if _, histErr := c.history.AddTx(ctx, tx, clientChatSourceID(job.DeviceID), failureEntry); histErr != nil {
+		c.logger.ErrorContext(ctx, "client voice: store voice failure in history", "err", histErr)
+	}
+
 	ev := model.Event{
 		Kind:      model.EventVoiceFailed,
 		EntityID:  job.DeviceID,
@@ -359,34 +450,30 @@ func (c *clientVoiceConsumer) Fail(ctx context.Context, job model.VoiceJob, caus
 
 // insertChatEvent writes a history entry + chat_message_created event in a single transaction.
 // Returns the generated messageID and the saved event (with Seq filled in).
-// audioJobID is set for voice-originated messages.
-func (c *clientVoiceConsumer) insertChatEvent(ctx context.Context, sourceID, deviceID, role, text string, ts time.Time, audioJobID string) (messageID string, ev model.Event, err error) {
+// audioJobID is the voice job the live event refers to (set for both the
+// transcript and the agent reply of a voice job).
+func (c *clientVoiceConsumer) insertChatEvent(ctx context.Context, sourceID, deviceID string, entry model.HistoryEntry, audioJobID string) (messageID string, ev model.Event, err error) {
 	tx, txErr := c.db.BeginTx(ctx, nil)
 	if txErr != nil {
 		return "", model.Event{}, txErr
 	}
 	defer tx.Rollback() //nolint:errcheck
 
-	authorName := deviceID
-	if role == "agent" {
-		authorName = "agent"
-	}
-
-	msgID, addErr := c.history.AddTx(ctx, tx, sourceID, model.HistoryEntry{
-		AuthorName: authorName,
-		Text:       text,
-		Timestamp:  ts,
-	})
+	msgID, addErr := c.history.AddTx(ctx, tx, sourceID, entry)
 	if addErr != nil {
 		return "", model.Event{}, addErr
 	}
 
+	ts := entry.Timestamp
 	p := clientChatMessagePayload{
-		MessageID:  msgID,
-		Role:       role,
-		Text:       text,
-		AudioJobID: audioJobID,
-		CreatedAt:  ts,
+		MessageID:       msgID,
+		Role:            entry.Role,
+		Kind:            entry.Kind,
+		Text:            entry.Text,
+		AudioJobID:      audioJobID,
+		AudioDurationMs: entry.AudioDurationMs,
+		TaskIDs:         entry.TaskIDs,
+		CreatedAt:       ts,
 	}
 	p.Source.Kind = "client"
 	p.Source.ID = deviceID

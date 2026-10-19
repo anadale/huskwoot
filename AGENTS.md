@@ -110,6 +110,21 @@ The owner receives a DM question with inline 👍/👎 buttons, not actual react
 
 Receipts, decisions, tasks, events, push jobs, and buffer `Finalize` are atomic. AI calls run outside the transaction; the event revision is rechecked before writing. The receipt key includes account/chat/message and a text hash. Group messages complete synchronous intake before the update is acknowledged; DM/GroupDirect and IMAP remain queued.
 
+### Task source details and priority
+
+Every task stores a snapshot of where it came from in `tasks.source_details` (JSON of `model.TaskSourceDetails`, migration `016_task_priority_source.sql`). It is taken at creation time and never points at `messages`: channel history is trimmed by TTL and `MaxMessages`, so a reference would rot. Fields: `Name` (chat title or mailbox), `Subject` (IMAP), `Author`, `Text`, `At`, `ReplyTo{Author, Text}`, `Link`, `Via`. `Capped()` truncates `Text` to 1000 runes and `ReplyTo.Text` to 500; `CreateTaskTx` stores the capped copy. An empty or malformed column reads as `nil` details without failing the read. `source_kind`/`source_id` keep their meaning.
+
+| Creation path | `Source` | `Via` | Details |
+|---|---|---|---|
+| Pipeline message (Telegram group, IMAP) | from the message | `message` | `model.SourceDetailsFromMessage(msg, via)` |
+| Forward batch | the 1:1 chat | `forward` | the forwarded entry named by `Task.ForwardIndex` (see the forward batch flow) |
+| Agent `create_task` | origin message `Source` | `chat`, or `voice` when the origin has `VoiceJobID` | `SourceDetailsFromMessage(origin, via)` |
+| REST `POST /v1/tasks` | `{Kind: "client", ID: device id}` | `api` | none |
+
+`SourceDetailsFromMessage` leaves `Name` and `Author` empty for client sources (the client knows its own device names) and falls back to the author id when the display name is empty. `model.TelegramMessageLink` builds `https://t.me/c/<id>/<message id>` only for supergroups and channels (chat id `-100<id>`); private chats, basic groups, forwards and IMAP get no link. New task creation paths MUST set both `Source` and `SourceDetails` on `CreateTaskRequest`.
+
+`Task.Priority` (`model.TaskPriority`: 0 none, 1 low, 2 medium, 3 high; column `tasks.priority`) is set on create and update. `TaskService.CreateTasks` and `UpdateTask` reject values outside 0–3 with `usecase.ErrInvalidTaskPriority` (the REST API maps it to 422). `createAutoTaskTx` copies `Priority` and `SourceDetails` from the request, so candidates keep both in their payload until approval. The extractors return priority 3 only for explicitly stated urgency and turn missing, malformed or out-of-range values into 0. Agent tools parse the argument with `parsePriorityArg` (integer or numeric string 0–3; missing or `null` = not set) and add `priority`/`priority_marker` (`!`…`!!!`) to their output through `addPriority`, only for priority > 0.
+
 ### Forward batch flow (Telegram 1:1 promises)
 
 Allows the owner to forward arbitrary messages from a private 1:1 Telegram chat into DM with the bot. The bot accumulates them in SQLite, then on timeout or user trigger extracts promises the owner made and creates tasks.
@@ -138,11 +153,11 @@ ForwardDispatcher (single-goroutine consumer)
 
 Pipeline `processForwardBatch`:
 1. Parse `triggerText` via `parseTriggerProjectHint` → resolve project or fallback Inbox.
-2. Exclude forwards with saved input receipts, then format the remaining snapshot via `FormatForwardBatch` → a labeled block identifying the owner or the sender by name.
+2. Exclude forwards with saved input receipts, then format the remaining snapshot via `FormatForwardBatch` → a labeled block identifying the owner or the sender by name. Every line is numbered in sorted order (`[N] [author, date] text`), and the sorted entries are returned alongside the text: entry `i` is message number `i+1`.
 3. `ForwardClassifier.Classify` → `promise` | `skip`.
    - `skip`: `AutoTaskService.Submit` with no tasks persists receipts and clears only the snapshot via `DeleteEntriesTx`; reply "no promises found"; Telegram forwards are NOT deleted.
-4. `ForwardExtractor.Extract` → `[]model.Task`.
-5. `AutoTaskService.Submit` compares candidates; one transaction saves decisions, tasks/events/push for new obligations, input receipts, and deletes only snapshot entries via `Finalize` + `DeleteEntriesTx`. Commit.
+4. `ForwardExtractor.Extract` → `[]model.Task`. The model returns `"message": <N>` for every task; it lands in the in-memory `Task.ForwardIndex` (0 when missing or malformed).
+5. `AutoTaskService.Submit` compares candidates; one transaction saves decisions, tasks/events/push for new obligations, input receipts, and deletes only snapshot entries via `Finalize` + `DeleteEntriesTx`. Commit. Source details (`forwardSourceDetails`): `Name` is the counterpart; a valid `ForwardIndex` adds the entry's `ForwardFromName`, text and original date; a missing or out-of-range index keeps only the latest original date of the batch.
 6. `Broker.Notify(events)` after commit.
 7. If `DeleteForwardsAfterExtract && len(result.Created) > 0`: call `payload.DeleteFn`; errors → `slog.Warn` only.
 8. Reply with created tasks and counts of pending candidates and skipped duplicates.
@@ -163,7 +178,7 @@ For Group messages, `watchHandler` waits for `Pipeline.Process` before acknowled
 
 - `SimpleClassifier` (Batch) — `promise` or `skip`
 - `GroupClassifier` (Group) — `promise` or `skip`
-- `ForwardClassifier` (ForwardBatch) — `promise` or `skip`; focuses on promises made by the owner (lines labeled as the owner)
+- `ForwardClassifier` (ForwardBatch) — `promise` or `skip`; focuses on promises made by the owner (lines labeled as the owner, each prefixed with its `[N]` number)
 
 ### MetaStore and project binding
 
@@ -176,9 +191,9 @@ All backed by a single `huskwoot.db`. `storage.OpenDB` enables WAL, foreign keys
 Stores:
 - `SQLiteStateStore` — read cursors. Table `cursors`.
 - `SQLiteMetaStore` — channel metadata. Table `channel_projects`. Single write method: `SetTx(ctx, tx, key, value)`.
-- `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`. Project aliases are stored in `project_aliases` table (1:N with `ON DELETE CASCADE`); new tx-aware methods: `AddProjectAliasTx`, `RemoveProjectAliasTx`, `ListAliasesForProject`. `ListClosedOlderThan(ctx, cutoff)` returns full snapshots of `done`/`cancelled` tasks whose `closed_at < cutoff`; `DeleteTaskTx(ctx, tx, id)` physically removes a task by id within the caller's transaction. Both are used by `TaskService.PurgeClosedOlderThan` so it can emit `task_deleted` events transactionally with the delete; the `idx_tasks_status_closed_at` index speeds up the list query.
+- `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`. Project aliases are stored in `project_aliases` table (1:N with `ON DELETE CASCADE`); new tx-aware methods: `AddProjectAliasTx`, `RemoveProjectAliasTx`, `ListAliasesForProject`. `ListClosedOlderThan(ctx, cutoff)` returns full snapshots of `done`/`cancelled` tasks whose `closed_at < cutoff`; `DeleteTaskTx(ctx, tx, id)` physically removes a task by id within the caller's transaction. Both are used by `TaskService.PurgeClosedOlderThan` so it can emit `task_deleted` events transactionally with the delete; the `idx_tasks_status_closed_at` index speeds up the list query. Columns `priority` and `source_details` (migration `016_task_priority_source.sql`) are written and read on every task path; see "Task source details and priority".
 - `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated via `projectService.invalidateProjectCache()` after any commit that changes the project set: `CreateProject`, `UpdateProject` when fields actually change, `AddProjectAlias`, `RemoveProjectAlias`). In `main.go`, `*SQLiteTaskStore` is always wrapped in `CachedTaskStore`.
-- `SQLiteHistory` — message history. Table `messages`. Column `message_id TEXT` (UUID v4, generated by the application on insert) with a UNIQUE index; added by migration `013_messages_message_id.sql`. `AddTx(ctx, tx, source, entry) (messageID string, err error)` inserts within a caller-supplied transaction and returns the UUID; `Add` wraps it in its own transaction.
+- `SQLiteHistory` — message history. Table `messages`. Column `message_id TEXT` (UUID v4, generated by the application on insert) with a UNIQUE index; added by migration `013_messages_message_id.sql`. `AddTx(ctx, tx, source, entry) (messageID string, err error)` inserts within a caller-supplied transaction and returns the UUID; `Add` wraps it in its own transaction. Client chat metadata (migration `017_chat_message_metadata.sql`): `role` (`user` | `agent` | `system`; `''` for channel rows; existing `client:%` rows were backfilled from `author_name`), `kind` (`text` | `voice` | `error`, default `text`), `audio_job_id`, `audio_duration_ms`, `task_ids` (JSON array of task UUIDs). Only the client chat and voice paths fill them. For `client:` sources `AddTx` also deletes the oldest rows beyond `storage.ClientHistoryCap` (1000) in the same transaction. `SetTaskIDs(ctx, messageID, ids)` merges ids into a row without duplicates (unknown message → error wrapping `sql.ErrNoRows`). `Recent` and `RecentActivity` skip `role = 'system'` rows, so voice failures never reach the agent prompt. `ListClient(ctx, source, before, limit)` returns one page for `GET /v1/chat/history`: the newest `limit` rows older than the `before` message (system rows included), oldest first, plus the next cursor; an unknown `before` wraps `model.ErrHistoryCursorNotFound`.
 - `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
 - `push.SQLitePushQueue` — push job queue. Table `push_queue`. `ON DELETE CASCADE` on `event_seq` (retention deletes pending jobs together with events).
@@ -197,6 +212,10 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 - `Config.Now func() time.Time` — current time injected into the system prompt and into `create_task` via `context.Value(nowKey)`. Falls back to `time.Now()` when `nil`.
 - `Config.ListProjects func(ctx) ([]Project, error)` — project list injected into the system prompt ("Known projects" block). Block is omitted when `nil`.
 
+### Origin message
+
+`Agent.Handle` stores the incoming `model.Message` in the tool context via `WithOriginMessage(ctx, msg)`; tools read it with `OriginMessageFromContext(ctx)`. `create_task` uses it to attribute the task: `Source` = origin `Source`, `Via` = `voice` when `VoiceJobID` is set (client voice consumer), otherwise `chat`, plus the user's text or transcript and time. Tools that create tasks MUST take the source from the origin message instead of leaving it empty.
+
 ### Tools
 
 | Tool | DMOnly | Description |
@@ -207,13 +226,13 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 | `update_project` | yes | Update project name, description, or slug (ref = UUID \| slug \| alias) |
 | `add_project_alias` | yes | Add an alias to a project (ref = UUID \| slug \| alias) |
 | `remove_project_alias` | yes | Remove an alias from a project |
-| `create_task` | no | Create a task (no project_id → Inbox) |
+| `create_task` | no | Create a task (no project_id → Inbox; optional `priority` 0–3) |
 | `list_tasks` | no | Tasks in a project filtered by status |
 | `complete_task` | no | Mark a task as completed |
 | `move_task` | no | Move a task (UUID or `<slug>#<number>`) |
 | `set_project` | no | Bind the current chat to a project |
 | `get_task` | no | Get full task details by UUID or `<slug>#<number>` |
-| `update_task` | no | Update summary, details, or deadline of a task |
+| `update_task` | no | Update summary, details, deadline, or priority (0–3) of a task |
 | `cancel_task` | no | Cancel (soft-delete) a task; reversible via `reopen_task` |
 | `reopen_task` | no | Reopen a completed or cancelled task |
 | `snooze_task` | no | Postpone a task by setting a new deadline (natural language) |
@@ -390,10 +409,14 @@ Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be
 
 **Retention**: runs hourly via `events.Runner.Tick`. Sequence: `PairingStore.DeleteExpired` → device sweep (`ListInactive` → `Revoke` + `RelayClient.DeleteRegistration` → `DeleteRevokedOlderThan`) → orphan voice-upload sweep (`filepath.WalkDir(uploadsDir)`: files older than 24 h with no matching row in `voice_queue` are removed) → `PushQueue.DeleteDelivered` → `EventStore.DeleteOlderThan(now - events_retention)`. Errors in one subsystem do not skip the others.
 
-**Voice chat** (`POST /v1/chat/voice`): multipart upload (`audio` + `metadata` JSON parts). Accepted MIME types: `audio/ogg;codecs=opus`, `audio/mp4`, `audio/webm;codecs=opus`. Returns `202 {jobId, createdAt}`; result delivered via `/v1/events` as two `chat_message_created` events (`role: user` then `role: agent`). On transcription failure: `voice_failed` event with `jobId`, `code`, `message`. Rate-limited per device (`voice_rate_limit_per_minute`, default 10). Requires `Transcriber != nil`; returns `503` otherwise. Supports `Idempotency-Key`.
+**Voice chat** (`POST /v1/chat/voice`): multipart upload (`audio` + `metadata` JSON parts). Accepted MIME types: `audio/ogg;codecs=opus`, `audio/mp4`, `audio/webm;codecs=opus`. Returns `202 {jobId, createdAt}`; result delivered via `/v1/events` as two `chat_message_created` events (`role: user` then `role: agent`). On transcription failure: `voice_failed` event with `jobId`, `code`, `message`, plus a history row (`role: system`, `kind: error`, `AuthorName: "system"`, the audio job id) in the same transaction; a history write error is logged and does not suppress the event. The transcript row is `kind: voice` with the audio job id and duration; the agent reply row is plain text with `TaskIDs`. When the agent mutates a task but replies late, the synthetic "Готово" reply stores the ids of the tasks this agent call touched — a `touchedSet` the consumer puts into the `HandleMessage` context (`withTouched` reuses it, the task service fills it) — and the late `ChatReply.TasksTouched` are merged into it through `History.SetTaskIDs` (no extra SSE event). Broker task events reach every subscriber whatever their source, so they only arm the ack timer; without touched tasks no synthetic reply is sent. Rate-limited per device (`voice_rate_limit_per_minute`, default 10). Requires `Transcriber != nil`; returns `503` otherwise. Supports `Idempotency-Key`.
+
+**Tasks**: `Task` responses (GET, lists, `POST`/`PATCH` results, sync snapshot — all via `toTaskDTO`) always include `priority` (0–3) and include `source` (`kind` from `Source.Kind` plus the source details) unless the task has neither a kind nor details. `POST /v1/tasks` accepts an optional `priority`; `PATCH /v1/tasks/{id}` accepts `priority` (listed in `allowedTaskUpdateFields`). A non-integer, `null` or out-of-range priority returns 422 `unprocessable`; 0 clears it. REST-created tasks get `Source{Kind: "client", ID: device id}` and `via: api`.
+
+**Chat history** (`GET /v1/chat/history?limit=&before=`): one page of the device's client chat (`client:<device id>`) via `History.ListClient`: the newest `limit` entries (default 50, capped at 500) older than the `before` message id, oldest first, with `nextBefore` for the next older page (omitted on the last page). An unknown `before` returns 400 `bad_request`. Entries carry `id`, `role` (rows without a stored role get it from `author_name`), `kind`, `text`, `createdAt`, `audio{jobId, durationMs}` when the row has an audio job id, and `tasks` — compact cards (`id`, `ref`, `summary`, `status`, `deadline`) resolved through `TaskService.GetTask` once per id at read time, deleted tasks skipped. `authorName` and `timestamp` stay for older clients.
 
 **New SSE event kinds**:
-- `chat_message_created`: `{messageId, source:{kind,id}, role, text, audioJobId?, createdAt}` — emitted by both `POST /v1/chat` (text) and `POST /v1/chat/voice` (voice).
+- `chat_message_created`: `{messageId, source:{kind,id}, role, kind, text, audioJobId?, audioDurationMs?, taskIds?, createdAt}` — emitted by both `POST /v1/chat` (text) and `POST /v1/chat/voice` (voice). `messageId` equals the `id` of the matching `GET /v1/chat/history` entry.
 - `voice_failed`: `{jobId, code, message}` — emitted when transcription fails after all retries.
 
 ### Pairing flow
@@ -428,7 +451,9 @@ Details: `docs/push-relay/hmac.md`.
 {"project": {...projectSnapshot...}, "changedFields": ["name"?, "description"?, "slug"?, "aliases"?]}
 ```
 
-`changedFields` order for tasks: `summary`, `details`, `topic`, `deadline`, `status`. `Templates.Resolve` for `task_updated` without `summary`/`deadline` → `ok=false` (dropped). `task_deleted` is also dropped by `Templates.Resolve` — it is delivered via SSE only.
+`taskSnapshot` keys are snake_case and include `priority` (always) and `source` (`kind` plus the `model.TaskSourceDetails` keys, `replyTo` included; omitted when the task has neither a kind nor details).
+
+`changedFields` order for tasks: `summary`, `details`, `topic`, `deadline`, `status`, `priority`. `Templates.Resolve` for `task_updated` without `summary`/`deadline` → `ok=false` (dropped). `task_deleted` is also dropped by `Templates.Resolve` — it is delivered via SSE only.
 
 `changedFields` order for projects: `name`, `description`, `slug`, `aliases`. `Templates.Resolve` for `project_updated` → always `ok=false` (dropped; no push notification sent).
 

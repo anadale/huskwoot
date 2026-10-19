@@ -293,15 +293,15 @@ func TestMigrationsCreatesForwardBufferTable(t *testing.T) {
 	}
 
 	wantCols := map[string]bool{
-		"id":               true,
-		"chat_id":          true,
-		"message_id":       true,
-		"forward_from_id":  true,
+		"id":                true,
+		"chat_id":           true,
+		"message_id":        true,
+		"forward_from_id":   true,
 		"forward_from_name": true,
-		"is_self_authored": true,
-		"original_date":    true,
-		"text":             true,
-		"received_at":      true,
+		"is_self_authored":  true,
+		"original_date":     true,
+		"text":              true,
+		"received_at":       true,
 	}
 
 	rows, err := db.Query(`PRAGMA table_info(forward_buffer)`)
@@ -903,4 +903,296 @@ func TestUUIDMigrationConvertsExistingRows(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO tasks(id, project_id, number, summary, created_at, updated_at) VALUES ('dup', ?, 1, 's', ?, ?)`, inbox.id, now, now); err == nil {
 		t.Fatalf("expected uniqueness error (project_id, number)")
 	}
+}
+
+// columnInfo is a single row of PRAGMA table_info.
+type columnInfo struct {
+	Name    string
+	Type    string
+	NotNull bool
+	Default sql.NullString
+}
+
+// tableColumns returns the columns of table in declaration order.
+func tableColumns(t *testing.T, db *sql.DB, table string) []columnInfo {
+	t.Helper()
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("PRAGMA table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+
+	var cols []columnInfo
+	for rows.Next() {
+		var cid, notNull, pk int
+		var c columnInfo
+		if err := rows.Scan(&cid, &c.Name, &c.Type, &notNull, &c.Default, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		c.NotNull = notNull != 0
+		cols = append(cols, c)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err table_info(%s): %v", table, err)
+	}
+	return cols
+}
+
+// findColumn returns the named column or nil when it is absent.
+func findColumn(cols []columnInfo, name string) *columnInfo {
+	for i := range cols {
+		if cols[i].Name == name {
+			return &cols[i]
+		}
+	}
+	return nil
+}
+
+// openGooseDB opens an in-memory database with goose configured for the embedded migrations.
+func openGooseDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	// A single connection keeps the in-memory database shared across queries.
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatalf("SetDialect: %v", err)
+	}
+	return db
+}
+
+// TestMigrations016And017FreshDB verifies the new task and message columns exist
+// with the expected types, NOT NULL constraints and defaults on a fresh DB.
+func TestMigrations016And017FreshDB(t *testing.T) {
+	db := openGooseDB(t)
+	if err := migrations.Up(db); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+
+	tests := []struct {
+		table       string
+		column      string
+		wantType    string
+		wantDefault string
+	}{
+		{"tasks", "priority", "INTEGER", "0"},
+		{"tasks", "source_details", "TEXT", "''"},
+		{"messages", "role", "TEXT", "''"},
+		{"messages", "kind", "TEXT", "'text'"},
+		{"messages", "audio_job_id", "TEXT", "''"},
+		{"messages", "audio_duration_ms", "INTEGER", "0"},
+		{"messages", "task_ids", "TEXT", "''"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.table+"."+tt.column, func(t *testing.T) {
+			col := findColumn(tableColumns(t, db, tt.table), tt.column)
+			if col == nil {
+				t.Fatalf("column %s.%s not found", tt.table, tt.column)
+			}
+			if col.Type != tt.wantType {
+				t.Errorf("type=%q, want %q", col.Type, tt.wantType)
+			}
+			if !col.NotNull {
+				t.Errorf("column must be NOT NULL")
+			}
+			if !col.Default.Valid || col.Default.String != tt.wantDefault {
+				t.Errorf("default=%v, want %q", col.Default, tt.wantDefault)
+			}
+		})
+	}
+}
+
+// TestMigration016DefaultsForExistingTasks verifies that tasks created before
+// migration 016 get priority 0 and empty source details.
+func TestMigration016DefaultsForExistingTasks(t *testing.T) {
+	db := openGooseDB(t)
+	if err := goose.UpTo(db, ".", 15); err != nil {
+		t.Fatalf("UpTo 15: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO projects(id, name, slug, description, task_counter, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"proj-1", "Work", "work", "", 2, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for i, id := range []string{"task-1", "task-2"} {
+		if _, err := db.Exec(`INSERT INTO tasks(id, project_id, number, summary, created_at, updated_at, source_kind, source_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			id, "proj-1", i+1, "summary "+id, now, now, "telegram", "-100123"); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+
+	if err := goose.UpTo(db, ".", 16); err != nil {
+		t.Fatalf("UpTo 16: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT id, summary, source_kind, priority, source_details FROM tasks ORDER BY number`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	var n int
+	for rows.Next() {
+		var id, summary, sourceKind, details string
+		var priority int
+		if err := rows.Scan(&id, &summary, &sourceKind, &priority, &details); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		n++
+		if summary != "summary "+id || sourceKind != "telegram" {
+			t.Errorf("%s: existing data changed: summary=%q source_kind=%q", id, summary, sourceKind)
+		}
+		if priority != 0 {
+			t.Errorf("%s: priority=%d, want 0", id, priority)
+		}
+		if details != "" {
+			t.Errorf("%s: source_details=%q, want empty", id, details)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("want 2 tasks, got %d", n)
+	}
+}
+
+// TestMigration017BackfillsRole verifies that existing messages get the default
+// metadata and that client chat rows get their role from author_name while
+// channel rows keep an empty role.
+func TestMigration017BackfillsRole(t *testing.T) {
+	db := openGooseDB(t)
+	if err := goose.UpTo(db, ".", 16); err != nil {
+		t.Fatalf("UpTo 16: %v", err)
+	}
+
+	now := time.Now().Unix()
+	seed := []struct {
+		messageID string
+		sourceID  string
+		author    string
+		wantRole  string
+	}{
+		{"m-client-user", "client:dev-1", "dev-1", "user"},
+		{"m-client-agent", "client:dev-1", "agent", "agent"},
+		{"m-client-other", "client:dev-2", "dev-2", "user"},
+		{"m-telegram-user", "123456", "Alice", ""},
+		{"m-telegram-agent", "-100987", "agent", ""},
+		{"m-imap", "imap:me@example.com:INBOX", "Bob", ""},
+	}
+	for _, s := range seed {
+		if _, err := db.Exec(`INSERT INTO messages(source_id, author_name, text, timestamp, message_id) VALUES (?, ?, ?, ?, ?)`,
+			s.sourceID, s.author, "text of "+s.messageID, now, s.messageID); err != nil {
+			t.Fatalf("insert %s: %v", s.messageID, err)
+		}
+	}
+
+	if err := goose.UpTo(db, ".", 17); err != nil {
+		t.Fatalf("UpTo 17: %v", err)
+	}
+
+	for _, s := range seed {
+		t.Run(s.messageID, func(t *testing.T) {
+			var role, kind, audioJobID, taskIDs, author, text string
+			var durationMs int64
+			err := db.QueryRow(`SELECT role, kind, audio_job_id, audio_duration_ms, task_ids, author_name, text FROM messages WHERE message_id = ?`, s.messageID).
+				Scan(&role, &kind, &audioJobID, &durationMs, &taskIDs, &author, &text)
+			if err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if role != s.wantRole {
+				t.Errorf("role=%q, want %q", role, s.wantRole)
+			}
+			if kind != "text" {
+				t.Errorf("kind=%q, want 'text'", kind)
+			}
+			if audioJobID != "" || durationMs != 0 || taskIDs != "" {
+				t.Errorf("audio_job_id=%q audio_duration_ms=%d task_ids=%q, want defaults", audioJobID, durationMs, taskIDs)
+			}
+			if author != s.author || text != "text of "+s.messageID {
+				t.Errorf("existing data changed: author_name=%q text=%q", author, text)
+			}
+		})
+	}
+}
+
+// TestMigrations016And017DownRestoreSchema verifies that rolling back both
+// migrations restores the previous tasks and messages schema and keeps the data.
+func TestMigrations016And017DownRestoreSchema(t *testing.T) {
+	db := openGooseDB(t)
+	if err := goose.UpTo(db, ".", 15); err != nil {
+		t.Fatalf("UpTo 15: %v", err)
+	}
+	wantTasks := tableColumns(t, db, "tasks")
+	wantMessages := tableColumns(t, db, "messages")
+
+	if err := goose.UpTo(db, ".", 17); err != nil {
+		t.Fatalf("UpTo 17: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := db.Exec(`INSERT INTO projects(id, name, slug, description, task_counter, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		"proj-1", "Work", "work", "", 1, now); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO tasks(id, project_id, number, summary, created_at, updated_at, priority, source_details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"task-1", "proj-1", 1, "keep me", now, now, 3, `{"via":"api"}`); err != nil {
+		t.Fatalf("insert task: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages(source_id, author_name, text, timestamp, message_id, role, kind, audio_job_id, audio_duration_ms, task_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"client:dev-1", "agent", "done", time.Now().Unix(), "m-1", "agent", "text", "", 0, `["task-1"]`); err != nil {
+		t.Fatalf("insert message: %v", err)
+	}
+
+	if err := goose.DownTo(db, ".", 16); err != nil {
+		t.Fatalf("DownTo 16: %v", err)
+	}
+	if got := tableColumns(t, db, "messages"); !equalColumns(got, wantMessages) {
+		t.Errorf("messages schema after Down 017:\n got %+v\nwant %+v", got, wantMessages)
+	}
+
+	if err := goose.DownTo(db, ".", 15); err != nil {
+		t.Fatalf("DownTo 15: %v", err)
+	}
+	if got := tableColumns(t, db, "tasks"); !equalColumns(got, wantTasks) {
+		t.Errorf("tasks schema after Down 016:\n got %+v\nwant %+v", got, wantTasks)
+	}
+
+	var summary string
+	if err := db.QueryRow(`SELECT summary FROM tasks WHERE id = 'task-1'`).Scan(&summary); err != nil {
+		t.Fatalf("task lost after Down: %v", err)
+	}
+	if summary != "keep me" {
+		t.Errorf("summary=%q, want 'keep me'", summary)
+	}
+	var text string
+	if err := db.QueryRow(`SELECT text FROM messages WHERE message_id = 'm-1'`).Scan(&text); err != nil {
+		t.Fatalf("message lost after Down: %v", err)
+	}
+	if text != "done" {
+		t.Errorf("text=%q, want 'done'", text)
+	}
+
+	// Re-applying after a rollback must succeed.
+	if err := goose.UpTo(db, ".", 17); err != nil {
+		t.Fatalf("re-applying UpTo 17: %v", err)
+	}
+}
+
+func equalColumns(a, b []columnInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

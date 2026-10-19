@@ -60,9 +60,9 @@ func TestResolveProjectRef(t *testing.T) {
 			wantID:                  "proj-uuid-3",
 		},
 		{
-			name:                 "empty ref returns required error",
-			ref:                  "",
-			wantErr:              true,
+			name:    "empty ref returns required error",
+			ref:     "",
+			wantErr: true,
 		},
 		{
 			name:                 "project not found returns i18n error",

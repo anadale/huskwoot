@@ -306,7 +306,17 @@ func (s *autoTaskService) commitSubmission(ctx context.Context, submission model
 }
 
 func (s *autoTaskService) createAutoTaskTx(ctx context.Context, tx *sql.Tx, req model.CreateTaskRequest, slug string, activeIDs []string) (*model.Task, model.Event, error) {
-	task := &model.Task{ProjectID: req.ProjectID, ProjectSlug: slug, Summary: req.Summary, Details: req.Details, Topic: req.Topic, Deadline: req.Deadline, Source: req.Source}
+	task := &model.Task{
+		ProjectID:     req.ProjectID,
+		ProjectSlug:   slug,
+		Summary:       req.Summary,
+		Details:       req.Details,
+		Topic:         req.Topic,
+		Deadline:      req.Deadline,
+		Priority:      req.Priority,
+		Source:        req.Source,
+		SourceDetails: req.SourceDetails,
+	}
 	if err := s.tasks.CreateTaskTx(ctx, tx, task); err != nil {
 		return nil, model.Event{}, fmt.Errorf("create automatic task: %w", err)
 	}

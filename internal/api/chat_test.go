@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -61,7 +62,10 @@ type chatTestHarness struct {
 	device  *model.Device
 	chat    *fakeChatService
 	history *storage.SQLiteHistory
-	cfg     api.Config
+	// tasks is the task service the chat handler resolves history task cards
+	// through; nil in harnesses without one.
+	tasks model.TaskService
+	cfg   api.Config
 }
 
 func newChatHarness(t *testing.T) *chatTestHarness {
@@ -82,13 +86,30 @@ func newChatHarnessWith(t *testing.T, chat *fakeChatService, chatTimeout time.Du
 
 	history := storage.NewSQLiteHistory(db, storage.SQLiteHistoryOptions{})
 
+	sqliteTasks, err := storage.NewSQLiteTaskStore(db)
+	if err != nil {
+		t.Fatalf("NewSQLiteTaskStore: %v", err)
+	}
+	deviceStore := devices.NewSQLiteDeviceStore(db)
+	// The task service gets its own event store and broker: the chat endpoints
+	// of this harness run without events (the plain history fallback).
+	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
+		DB:      db,
+		Tasks:   storage.NewCachedTaskStore(sqliteTasks),
+		Events:  events.NewSQLiteEventStore(db),
+		Devices: deviceStore,
+		Queue:   push.NewSQLitePushQueue(db),
+		Broker:  events.NewBroker(events.BrokerConfig{}),
+	})
+
 	token := "chat-test-token"
 	device := createTestDevice(t, db, "test-device", token)
 
 	cfg := api.Config{
 		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DB:          db,
-		Devices:     devices.NewSQLiteDeviceStore(db),
+		Devices:     deviceStore,
+		Tasks:       taskSvc,
 		Chat:        chat,
 		History:     history,
 		ChatTimeout: chatTimeout,
@@ -104,6 +125,7 @@ func newChatHarnessWith(t *testing.T, chat *fakeChatService, chatTimeout time.Du
 		device:  device,
 		chat:    chat,
 		history: history,
+		tasks:   taskSvc,
 		cfg:     cfg,
 	}
 }
@@ -327,6 +349,78 @@ func TestPostChatStoresInHistoryUnderClientSource(t *testing.T) {
 	}
 }
 
+// TestPostChatStoresRoleKindAndTasksTouched verifies that POST /v1/chat stores
+// the role and kind of both messages and the agent's touched tasks, on the
+// transactional path (with an event store) and on the plain history fallback.
+func TestPostChatStoresRoleKindAndTasksTouched(t *testing.T) {
+	tests := []struct {
+		name    string
+		harness func(t *testing.T, chat *fakeChatService) *chatTestHarness
+	}{
+		{
+			name: "with events",
+			harness: func(t *testing.T, chat *fakeChatService) *chatTestHarness {
+				return newChatEventHarness(t, chat).chatTestHarness
+			},
+		},
+		{
+			name: "history only",
+			harness: func(t *testing.T, chat *fakeChatService) *chatTestHarness {
+				return newChatHarnessWith(t, chat, 0)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chat := &fakeChatService{reply: model.ChatReply{
+				Text:         "created",
+				TasksTouched: []string{"task-1", "task-2"},
+			}}
+			h := tt.harness(t, chat)
+
+			rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "create two tasks"}, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d, body=%s", rec.Code, rec.Body.String())
+			}
+
+			entries, err := h.history.Recent(context.Background(), "client:"+h.device.ID, 10)
+			if err != nil {
+				t.Fatalf("Recent: %v", err)
+			}
+			if len(entries) != 2 {
+				t.Fatalf("entries=%d, want 2; got %+v", len(entries), entries)
+			}
+			byRole := map[string]model.HistoryEntry{}
+			for _, e := range entries {
+				byRole[e.Role] = e
+			}
+
+			user, ok := byRole[model.HistoryRoleUser]
+			if !ok {
+				t.Fatalf("no user entry in %+v", entries)
+			}
+			if user.Text != "create two tasks" || user.Kind != model.HistoryKindText || user.AuthorName != h.device.ID {
+				t.Errorf("user entry = %+v", user)
+			}
+			if user.TaskIDs != nil || user.AudioJobID != "" {
+				t.Errorf("user entry must not carry tasks or audio: %+v", user)
+			}
+
+			agent, ok := byRole[model.HistoryRoleAgent]
+			if !ok {
+				t.Fatalf("no agent entry in %+v", entries)
+			}
+			if agent.Text != "created" || agent.Kind != model.HistoryKindText || agent.AuthorName != "agent" {
+				t.Errorf("agent entry = %+v", agent)
+			}
+			if want := []string{"task-1", "task-2"}; !reflect.DeepEqual(agent.TaskIDs, want) {
+				t.Errorf("agent TaskIDs = %v, want %v", agent.TaskIDs, want)
+			}
+		})
+	}
+}
+
 func TestChatHistoryLimit(t *testing.T) {
 	h := newChatHarness(t)
 	ctx := context.Background()
@@ -377,9 +471,311 @@ func TestChatUnauthenticatedReturns401(t *testing.T) {
 
 // chatHistoryEntryDTO is a local type for decoding /v1/chat/history responses in tests.
 type chatHistoryEntryDTO struct {
-	AuthorName string    `json:"authorName"`
-	Text       string    `json:"text"`
-	Timestamp  time.Time `json:"timestamp"`
+	ID        string    `json:"id"`
+	Role      string    `json:"role"`
+	Kind      string    `json:"kind"`
+	Text      string    `json:"text"`
+	CreatedAt time.Time `json:"createdAt"`
+	Audio     *struct {
+		JobID      string `json:"jobId"`
+		DurationMs int64  `json:"durationMs"`
+	} `json:"audio"`
+	Tasks      []chatHistoryTaskDTO `json:"tasks"`
+	AuthorName string               `json:"authorName"`
+	Timestamp  time.Time            `json:"timestamp"`
+}
+
+// chatHistoryTaskDTO is a local type for decoding history task cards in tests.
+type chatHistoryTaskDTO struct {
+	ID       string     `json:"id"`
+	Ref      string     `json:"ref"`
+	Summary  string     `json:"summary"`
+	Status   string     `json:"status"`
+	Deadline *time.Time `json:"deadline"`
+}
+
+// chatHistoryRespDTO is a local type for decoding the /v1/chat/history response in tests.
+type chatHistoryRespDTO struct {
+	Entries    []chatHistoryEntryDTO `json:"entries"`
+	NextBefore *string               `json:"nextBefore"`
+}
+
+// addHistory writes entry under source through AddTx and returns the message id.
+func (h *chatTestHarness) addHistory(source string, entry model.HistoryEntry) string {
+	h.t.Helper()
+	ctx := context.Background()
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		h.t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+	id, err := h.history.AddTx(ctx, tx, source, entry)
+	if err != nil {
+		h.t.Fatalf("AddTx: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		h.t.Fatalf("Commit: %v", err)
+	}
+	return id
+}
+
+// getChatHistory requests target and decodes a 200 response.
+func (h *chatTestHarness) getChatHistory(target string) chatHistoryRespDTO {
+	h.t.Helper()
+	rec := h.do(http.MethodGet, target, nil, nil)
+	if rec.Code != http.StatusOK {
+		h.t.Fatalf("GET %s: status=%d, body=%s", target, rec.Code, rec.Body.String())
+	}
+	var resp chatHistoryRespDTO
+	decodeJSONResp(h.t, rec.Body, &resp)
+	return resp
+}
+
+func TestChatHistoryPaging(t *testing.T) {
+	h := newChatHarness(t)
+	source := "client:" + h.device.ID
+	t0 := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+
+	ids := map[string]string{}
+	for i, text := range []string{"m1", "m2", "m3", "m4", "m5"} {
+		ids[text] = h.addHistory(source, model.HistoryEntry{
+			AuthorName: h.device.ID, Text: text, Timestamp: t0.Add(time.Duration(i) * time.Second),
+			Role: model.HistoryRoleUser, Kind: model.HistoryKindText,
+		})
+		// Rows of another device and of a Telegram chat interleave with ours.
+		h.addHistory("client:other-device", model.HistoryEntry{
+			AuthorName: "other-device", Text: "other-" + text, Timestamp: t0.Add(time.Duration(i) * time.Second),
+			Role: model.HistoryRoleUser, Kind: model.HistoryKindText,
+		})
+		h.addHistory("123456", makeTelegramEntry("telegram-"+text, t0.Add(time.Duration(i)*time.Second)))
+	}
+
+	wantPages := [][]string{{"m4", "m5"}, {"m2", "m3"}, {"m1"}}
+	target := "/v1/chat/history?limit=2"
+	for i, want := range wantPages {
+		resp := h.getChatHistory(target)
+		got := make([]string, 0, len(resp.Entries))
+		for _, e := range resp.Entries {
+			got = append(got, e.Text)
+			if e.ID != ids[e.Text] {
+				t.Errorf("page %d: %q id=%q, want %q", i, e.Text, e.ID, ids[e.Text])
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("page %d = %v, want %v", i, got, want)
+		}
+
+		if i == len(wantPages)-1 {
+			if resp.NextBefore != nil {
+				t.Fatalf("last page must omit nextBefore, got %q", *resp.NextBefore)
+			}
+			break
+		}
+		if resp.NextBefore == nil || *resp.NextBefore != ids[want[0]] {
+			t.Fatalf("page %d nextBefore=%v, want the id of %q", i, resp.NextBefore, want[0])
+		}
+		target = "/v1/chat/history?limit=2&before=" + *resp.NextBefore
+	}
+
+	// Without a limit the whole history of this device fits on one page.
+	resp := h.getChatHistory("/v1/chat/history")
+	if len(resp.Entries) != 5 || resp.NextBefore != nil {
+		t.Fatalf("default page: entries=%d nextBefore=%v, want 5 entries and no nextBefore", len(resp.Entries), resp.NextBefore)
+	}
+}
+
+// makeTelegramEntry builds a channel history row (no role).
+func makeTelegramEntry(text string, ts time.Time) model.HistoryEntry {
+	return model.HistoryEntry{AuthorName: "owner", Text: text, Timestamp: ts}
+}
+
+func TestChatHistoryUnknownBeforeReturns400(t *testing.T) {
+	h := newChatHarness(t)
+	h.addHistory("client:"+h.device.ID, model.HistoryEntry{
+		AuthorName: h.device.ID, Text: "mine", Timestamp: time.Now(), Role: model.HistoryRoleUser,
+	})
+	otherID := h.addHistory("client:other-device", model.HistoryEntry{
+		AuthorName: "other-device", Text: "theirs", Timestamp: time.Now(), Role: model.HistoryRoleUser,
+	})
+	telegramID := h.addHistory("123456", makeTelegramEntry("telegram", time.Now()))
+
+	tests := []struct {
+		name   string
+		before string
+	}{
+		{name: "missing message", before: "00000000-0000-0000-0000-000000000000"},
+		{name: "message of another device", before: otherID},
+		{name: "telegram message", before: telegramID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := h.do(http.MethodGet, "/v1/chat/history?before="+tt.before, nil, nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			var errResp struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			decodeJSONResp(t, rec.Body, &errResp)
+			if errResp.Error.Code != "bad_request" {
+				t.Fatalf("error code=%q, want bad_request; body=%s", errResp.Error.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestChatHistoryReturnsMetadataAndTaskCards(t *testing.T) {
+	h := newChatHarness(t)
+	ctx := context.Background()
+	source := "client:" + h.device.ID
+
+	deadline := time.Date(2026, 11, 1, 18, 0, 0, 0, time.UTC)
+	first, err := h.tasks.CreateTask(ctx, model.CreateTaskRequest{Summary: "Buy tickets", Deadline: &deadline})
+	if err != nil {
+		t.Fatalf("CreateTask first: %v", err)
+	}
+	second, err := h.tasks.CreateTask(ctx, model.CreateTaskRequest{Summary: "Call mom"})
+	if err != nil {
+		t.Fatalf("CreateTask second: %v", err)
+	}
+	if _, err := h.tasks.CompleteTask(ctx, second.ID); err != nil {
+		t.Fatalf("CompleteTask: %v", err)
+	}
+	purged, err := h.tasks.CreateTask(ctx, model.CreateTaskRequest{Summary: "Purged"})
+	if err != nil {
+		t.Fatalf("CreateTask purged: %v", err)
+	}
+	// A physically deleted task (closed-task retention) is skipped.
+	if _, err := h.db.ExecContext(ctx, `DELETE FROM tasks WHERE id = ?`, purged.ID); err != nil {
+		t.Fatalf("delete task: %v", err)
+	}
+
+	t0 := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	voiceID := h.addHistory(source, model.HistoryEntry{
+		AuthorName: h.device.ID, Text: "buy tickets and call mom", Timestamp: t0,
+		Role: model.HistoryRoleUser, Kind: model.HistoryKindVoice,
+		AudioJobID: "job-1", AudioDurationMs: 9000,
+	})
+	agentID := h.addHistory(source, model.HistoryEntry{
+		AuthorName: "agent", Text: "Done", Timestamp: t0.Add(time.Second),
+		Role: model.HistoryRoleAgent, Kind: model.HistoryKindText,
+		TaskIDs: []string{first.ID, purged.ID, "00000000-0000-0000-0000-000000000000", second.ID},
+	})
+	failureID := h.addHistory(source, model.HistoryEntry{
+		AuthorName: model.HistoryRoleSystem, Text: "audio does not contain recognisable speech", Timestamp: t0.Add(2 * time.Second),
+		Role: model.HistoryRoleSystem, Kind: model.HistoryKindError,
+		AudioJobID: "job-2",
+	})
+	deletedOnlyID := h.addHistory(source, model.HistoryEntry{
+		AuthorName: "agent", Text: "Removed", Timestamp: t0.Add(3 * time.Second),
+		Role: model.HistoryRoleAgent, Kind: model.HistoryKindText,
+		TaskIDs: []string{purged.ID},
+	})
+
+	rec := h.do(http.MethodGet, "/v1/chat/history", nil, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, body=%s", rec.Code, rec.Body.String())
+	}
+	raw := rec.Body.Bytes()
+	var resp chatHistoryRespDTO
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(resp.Entries) != 4 {
+		t.Fatalf("entries=%d, want 4; body=%s", len(resp.Entries), raw)
+	}
+
+	firstCard := chatHistoryTaskDTO{ID: first.ID, Ref: "inbox-1", Summary: "Buy tickets", Status: "open", Deadline: &deadline}
+	secondCard := chatHistoryTaskDTO{ID: second.ID, Ref: "inbox-2", Summary: "Call mom", Status: "done"}
+
+	type audio = struct {
+		JobID      string `json:"jobId"`
+		DurationMs int64  `json:"durationMs"`
+	}
+	want := []chatHistoryEntryDTO{
+		{
+			ID: voiceID, Role: "user", Kind: "voice", Text: "buy tickets and call mom", CreatedAt: t0,
+			Audio:      &audio{JobID: "job-1", DurationMs: 9000},
+			AuthorName: h.device.ID, Timestamp: t0,
+		},
+		{
+			ID: agentID, Role: "agent", Kind: "text", Text: "Done", CreatedAt: t0.Add(time.Second),
+			Tasks:      []chatHistoryTaskDTO{firstCard, secondCard},
+			AuthorName: "agent", Timestamp: t0.Add(time.Second),
+		},
+		{
+			ID: failureID, Role: "system", Kind: "error", Text: "audio does not contain recognisable speech", CreatedAt: t0.Add(2 * time.Second),
+			Audio:      &audio{JobID: "job-2", DurationMs: 0},
+			AuthorName: "system", Timestamp: t0.Add(2 * time.Second),
+		},
+		{
+			ID: deletedOnlyID, Role: "agent", Kind: "text", Text: "Removed", CreatedAt: t0.Add(3 * time.Second),
+			AuthorName: "agent", Timestamp: t0.Add(3 * time.Second),
+		},
+	}
+	for i := range want {
+		got := resp.Entries[i]
+		if !got.CreatedAt.Equal(want[i].CreatedAt) || !got.Timestamp.Equal(want[i].Timestamp) {
+			t.Errorf("entry %d: createdAt=%v timestamp=%v, want %v", i, got.CreatedAt, got.Timestamp, want[i].CreatedAt)
+		}
+		got.CreatedAt, got.Timestamp = want[i].CreatedAt, want[i].Timestamp
+		if !reflect.DeepEqual(got, want[i]) {
+			t.Errorf("entry %d:\n got %+v\nwant %+v", i, got, want[i])
+		}
+	}
+
+	// Optional keys are omitted, not sent empty.
+	var rawResp struct {
+		Entries []map[string]json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &rawResp); err != nil {
+		t.Fatalf("unmarshal raw: %v", err)
+	}
+	for i, key := range map[int]string{1: "audio", 3: "tasks"} {
+		if _, ok := rawResp.Entries[i][key]; ok {
+			t.Errorf("entry %d must omit %q: %s", i, key, raw)
+		}
+	}
+	if _, ok := rawResp.Entries[0]["tasks"]; ok {
+		t.Errorf("user entry must omit tasks: %s", raw)
+	}
+}
+
+// TestChatHistoryWithoutTaskServiceOmitsTaskCards verifies that the history is
+// still served when the server has no task service; task cards are left out.
+func TestChatHistoryWithoutTaskServiceOmitsTaskCards(t *testing.T) {
+	h := newChatEventHarness(t, &fakeChatService{reply: model.ChatReply{Text: "ok"}})
+	h.addHistory("client:"+h.device.ID, model.HistoryEntry{
+		AuthorName: "agent", Text: "Done", Timestamp: time.Now(),
+		Role: model.HistoryRoleAgent, Kind: model.HistoryKindText, TaskIDs: []string{"task-1"},
+	})
+
+	resp := h.getChatHistory("/v1/chat/history")
+	if len(resp.Entries) != 1 || resp.Entries[0].Role != "agent" || resp.Entries[0].Tasks != nil {
+		t.Fatalf("entries = %+v, want one agent entry without tasks", resp.Entries)
+	}
+}
+
+// TestChatHistoryRowsWithoutRoleGetRoleFromAuthor verifies that a client row
+// without a stored role is classified by author_name, like the migration 017
+// backfill.
+func TestChatHistoryRowsWithoutRoleGetRoleFromAuthor(t *testing.T) {
+	h := newChatHarness(t)
+	source := "client:" + h.device.ID
+	t0 := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+	h.addHistory(source, model.HistoryEntry{AuthorName: h.device.ID, Text: "question", Timestamp: t0})
+	h.addHistory(source, model.HistoryEntry{AuthorName: "agent", Text: "answer", Timestamp: t0.Add(time.Second)})
+
+	resp := h.getChatHistory("/v1/chat/history")
+	got := make([]string, 0, len(resp.Entries))
+	for _, e := range resp.Entries {
+		got = append(got, e.Text+":"+e.Role+":"+e.Kind)
+	}
+	if want := []string{"question:user:text", "answer:agent:text"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("entries = %v, want %v", got, want)
+	}
 }
 
 // ---- chat_message_created SSE event tests ----
@@ -493,10 +889,10 @@ func TestPostChatEmitsChatMessageCreatedEvents(t *testing.T) {
 			Kind string `json:"kind"`
 			ID   string `json:"id"`
 		} `json:"source"`
-		Role      string    `json:"role"`
-		Text      string    `json:"text"`
-		CreatedAt time.Time `json:"createdAt"`
-		AudioJobID string   `json:"audioJobId,omitempty"`
+		Role       string    `json:"role"`
+		Text       string    `json:"text"`
+		CreatedAt  time.Time `json:"createdAt"`
+		AudioJobID string    `json:"audioJobId,omitempty"`
 	}
 	if err := json.Unmarshal(chatEvs[0].Payload, &userPayload); err != nil {
 		t.Fatalf("unmarshal user event: %v", err)
@@ -532,6 +928,71 @@ func TestPostChatEmitsChatMessageCreatedEvents(t *testing.T) {
 	}
 	if agentPayload.Text != "ответ агента" {
 		t.Fatalf("second event text=%q", agentPayload.Text)
+	}
+}
+
+// TestPostChatEventPayloadCarriesKindAndTaskIDs verifies the chat_message_created
+// payload keys added for live rendering: kind on both messages and taskIds on
+// the agent reply; audioDurationMs is absent for text messages.
+func TestPostChatEventPayloadCarriesKindAndTaskIDs(t *testing.T) {
+	chat := &fakeChatService{reply: model.ChatReply{Text: "created", TasksTouched: []string{"t-1", "t-2"}}}
+	h := newChatEventHarness(t, chat)
+
+	rec := h.do(http.MethodPost, "/v1/chat", map[string]string{"message": "create two tasks"}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	evs, err := h.eventStore.SinceSeq(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("SinceSeq: %v", err)
+	}
+	var payloads []map[string]json.RawMessage
+	for _, ev := range evs {
+		if ev.Kind != model.EventChatMessageCreated {
+			continue
+		}
+		var p map[string]json.RawMessage
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		payloads = append(payloads, p)
+	}
+	if len(payloads) != 2 {
+		t.Fatalf("want 2 chat_message_created events, got %d", len(payloads))
+	}
+
+	tests := []struct {
+		name        string
+		payload     map[string]json.RawMessage
+		wantKind    string
+		wantTaskIDs string
+	}{
+		{name: "user", payload: payloads[0], wantKind: `"text"`},
+		{name: "agent", payload: payloads[1], wantKind: `"text"`, wantTaskIDs: `["t-1","t-2"]`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := string(tt.payload["kind"]); got != tt.wantKind {
+				t.Errorf("kind=%s, want %s", got, tt.wantKind)
+			}
+			if got := string(tt.payload["taskIds"]); got != tt.wantTaskIDs {
+				t.Errorf("taskIds=%s, want %q", got, tt.wantTaskIDs)
+			}
+			if _, ok := tt.payload["audioDurationMs"]; ok {
+				t.Errorf("text message must not carry audioDurationMs: %v", tt.payload)
+			}
+		})
+	}
+
+	// The live messageId matches the history entry id.
+	var userID string
+	if err := json.Unmarshal(payloads[0]["messageId"], &userID); err != nil {
+		t.Fatalf("unmarshal messageId: %v", err)
+	}
+	resp := h.getChatHistory("/v1/chat/history")
+	if len(resp.Entries) != 2 || resp.Entries[0].ID != userID {
+		t.Fatalf("history entries = %+v, want the user entry with id %q first", resp.Entries, userID)
 	}
 }
 

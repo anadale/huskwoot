@@ -17,8 +17,12 @@ type CreateTaskRequest struct {
 	Topic string
 	// Deadline is the due date (nil if not set).
 	Deadline *time.Time
+	// Priority is the task importance (0–3); 0 means not set.
+	Priority TaskPriority
 	// Source is the channel that initiated task creation.
 	Source Source
+	// SourceDetails is the snapshot of the message the task was created from (optional).
+	SourceDetails *TaskSourceDetails
 }
 
 // CreateTasksRequest holds parameters for batch task creation via TaskService.

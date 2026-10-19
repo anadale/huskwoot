@@ -37,6 +37,7 @@ func (t *updateTaskTool) Parameters() map[string]any {
 			"summary":  map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_update_task_param_summary", nil)},
 			"details":  map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_update_task_param_details", nil)},
 			"deadline": map[string]any{"type": "string", "description": huskwootI18n.Translate(t.loc, "tool_update_task_param_deadline", nil)},
+			"priority": priorityParam(huskwootI18n.Translate(t.loc, "tool_update_task_param_priority", nil)),
 		},
 		"required": []string{"task_id"},
 	}
@@ -59,7 +60,11 @@ func (t *updateTaskTool) Execute(ctx context.Context, args string) (string, erro
 	_, hasSummary := raw["summary"]
 	_, hasDetails := raw["details"]
 	_, hasDeadline := raw["deadline"]
-	if !hasSummary && !hasDetails && !hasDeadline {
+	priority, hasPriority, err := parsePriorityArg(raw["priority"], t.loc)
+	if err != nil {
+		return "", err
+	}
+	if !hasSummary && !hasDetails && !hasDeadline && !hasPriority {
 		return "", errors.New(huskwootI18n.Translate(t.loc, "agent_no_fields_to_update", nil))
 	}
 
@@ -69,6 +74,9 @@ func (t *updateTaskTool) Execute(ctx context.Context, args string) (string, erro
 	}
 
 	var upd model.TaskUpdate
+	if hasPriority {
+		upd.Priority = &priority
+	}
 
 	if rawSummary, ok := raw["summary"]; ok {
 		var s string
@@ -127,6 +135,7 @@ func (t *updateTaskTool) Execute(ctx context.Context, args string) (string, erro
 	if updated.Deadline != nil {
 		data["deadline"] = updated.Deadline.Format(time.RFC3339)
 	}
+	addPriority(data, updated.Priority)
 
 	result, _ := json.Marshal(data)
 	return string(result), nil

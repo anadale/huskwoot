@@ -22,7 +22,22 @@ const (
 	sourceIDKey contextKey = iota
 	// nowKey is the key for the current time in the tool context.
 	nowKey
+	// originMessageKey is the key for the incoming message the agent is handling.
+	originMessageKey
 )
+
+// WithOriginMessage returns a context carrying msg as the message the agent is
+// handling. Tools read it to attribute created tasks to their origin.
+func WithOriginMessage(ctx context.Context, msg model.Message) context.Context {
+	return context.WithValue(ctx, originMessageKey, msg)
+}
+
+// OriginMessageFromContext returns the message stored by WithOriginMessage.
+// The second value is false when the context carries no origin message.
+func OriginMessageFromContext(ctx context.Context) (model.Message, bool) {
+	msg, ok := ctx.Value(originMessageKey).(model.Message)
+	return msg, ok
+}
 
 // AIClient is the AI client interface for the tool-calling loop.
 type AIClient interface {
@@ -107,6 +122,7 @@ func (a *Agent) Handle(ctx context.Context, msg model.Message) (string, error) {
 	if msg.Source.ID != "" {
 		ctx = context.WithValue(ctx, sourceIDKey, msg.Source.ID)
 	}
+	ctx = WithOriginMessage(ctx, msg)
 
 	// A single agent message uses a fixed now: stored in context and rendered into the prompt.
 	now := a.now()

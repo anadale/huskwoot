@@ -281,12 +281,14 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 			"project_id", projectID,
 			"confidence", task.Confidence)
 		taskReqs = append(taskReqs, model.CreateTaskRequest{
-			ProjectID: projectID,
-			Summary:   task.Summary,
-			Details:   task.Details,
-			Topic:     topic,
-			Deadline:  task.Deadline,
-			Source:    task.Source,
+			ProjectID:     projectID,
+			Summary:       task.Summary,
+			Details:       task.Details,
+			Topic:         topic,
+			Deadline:      task.Deadline,
+			Priority:      task.Priority,
+			Source:        task.Source,
+			SourceDetails: model.SourceDetailsFromMessage(msg, model.SourceViaMessage),
 		})
 	}
 
@@ -381,7 +383,7 @@ func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) e
 	if tz == nil {
 		tz = time.UTC
 	}
-	formatted := FormatForwardBatch(unprocessed, payload.Counterpart, tz)
+	formatted, numbered := FormatForwardBatch(unprocessed, payload.Counterpart, tz)
 	var requests []model.CreateTaskRequest
 	if len(unprocessed) > 0 {
 		syntheticMsg := model.Message{Text: formatted, Kind: model.MessageKindForwardBatch, Source: source}
@@ -401,12 +403,14 @@ func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) e
 			}
 			for _, task := range extracted {
 				requests = append(requests, model.CreateTaskRequest{
-					ProjectID: projectID,
-					Summary:   task.Summary,
-					Details:   task.Details,
-					Topic:     task.Topic,
-					Deadline:  task.Deadline,
-					Source:    source,
+					ProjectID:     projectID,
+					Summary:       task.Summary,
+					Details:       task.Details,
+					Topic:         task.Topic,
+					Deadline:      task.Deadline,
+					Priority:      task.Priority,
+					Source:        source,
+					SourceDetails: forwardSourceDetails(numbered, task.ForwardIndex, payload.Counterpart),
 				})
 			}
 		default:
@@ -468,6 +472,31 @@ func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) e
 		}
 	}
 	return nil
+}
+
+// forwardSourceDetails builds the source snapshot of a task extracted from a
+// forward batch. numbered holds the entries in FormatForwardBatch order and index
+// is the 1-based message number returned by the extractor. A valid index names the
+// author, text and time of that message; a missing or out-of-range index falls
+// back to batch-level details (the latest original date, no author or text).
+// Forwarded DMs have no public link.
+func forwardSourceDetails(numbered []model.ForwardEntry, index int, counterpart string) *model.TaskSourceDetails {
+	details := &model.TaskSourceDetails{Name: counterpart, Via: model.SourceViaForward}
+	if index >= 1 && index <= len(numbered) {
+		entry := numbered[index-1]
+		details.Author = entry.ForwardFromName
+		details.Text = entry.Text
+		details.At = model.SourceTime(entry.OriginalDate)
+		return details.Capped()
+	}
+	var latest time.Time
+	for _, entry := range numbered {
+		if entry.OriginalDate.After(latest) {
+			latest = entry.OriginalDate
+		}
+	}
+	details.At = model.SourceTime(latest)
+	return details
 }
 
 // autoInputKey separates message edits and source accounts without persisting raw text.

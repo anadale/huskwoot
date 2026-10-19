@@ -634,6 +634,49 @@ func TestAgent_PutsNowInToolContext(t *testing.T) {
 	}
 }
 
+func TestAgent_PutsOriginMessageInToolContext(t *testing.T) {
+	var origin model.Message
+	var found bool
+	capture := &mockTool{
+		name: "capture_origin",
+		executeFunc: func(ctx context.Context, _ string) (string, error) {
+			origin, found = agent.OriginMessageFromContext(ctx)
+			return `{"ok":true}`, nil
+		},
+	}
+	client := &mockAIClient{
+		responses: []openai.ChatCompletionResponse{
+			toolCallResponse("call_1", "capture_origin", `{}`),
+			textResponse("Готово."),
+		},
+	}
+	a := newTestAgent(t, client, []agent.Tool{capture}, agent.Config{})
+	msg := model.Message{
+		ID:         "device-1:1",
+		Kind:       model.MessageKindDM,
+		Source:     model.Source{Kind: "client", ID: "device-1"},
+		Text:       "создай задачу",
+		VoiceJobID: "voice-job-1",
+	}
+
+	if _, err := a.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Handle() returned error: %v", err)
+	}
+
+	if !found {
+		t.Fatal("origin message not found in tool context")
+	}
+	if origin.ID != msg.ID || origin.Source != msg.Source || origin.Text != msg.Text || origin.VoiceJobID != msg.VoiceJobID {
+		t.Errorf("origin = %+v, want %+v", origin, msg)
+	}
+}
+
+func TestOriginMessageFromContext_Missing(t *testing.T) {
+	if _, ok := agent.OriginMessageFromContext(context.Background()); ok {
+		t.Error("OriginMessageFromContext reported a message for an empty context")
+	}
+}
+
 func TestAgentToolSetIncludesProjectManagement_DM(t *testing.T) {
 	captureClient := &captureToolsClient{response: textResponse("ок")}
 

@@ -81,13 +81,15 @@ func (m *mockTaskService) CreateTask(_ context.Context, req model.CreateTaskRequ
 		return nil, m.createErr
 	}
 	task := model.Task{
-		ID:        "task-id",
-		ProjectID: req.ProjectID,
-		Summary:   req.Summary,
-		Details:   req.Details,
-		Topic:     req.Topic,
-		Deadline:  req.Deadline,
-		Source:    req.Source,
+		ID:            "task-id",
+		ProjectID:     req.ProjectID,
+		Summary:       req.Summary,
+		Details:       req.Details,
+		Topic:         req.Topic,
+		Deadline:      req.Deadline,
+		Priority:      req.Priority,
+		Source:        req.Source,
+		SourceDetails: req.SourceDetails,
 	}
 	m.createdTasks = append(m.createdTasks, task)
 	return &task, nil
@@ -102,13 +104,15 @@ func (m *mockTaskService) CreateTasks(_ context.Context, req model.CreateTasksRe
 	var result []model.Task
 	for _, r := range req.Tasks {
 		task := model.Task{
-			ID:        "task-id",
-			ProjectID: req.ProjectID,
-			Summary:   r.Summary,
-			Details:   r.Details,
-			Topic:     r.Topic,
-			Deadline:  r.Deadline,
-			Source:    r.Source,
+			ID:            "task-id",
+			ProjectID:     req.ProjectID,
+			Summary:       r.Summary,
+			Details:       r.Details,
+			Topic:         r.Topic,
+			Deadline:      r.Deadline,
+			Priority:      r.Priority,
+			Source:        r.Source,
+			SourceDetails: r.SourceDetails,
 		}
 		m.createdTasks = append(m.createdTasks, task)
 		result = append(result, task)

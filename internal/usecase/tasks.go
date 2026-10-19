@@ -16,6 +16,9 @@ import (
 // not-found и возвращал HTTP 404 вместо 500.
 var ErrTaskNotFound = errors.New("task not found")
 
+// ErrInvalidTaskPriority is returned when a task priority is outside the 0–3 range.
+var ErrInvalidTaskPriority = errors.New("task priority must be between 0 and 3")
+
 // TaskServiceDeps collects the dependencies for TaskService.
 type TaskServiceDeps struct {
 	// DB is the database used to open write transactions.
@@ -56,18 +59,28 @@ func NewTaskService(deps TaskServiceDeps) model.TaskService {
 
 // taskSnapshot is the JSON schema for a task event payload.
 type taskSnapshot struct {
-	ID          string     `json:"id"`
-	Number      int        `json:"number"`
-	ProjectID   string     `json:"project_id"`
-	ProjectSlug string     `json:"project_slug,omitempty"`
-	Summary     string     `json:"summary"`
-	Details     string     `json:"details,omitempty"`
-	Topic       string     `json:"topic,omitempty"`
-	Status      string     `json:"status"`
-	Deadline    *time.Time `json:"deadline,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
+	ID          string              `json:"id"`
+	Number      int                 `json:"number"`
+	ProjectID   string              `json:"project_id"`
+	ProjectSlug string              `json:"project_slug,omitempty"`
+	Summary     string              `json:"summary"`
+	Details     string              `json:"details,omitempty"`
+	Topic       string              `json:"topic,omitempty"`
+	Status      string              `json:"status"`
+	Deadline    *time.Time          `json:"deadline,omitempty"`
+	Priority    model.TaskPriority  `json:"priority"`
+	Source      *taskSourceSnapshot `json:"source,omitempty"`
+	CreatedAt   time.Time           `json:"created_at"`
+	UpdatedAt   time.Time           `json:"updated_at"`
+	ClosedAt    *time.Time          `json:"closed_at,omitempty"`
+}
+
+// taskSourceSnapshot is the task source in an event payload: the channel kind
+// plus the persisted source details, flattened under the same JSON keys as
+// model.TaskSourceDetails (replyTo included).
+type taskSourceSnapshot struct {
+	Kind string `json:"kind,omitempty"`
+	*model.TaskSourceDetails
 }
 
 func makeTaskSnapshot(t *model.Task) taskSnapshot {
@@ -81,10 +94,30 @@ func makeTaskSnapshot(t *model.Task) taskSnapshot {
 		Topic:       t.Topic,
 		Status:      t.Status,
 		Deadline:    t.Deadline,
+		Priority:    t.Priority,
+		Source:      makeTaskSourceSnapshot(t),
 		CreatedAt:   t.CreatedAt,
 		UpdatedAt:   t.UpdatedAt,
 		ClosedAt:    t.ClosedAt,
 	}
+}
+
+// makeTaskSourceSnapshot returns nil when the task has neither a source kind
+// nor source details, so the "source" key is omitted from the payload.
+func makeTaskSourceSnapshot(t *model.Task) *taskSourceSnapshot {
+	if t.Source.Kind == "" && t.SourceDetails == nil {
+		return nil
+	}
+	return &taskSourceSnapshot{Kind: t.Source.Kind, TaskSourceDetails: t.SourceDetails}
+}
+
+// validatePriority reports an ErrInvalidTaskPriority-wrapped error when p is
+// outside the supported 0–3 range.
+func validatePriority(p model.TaskPriority) error {
+	if !p.Valid() {
+		return fmt.Errorf("priority %d: %w", p, ErrInvalidTaskPriority)
+	}
+	return nil
 }
 
 // taskEventPayload wraps the payload for all task_* events.
@@ -121,6 +154,9 @@ func collectChangedFields(original *model.Task, upd model.TaskUpdate) []string {
 	if upd.Status != nil && *upd.Status != original.Status {
 		changed = append(changed, "status")
 	}
+	if upd.Priority != nil && *upd.Priority != original.Priority {
+		changed = append(changed, "priority")
+	}
 	return changed
 }
 
@@ -142,6 +178,11 @@ func (s *taskService) CreateTask(ctx context.Context, req model.CreateTaskReques
 func (s *taskService) CreateTasks(ctx context.Context, req model.CreateTasksRequest) ([]model.Task, error) {
 	if len(req.Tasks) == 0 {
 		return nil, nil
+	}
+	for _, r := range req.Tasks {
+		if err := validatePriority(r.Priority); err != nil {
+			return nil, fmt.Errorf("create task: %w", err)
+		}
 	}
 
 	projectID := req.ProjectID
@@ -173,13 +214,15 @@ func (s *taskService) CreateTasks(ctx context.Context, req model.CreateTasksRequ
 
 	for _, r := range req.Tasks {
 		task := &model.Task{
-			ProjectID:   projectID,
-			ProjectSlug: project.Slug,
-			Summary:     r.Summary,
-			Details:     r.Details,
-			Topic:       r.Topic,
-			Deadline:    r.Deadline,
-			Source:      r.Source,
+			ProjectID:     projectID,
+			ProjectSlug:   project.Slug,
+			Summary:       r.Summary,
+			Details:       r.Details,
+			Topic:         r.Topic,
+			Deadline:      r.Deadline,
+			Priority:      r.Priority,
+			Source:        r.Source,
+			SourceDetails: r.SourceDetails,
 		}
 		if err := s.tasks.CreateTaskTx(ctx, tx, task); err != nil {
 			return nil, fmt.Errorf("создание задачи: %w", err)
@@ -211,6 +254,11 @@ func (s *taskService) CreateTasks(ctx context.Context, req model.CreateTasksRequ
 }
 
 func (s *taskService) UpdateTask(ctx context.Context, id string, upd model.TaskUpdate) (*model.Task, error) {
+	if upd.Priority != nil {
+		if err := validatePriority(*upd.Priority); err != nil {
+			return nil, fmt.Errorf("update task %s: %w", id, err)
+		}
+	}
 	return s.updateAndEmit(ctx, id, upd, model.EventTaskUpdated)
 }
 
