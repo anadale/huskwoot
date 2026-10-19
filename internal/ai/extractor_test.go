@@ -1020,8 +1020,8 @@ func TestExtractor_SystemPromptHasDeadlineRules(t *testing.T) {
 	if !strings.Contains(cap.systemPrompt, "ISO 8601") {
 		t.Errorf("system prompt does not contain 'ISO 8601', prompt:\n%s", cap.systemPrompt)
 	}
-	if !strings.Contains(cap.systemPrompt, "русское натуральное выражение") {
-		t.Errorf("system prompt does not contain 'русское натуральное выражение', prompt:\n%s", cap.systemPrompt)
+	if !strings.Contains(cap.systemPrompt, "Относительный срок") || !strings.Contains(cap.systemPrompt, "без пересчёта в дату") {
+		t.Errorf("system prompt must tell the model to return relative deadlines verbatim, prompt:\n%s", cap.systemPrompt)
 	}
 	if !strings.Contains(cap.systemPrompt, "завтра") {
 		t.Errorf("system prompt does not contain example 'завтра', prompt:\n%s", cap.systemPrompt)

@@ -60,6 +60,10 @@ func TestRussianDateLanguage_DayTime(t *testing.T) {
 		{"сегодня вечером", "сегодня вечером", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
 		{"к утру", "к утру", time.Date(2026, 4, 16, 11, 0, 0, 0, loc)},
 		{"к вечеру", "к вечеру", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"до вечера", "до вечера", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"сегодня до вечера", "сегодня до вечера", time.Date(2026, 4, 15, 20, 0, 0, 0, loc)},
+		{"завтра до вечера", "завтра до вечера", time.Date(2026, 4, 16, 20, 0, 0, 0, loc)},
+		{"послезавтра до вечера", "послезавтра до вечера", time.Date(2026, 4, 17, 20, 0, 0, 0, loc)},
 		{"к обеду", "к обеду", time.Date(2026, 4, 15, 12, 0, 0, 0, loc)},
 		{"после обеда", "после обеда", time.Date(2026, 4, 15, 14, 0, 0, 0, loc)},
 	}
@@ -289,6 +293,11 @@ func TestRussianDateLanguage_NightCutoff(t *testing.T) {
 			"послезавтра утром before cutoff → tomorrow at morning",
 			nightNow, cfgCutoff, "послезавтра утром",
 			time.Date(2026, 4, 28, 11, 0, 0, 0, loc), // shift: 2→1, morning=11
+		},
+		{
+			"завтра до вечера before cutoff → today at evening",
+			nightNow, cfgCutoff, "завтра до вечера",
+			time.Date(2026, 4, 27, 20, 0, 0, 0, loc), // shift: 1→0, evening=20
 		},
 		{
 			"завтра в 14:00 before cutoff → today 14:00",

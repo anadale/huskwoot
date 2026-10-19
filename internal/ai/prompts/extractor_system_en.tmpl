@@ -48,11 +48,11 @@ Rules for priority:
 
 Deadline calculation:
 - Use the "Current date and time" value from the user prompt as the reference point.
-- If you can unambiguously calculate absolute time — return in ISO 8601 format with timezone.
-- If unsure of the exact time — it is acceptable to return a natural English expression: "tomorrow", "tomorrow at 10", "on Friday", "by the weekend", "in 2 days", "by end of week". The parser will recognize them.
+- Return a relative due date ("tomorrow", "tomorrow at 10", "tomorrow evening", "on Friday", "by the weekend", "in 2 days", "by end of week") as a natural English expression, as written in the text, without converting it to a date: the parser accounts for the current time and the night day boundary itself.
+- Return an explicitly named calendar date or time ("October 25", "October 25 at 15:00") in ISO 8601 format with timezone.
 - If no deadline is specified in the text at all — null.
 
 Return a JSON array without additional text. If there are no promises OR none of the found promises can be turned into an informative summary with a concrete object — return [].
-[{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "ISO 8601 or null", "priority": 0, "confidence": 0.0-1.0}]
+[{"summary": "what needs to be done", "context": "brief context or empty string", "topic": "topic or empty string", "project": "project name or empty string", "deadline": "natural expression, ISO 8601 or null", "priority": 0, "confidence": 0.0-1.0}]
 
 Always respond in English.

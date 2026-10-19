@@ -497,6 +497,76 @@ func TestAgent_InjectsNowIntoSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestAgent_SystemPromptNightShift(t *testing.T) {
+	msk := time.FixedZone("MSK", 3*3600)
+	night := time.Date(2026, 10, 20, 0, 20, 0, 0, msk)
+	atCutoff := time.Date(2026, 10, 20, 5, 0, 0, 0, msk)
+
+	tests := []struct {
+		name     string
+		lang     string
+		cutoff   int
+		now      time.Time
+		wantNote string
+	}{
+		{"ru before cutoff", "ru", 300, night, "«завтра» в его словах означает 2026-10-20, «послезавтра» — 2026-10-21"},
+		{"en before cutoff", "en", 300, night, `"tomorrow" in their words means 2026-10-20, "the day after tomorrow" means 2026-10-21`},
+		{"ru at cutoff", "ru", 300, atCutoff, ""},
+		{"ru cutoff disabled", "ru", 0, night, ""},
+		{"en cutoff disabled", "en", 0, night, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			captureClient := &captureToolsClient{response: textResponse("ок")}
+			now := tt.now
+			a := newTestAgent(t, captureClient, nil, agent.Config{
+				Language:           tt.lang,
+				Now:                func() time.Time { return now },
+				NightCutoffMinutes: tt.cutoff,
+			})
+			if _, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindDM, Text: "тест"}); err != nil {
+				t.Fatalf("Handle() returned error: %v", err)
+			}
+			sys := captureClient.capturedSysContent
+			nightMarker := map[string]string{"ru": "Сейчас ночь", "en": "It is night"}[tt.lang]
+			if tt.wantNote == "" {
+				if strings.Contains(sys, nightMarker) {
+					t.Errorf("system prompt must not contain the night note\nFull prompt: %q", sys)
+				}
+				return
+			}
+			if !strings.Contains(sys, tt.wantNote) {
+				t.Errorf("system prompt does not contain %q\nFull prompt: %q", tt.wantNote, sys)
+			}
+			if !strings.Contains(sys, nightMarker+", до 05:00") && !strings.Contains(sys, nightMarker+", before 05:00") {
+				t.Errorf("system prompt does not name the cutoff 05:00\nFull prompt: %q", sys)
+			}
+		})
+	}
+}
+
+func TestAgent_SystemPromptPassesRelativeDeadlinesVerbatim(t *testing.T) {
+	tests := []struct {
+		lang string
+		want string
+	}{
+		{"ru", "Относительный срок передавай натуральным выражением так, как его сказал пользователь"},
+		{"en", "Pass a relative due date as a natural expression, exactly as the user said it"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.lang, func(t *testing.T) {
+			captureClient := &captureToolsClient{response: textResponse("ок")}
+			a := newTestAgent(t, captureClient, nil, agent.Config{Language: tt.lang})
+			if _, err := a.Handle(context.Background(), model.Message{Kind: model.MessageKindDM, Text: "тест"}); err != nil {
+				t.Fatalf("Handle() returned error: %v", err)
+			}
+			if !strings.Contains(captureClient.capturedSysContent, tt.want) {
+				t.Errorf("system prompt does not contain %q", tt.want)
+			}
+		})
+	}
+}
+
 func TestAgent_InjectsProjectsIntoSystemPrompt(t *testing.T) {
 	captureClient := &captureToolsClient{
 		response: textResponse("ок"),

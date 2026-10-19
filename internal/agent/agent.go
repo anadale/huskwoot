@@ -58,6 +58,11 @@ type Config struct {
 	// nil — the projects block is not added to the prompt. Errors are logged
 	// but do not interrupt processing.
 	ListProjects func(ctx context.Context) ([]model.Project, error)
+	// NightCutoffMinutes is the night day boundary in minutes since midnight
+	// (datetime.night_cutoff); 0 disables it. Before the boundary the prompt tells
+	// the model that "tomorrow" in the user's words means the current date, the
+	// same shift dateparse applies to relative day phrases.
+	NightCutoffMinutes int
 }
 
 // Tool describes a single agent tool.
@@ -81,6 +86,7 @@ type Agent struct {
 	tools        []Tool
 	listProjects func(ctx context.Context) ([]model.Project, error)
 	now          func() time.Time
+	nightCutoff  int
 	systemTmpl   *template.Template
 	logger       *slog.Logger
 }
@@ -111,6 +117,7 @@ func New(client AIClient, tools []Tool, cfg Config, logger *slog.Logger) (*Agent
 		tools:        tools,
 		listProjects: cfg.ListProjects,
 		now:          nowFn,
+		nightCutoff:  cfg.NightCutoffMinutes,
 		systemTmpl:   tmpl,
 		logger:       logger,
 	}, nil
@@ -158,12 +165,28 @@ func (a *Agent) Handle(ctx context.Context, msg model.Message) (string, error) {
 		projectHint = &projectHintEntry{Name: msg.ProjectHint.Name, Slug: msg.ProjectHint.Slug}
 	}
 
+	type nightShiftEntry struct {
+		Cutoff   string
+		Today    string
+		Tomorrow string
+	}
+	var nightShift *nightShiftEntry
+	if a.nightCutoff > 0 && now.Hour()*60+now.Minute() < a.nightCutoff {
+		nightShift = &nightShiftEntry{
+			Cutoff:   fmt.Sprintf("%02d:%02d", a.nightCutoff/60, a.nightCutoff%60),
+			Today:    now.Format("2006-01-02"),
+			Tomorrow: now.AddDate(0, 0, 1).Format("2006-01-02"),
+		}
+	}
+
 	data := struct {
 		Now         string
+		NightShift  *nightShiftEntry
 		Projects    []projectEntry
 		ProjectHint *projectHintEntry
 	}{
 		Now:         now.Format("2006-01-02 15:04:05 -07:00"),
+		NightShift:  nightShift,
 		Projects:    projectEntries,
 		ProjectHint: projectHint,
 	}

@@ -211,6 +211,8 @@ Handles `MessageKindDM` and `MessageKindGroupDirect` via a tool-calling loop (ma
 
 - `Config.Now func() time.Time` — current time injected into the system prompt and into `create_task` via `context.Value(nowKey)`. Falls back to `time.Now()` when `nil`.
 - `Config.ListProjects func(ctx) ([]Project, error)` — project list injected into the system prompt ("Known projects" block). Block is omitted when `nil`.
+- `Config.NightCutoffMinutes int` — `datetime.night_cutoff` in minutes; `0` = off. Before the cutoff the system prompt states which dates "tomorrow" and "the day after tomorrow" mean, so dates the model computes itself (e.g. `search_tasks` ranges) follow the same shift as `dateparse`.
+- Relative deadlines are passed to tools verbatim as natural expressions; only explicit calendar dates go as ISO 8601. An ISO value bypasses the night cutoff, so the agent and message extractor prompts must not ask the model to convert relative phrases. The forward extractor keeps ISO, because relative phrases there refer to the original message date.
 
 ### Origin message
 

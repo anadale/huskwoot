@@ -306,10 +306,11 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 		agent.NewSearchTasksTool(taskSvc, projectSvc, dp, agentLoc),
 	}
 	ag, err := agent.New(aiComps.smartClient, agentTools, agent.Config{
-		SystemPrompt: promptOverrides.agentSystem,
-		Language:     cfg.User.Language,
-		Now:          nowFn,
-		ListProjects: projectSvc.ListProjects,
+		SystemPrompt:       promptOverrides.agentSystem,
+		Language:           cfg.User.Language,
+		Now:                nowFn,
+		ListProjects:       projectSvc.ListProjects,
+		NightCutoffMinutes: cfg.DateTime.NightCutoffMinutes,
 	}, logger)
 	if err != nil {
 		return fmt.Errorf("initializing agent: %w", err)

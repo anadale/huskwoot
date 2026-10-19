@@ -133,6 +133,7 @@ func matchDayTime(s string, now time.Time, cfg Config) (*time.Time, bool) {
 		{"после обеда", markerAfternoon},
 		{"вечером", markerEvening},
 		{"к вечеру", markerEvening},
+		{"до вечера", markerEvening},
 		{"ночью", markerNight},
 		{"к обеду", markerLunch},
 		{"в обед", markerLunch},
