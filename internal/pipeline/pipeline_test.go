@@ -145,14 +145,16 @@ func (m *mockTaskService) PurgeClosedOlderThan(_ context.Context, _ time.Time) (
 
 // mockProjectService implements model.ProjectService for tests.
 type mockProjectService struct {
-	mu         sync.Mutex
-	resolveID  string
-	resolveErr error
+	mu               sync.Mutex
+	resolveID        string
+	resolveErr       error
+	resolvedChannels []string
 }
 
-func (m *mockProjectService) ResolveProjectForChannel(_ context.Context, _ string) (string, error) {
+func (m *mockProjectService) ResolveProjectForChannel(_ context.Context, channelID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.resolvedChannels = append(m.resolvedChannels, channelID)
 	return m.resolveID, m.resolveErr
 }
 
@@ -587,7 +589,7 @@ func TestProcess_Group_TaskServiceCreateTasks(t *testing.T) {
 	}
 }
 
-func TestProcess_Batch_GoesToTaskService(t *testing.T) {
+func TestProcess_Batch_GoesToTaskService_WithoutAutoTasks(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{tasks: testTasks()}
 	taskSvc := &mockTaskService{}
@@ -596,7 +598,7 @@ func TestProcess_Batch_GoesToTaskService(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
-	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
+	cfg.AutoTasks = nil
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -612,7 +614,7 @@ func TestProcess_Batch_GoesToTaskService(t *testing.T) {
 	}
 }
 
-func TestProcess_Batch_TaskServiceError_NotifierStillCalled(t *testing.T) {
+func TestProcess_Batch_TaskServiceError_NotifierStillCalled_WithoutAutoTasks(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{tasks: testTasks()}
 	taskSvc := &mockTaskService{createErr: errors.New("ошибка записи")}
@@ -622,7 +624,7 @@ func TestProcess_Batch_TaskServiceError_NotifierStillCalled(t *testing.T) {
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
 	cfg.Tasks = taskSvc
-	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
+	cfg.AutoTasks = nil
 	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
@@ -888,13 +890,12 @@ func TestProcess_ClassPromise_Group_HistoryFnError_ContinuesProcessing(t *testin
 func TestProcess_ClassPromise_Batch_BypassOwnerCheck(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
 	extractor := &mockExtractor{tasks: testTasks()}
-	taskSvc := &mockTaskService{}
+	auto := &pipelineAutoTasks{}
 
 	cfg := testConfig()
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
-	cfg.Tasks = taskSvc
-	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
+	cfg.AutoTasks = auto
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -902,11 +903,9 @@ func TestProcess_ClassPromise_Batch_BypassOwnerCheck(t *testing.T) {
 		t.Fatalf("Process returned error: %v", err)
 	}
 
-	taskSvc.mu.Lock()
-	n := len(taskSvc.createdTasks)
-	taskSvc.mu.Unlock()
-	if n != 1 {
-		t.Errorf("taskSvc must be called for Batch, created %d tasks", n)
+	if classifier.calls != 1 || extractor.calls != 1 || len(auto.submissions) != 1 {
+		t.Errorf("non-owner email was not processed: classifier=%d extractor=%d submissions=%d",
+			classifier.calls, extractor.calls, len(auto.submissions))
 	}
 }
 
@@ -1175,13 +1174,12 @@ func TestProcess_OriginTopic_PreservedForBatch(t *testing.T) {
 		Summary: "задача", Confidence: 0.9,
 		Topic: "Тема письма",
 	}}}
-	taskSvc := &mockTaskService{}
+	auto := &pipelineAutoTasks{}
 
 	cfg := testConfig()
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
-	cfg.Tasks = taskSvc
-	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
+	cfg.AutoTasks = auto
 	p := New(cfg)
 
 	msg := testBatchMsg()
@@ -1189,44 +1187,63 @@ func TestProcess_OriginTopic_PreservedForBatch(t *testing.T) {
 		t.Fatalf("Process returned error: %v", err)
 	}
 
-	taskSvc.mu.Lock()
-	defer taskSvc.mu.Unlock()
-	if len(taskSvc.createdTasks) == 0 {
-		t.Fatal("taskSvc received no tasks")
+	if len(auto.submissions) != 1 || len(auto.submissions[0].Tasks) != 1 {
+		t.Fatal("email task was not submitted")
 	}
-	if taskSvc.createdTasks[0].Topic != "Тема письма" {
-		t.Errorf("Topic must be preserved for Batch, got %q", taskSvc.createdTasks[0].Topic)
+	if got := auto.submissions[0].Tasks[0].Topic; got != "Тема письма" {
+		t.Errorf("Topic must be preserved for Batch, got %q", got)
 	}
 }
 
 func TestProcess_BatchMessage_TaskSourcePreserved(t *testing.T) {
 	classifier := &mockClassifier{class: model.ClassPromise}
-	extractor := &mockExtractor{tasks: []model.Task{{Summary: "задача", Confidence: 0.9}}}
-	taskSvc := &mockTaskService{}
+	msg := model.Message{
+		ID: "42", IMAPUIDValidity: 100,
+		Author: "boss@example.com", AuthorName: "Project owner",
+		Text: "Prepare the report", Subject: "Q1 meeting",
+		Timestamp: time.Date(2026, time.October, 20, 10, 0, 0, 0, time.UTC),
+		Kind:      model.MessageKindBatch,
+		Source:    model.Source{Kind: "imap", ID: "user@example.com:INBOX", Name: "Work mailbox"},
+	}
+	extractor := &mockExtractor{tasks: []model.Task{{Summary: "Prepare the report", Source: msg.Source}}}
+	auto := &pipelineAutoTasks{}
+	notifier := &mockNotifier{}
 
 	cfg := testConfig()
 	cfg.Classifiers = groupClassifiers(classifier)
 	cfg.Extractors = groupExtractors(extractor)
-	cfg.Tasks = taskSvc
-	cfg.AutoTasks = &pipelineAutoTasks{tasks: taskSvc}
+	cfg.AutoTasks = auto
+	cfg.Notifiers = []model.Notifier{notifier}
 	p := New(cfg)
 
-	msg := model.Message{
-		ID:      "imap-1",
-		Author:  "boss@example.com",
-		Text:    "нужно подготовить отчёт",
-		Subject: "Встреча по Q1",
-		Kind:    model.MessageKindBatch,
-		Source:  model.Source{Kind: "imap", ID: "user@example.com:INBOX", Name: "Рабочая почта"},
-	}
 	if err := p.Process(context.Background(), msg); err != nil {
 		t.Fatalf("Process returned error: %v", err)
 	}
 
-	taskSvc.mu.Lock()
-	defer taskSvc.mu.Unlock()
-	if len(taskSvc.createdTasks) == 0 {
-		t.Fatal("taskSvc received no tasks")
+	if len(auto.submissions) != 1 || len(auto.submissions[0].Tasks) != 1 {
+		t.Fatal("email task was not submitted")
+	}
+	request := auto.submissions[0].Tasks[0]
+	if request.Source != msg.Source {
+		t.Errorf("source = %+v, want %+v", request.Source, msg.Source)
+	}
+	details := request.SourceDetails
+	if details == nil {
+		t.Fatal("email source snapshot is missing")
+	}
+	if details.Name != msg.Source.Name || details.Subject != msg.Subject ||
+		details.Text != msg.Text || details.Author != msg.AuthorName ||
+		details.Via != model.SourceViaMessage || details.At == nil || !details.At.Equal(msg.Timestamp) {
+		t.Errorf("email source snapshot lost provenance: %+v", details)
+	}
+	if notifier.calls != 1 || len(notifier.tasks) != 1 {
+		t.Fatal("created email task was not notified")
+	}
+	task := notifier.tasks[0]
+	if task.Source != msg.Source || task.SourceDetails != details ||
+		task.SourceMessage.ID != msg.ID || task.SourceMessage.Subject != msg.Subject ||
+		task.SourceMessage.IMAPUIDValidity != msg.IMAPUIDValidity {
+		t.Errorf("notified email task lost provenance: %+v", task)
 	}
 }
 

@@ -344,18 +344,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	})
 
 	msgCh := make(chan model.Message, 100)
-	watchHandler := func(ctx context.Context, msg model.Message) error {
-		// Do not acknowledge group updates until their durable intake transaction commits.
-		if msg.Kind == model.MessageKindGroup {
-			return pipe.Process(ctx, msg)
-		}
-		select {
-		case msgCh <- msg:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
+	watchHandler := pipe.WatchHandler(msgCh)
 
 	if voiceQueue != nil && transcriber != nil {
 		downloaders := map[string]model.VoiceDownloader{}

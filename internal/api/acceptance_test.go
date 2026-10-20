@@ -35,9 +35,9 @@ import (
 )
 
 // The tests in this file are end-to-end acceptance checks for task source,
-// task priority and the client chat history. They run the real pipeline,
-// extractors, agent, services and SQLite stores behind the HTTP API; only the
-// language model calls are scripted.
+// task priority, email duplicate decisions and the client chat history. They run
+// the real pipeline, extractors, agent, services and SQLite stores behind the
+// HTTP API; model calls and duplicate assessments are scripted.
 
 // acceptanceOwnerID is the Telegram user id of the owner in acceptance tests.
 const acceptanceOwnerID = "owner-123"
@@ -45,9 +45,11 @@ const acceptanceOwnerID = "owner-123"
 // acceptanceCompleter is an ai.Completer that returns a fixed model response.
 type acceptanceCompleter struct {
 	response string
+	calls    int
 }
 
 func (c *acceptanceCompleter) Complete(context.Context, string, string) (string, error) {
+	c.calls++
 	return c.response, nil
 }
 
@@ -56,6 +58,65 @@ type promiseClassifier struct{}
 
 func (promiseClassifier) Classify(context.Context, model.Message) (model.Classification, error) {
 	return model.ClassPromise, nil
+}
+
+type acceptanceClassifier struct {
+	calls int
+}
+
+func (c *acceptanceClassifier) Classify(context.Context, model.Message) (model.Classification, error) {
+	c.calls++
+	return model.ClassPromise, nil
+}
+
+type acceptanceDuplicateCall struct {
+	task       model.CreateTaskRequest
+	sourceText string
+	references []model.TaskReference
+}
+
+// acceptanceDuplicateChecker consumes explicit decisions against the first open
+// task, recording the real reference set supplied by AutoTaskService.
+type acceptanceDuplicateChecker struct {
+	assessments []model.TaskAssessment
+	calls       []acceptanceDuplicateCall
+}
+
+func (c *acceptanceDuplicateChecker) Compare(_ context.Context, task model.CreateTaskRequest, sourceText string, refs []model.TaskReference) (model.TaskAssessment, error) {
+	c.calls = append(c.calls, acceptanceDuplicateCall{task, sourceText, append([]model.TaskReference(nil), refs...)})
+	if len(c.assessments) == 0 {
+		return model.TaskAssessment{}, errors.New("duplicate checker: no decision left")
+	}
+	assessment := c.assessments[0]
+	c.assessments = c.assessments[1:]
+	for _, ref := range refs {
+		if strings.HasPrefix(ref.ID, "task:") && ref.State == "open" {
+			assessment.MatchID = ref.ID
+			break
+		}
+	}
+	return assessment, nil
+}
+
+type acceptanceNotifier struct {
+	deliveries [][]model.Task
+}
+
+func (n *acceptanceNotifier) Name() string { return "acceptance" }
+
+func (n *acceptanceNotifier) Notify(_ context.Context, tasks []model.Task) error {
+	n.deliveries = append(n.deliveries, append([]model.Task(nil), tasks...))
+	return nil
+}
+
+type acceptanceHarnessOption func(*usecase.AutoTaskServiceDeps)
+
+func withAcceptanceDuplicateChecker(checker model.TaskDuplicateChecker) acceptanceHarnessOption {
+	return func(deps *usecase.AutoTaskServiceDeps) {
+		deps.Checker = checker
+		deps.DuplicateThreshold = .95
+		deps.ReviewThreshold = .70
+	}
 }
 
 // scriptedStep is one scripted agent model response. When gate is set, the
@@ -201,11 +262,14 @@ type acceptanceHarness struct {
 	// extractorAI answers the message extractor (groups and email).
 	extractorAI *acceptanceCompleter
 	// forwardAI answers the forward batch extractor.
-	forwardAI *acceptanceCompleter
-	forwards  *storage.SQLiteForwardBuffer
+	forwardAI  *acceptanceCompleter
+	forwards   *storage.SQLiteForwardBuffer
+	autoTasks  model.AutoTaskService
+	classifier *acceptanceClassifier
+	notifier   *acceptanceNotifier
 }
 
-func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
+func newAcceptanceHarness(t *testing.T, options ...acceptanceHarnessOption) *acceptanceHarness {
 	t.Helper()
 	db := openTestDB(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -229,10 +293,14 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		DB: db, Tasks: taskStore, Events: eventStore,
 		Devices: deviceStore, Queue: pushQueue, Broker: broker,
 	})
-	autoTaskSvc := usecase.NewAutoTaskService(usecase.AutoTaskServiceDeps{
+	autoDeps := usecase.AutoTaskServiceDeps{
 		DB: db, Tasks: taskStore, Events: eventStore, Devices: deviceStore,
 		Queue: pushQueue, Broker: broker, Store: storage.NewSQLiteAutoTaskStore(db), Logger: logger,
-	})
+	}
+	for _, option := range options {
+		option(&autoDeps)
+	}
+	autoTaskSvc := usecase.NewAutoTaskService(autoDeps)
 
 	bundle, err := huskwootI18n.NewBundle("ru")
 	if err != nil {
@@ -268,19 +336,22 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		t.Fatalf("NewForwardExtractor: %v", err)
 	}
 	forwards := storage.NewSQLiteForwardBuffer(db)
+	classifier := &acceptanceClassifier{}
+	notifier := &acceptanceNotifier{}
 	p := pipeline.New(pipeline.Config{
 		OwnerIDs:  []string{acceptanceOwnerID},
 		Tasks:     taskSvc,
 		AutoTasks: autoTaskSvc,
 		Projects:  projectSvc,
 		Classifiers: map[model.MessageKind]model.Classifier{
-			model.MessageKindGroup: promiseClassifier{},
-			model.MessageKindBatch: promiseClassifier{},
+			model.MessageKindGroup: classifier,
+			model.MessageKindBatch: classifier,
 		},
 		Extractors: map[model.MessageKind]model.Extractor{
 			model.MessageKindGroup: extractor,
 			model.MessageKindBatch: extractor,
 		},
+		Notifiers:         []model.Notifier{notifier},
 		Logger:            logger,
 		ForwardClassifier: promiseClassifier{},
 		ForwardExtractor:  forwardExtractor,
@@ -307,6 +378,7 @@ func newAcceptanceHarness(t *testing.T) *acceptanceHarness {
 		t: t, db: db, server: srv, token: token, device: device,
 		tasks: taskSvc, events: eventStore, agentAI: agentAI, voice: voice, pipeline: p,
 		extractorAI: extractorAI, forwardAI: forwardAI, forwards: forwards,
+		autoTasks: autoTaskSvc, classifier: classifier, notifier: notifier,
 	}
 }
 
@@ -878,5 +950,190 @@ func TestAcceptanceOldClientsKeepWorking(t *testing.T) {
 	}
 	for i, entry := range history.Entries {
 		assertKeys(t, fmt.Sprintf("history entry %d", i), entry, "authorName", "text", "timestamp")
+	}
+}
+
+func acceptanceDuplicateEmail() model.Message {
+	return model.Message{
+		ID: "93", IMAPUIDValidity: 101,
+		Author: "sender@example.invalid", AuthorName: "Synthetic Sender",
+		Text:    "Gregory, restore the site on another virtual machine.",
+		Subject: "Site recovery", Timestamp: time.Date(2026, 10, 20, 9, 30, 0, 0, time.UTC),
+		Kind:   model.MessageKindBatch,
+		Source: model.Source{Kind: "imap", ID: "owner@example.invalid:INBOX", Name: "Synthetic mailbox"},
+	}
+}
+
+func (h *acceptanceHarness) seedRecoveryTask() *model.Task {
+	h.t.Helper()
+	task, err := h.tasks.CreateTask(context.Background(), model.CreateTaskRequest{
+		Summary: "Restore the data on another virtual machine",
+	})
+	if err != nil {
+		h.t.Fatalf("CreateTask: %v", err)
+	}
+	return task
+}
+
+func (h *acceptanceHarness) assertEmailEffects(taskCount, questionCount, notificationCount, inferenceCount int) []model.TaskCandidate {
+	h.t.Helper()
+	var list struct {
+		Tasks []acceptanceTask `json:"tasks"`
+	}
+	h.getJSON("/v1/tasks", &list)
+	if len(list.Tasks) != taskCount {
+		h.t.Errorf("visible tasks=%+v, want %d", list.Tasks, taskCount)
+	}
+	pending, err := h.autoTasks.PendingQuestions(context.Background(), 100)
+	if err != nil {
+		h.t.Fatalf("PendingQuestions: %v", err)
+	}
+	if len(pending) != questionCount {
+		h.t.Fatalf("pending owner questions=%+v, want %d", pending, questionCount)
+	}
+	if len(h.notifier.deliveries) != notificationCount {
+		h.t.Errorf("notification deliveries=%d, want %d", len(h.notifier.deliveries), notificationCount)
+	}
+	if h.classifier.calls != inferenceCount || h.extractorAI.calls != inferenceCount {
+		h.t.Errorf("classifier/extractor calls=%d/%d, want %d each", h.classifier.calls, h.extractorAI.calls, inferenceCount)
+	}
+	return pending
+}
+
+func TestAcceptanceEmailDuplicateWaitsForOwnerAndPreservesProvenance(t *testing.T) {
+	checker := &acceptanceDuplicateChecker{assessments: []model.TaskAssessment{
+		{Verdict: "uncertain", Score: .80, Reason: "The restoration targets may differ"},
+		{Verdict: "same", Score: .95, Reason: "The same restoration request"},
+	}}
+	h := newAcceptanceHarness(t, withAcceptanceDuplicateChecker(checker))
+	existing := h.seedRecoveryTask()
+	h.extractorAI.response = `[{"summary":"Restore the site on another virtual machine","context":"Keep the site available","topic":"Recovery","project":"","deadline":null,"confidence":0.9}]`
+	ctx := context.Background()
+	msg := acceptanceDuplicateEmail()
+	if err := h.pipeline.Process(ctx, msg); err != nil {
+		t.Fatalf("Process uncertain email: %v", err)
+	}
+	pending := h.assertEmailEffects(1, 1, 0, 1)
+	candidate, err := h.autoTasks.GetCandidate(ctx, pending[0].ID)
+	if err != nil || candidate == nil {
+		t.Fatalf("GetCandidate: candidate=%+v, err=%v", candidate, err)
+	}
+	if candidate.Status != "pending" || candidate.MatchID != "task:"+existing.ID ||
+		candidate.MatchDisplayID != existing.DisplayID() || candidate.SourceText != msg.Text {
+		t.Errorf("persisted owner question=%+v", candidate)
+	}
+	wantDetails := &model.TaskSourceDetails{
+		Name: msg.Source.Name, Subject: msg.Subject, Author: msg.AuthorName,
+		Text: msg.Text, At: &msg.Timestamp, Via: model.SourceViaMessage,
+	}
+	if candidate.Task.Source != msg.Source || !reflect.DeepEqual(candidate.Task.SourceDetails, wantDetails) ||
+		candidate.Task.Topic != "Recovery" || candidate.Task.ProjectID != existing.ProjectID {
+		t.Errorf("candidate lost email provenance or project/topic: %+v", candidate.Task)
+	}
+	if len(checker.calls) != 1 {
+		t.Fatalf("comparisons=%d, want 1", len(checker.calls))
+	}
+	call := checker.calls[0]
+	if call.sourceText != msg.Text || !reflect.DeepEqual(call.task, candidate.Task) ||
+		len(call.references) != 1 || call.references[0].ID != "task:"+existing.ID || call.references[0].State != "open" {
+		t.Errorf("email comparison did not include the open task and original source: %+v", call)
+	}
+
+	if err := h.pipeline.Process(ctx, msg); err != nil {
+		t.Fatalf("Process committed replay: %v", err)
+	}
+	replayed := h.assertEmailEffects(1, 1, 0, 1)
+	if replayed[0].ID != candidate.ID || len(checker.calls) != 1 {
+		t.Errorf("replay repeated the candidate/comparison: pending=%+v, comparisons=%d", replayed, len(checker.calls))
+	}
+
+	// A new mailbox generation is a fresh input, not necessarily a fresh task.
+	msg.IMAPUIDValidity++
+	if err := h.pipeline.Process(ctx, msg); err != nil {
+		t.Fatalf("Process new mailbox generation: %v", err)
+	}
+	afterGeneration := h.assertEmailEffects(1, 1, 0, 2)
+	if afterGeneration[0].ID != candidate.ID || len(checker.calls) != 2 {
+		t.Fatalf("new generation did not compare and skip a duplicate: pending=%+v, comparisons=%d", afterGeneration, len(checker.calls))
+	}
+	if !reflect.DeepEqual(checker.calls[1].task, call.task) || checker.calls[1].sourceText != call.sourceText {
+		t.Errorf("generation changed source/project/topic: first=%+v, second=%+v", call, checker.calls[1])
+	}
+	if err := h.pipeline.Process(ctx, msg); err != nil {
+		t.Fatalf("Process new generation replay: %v", err)
+	}
+	h.assertEmailEffects(1, 1, 0, 2)
+	if len(checker.calls) != 2 {
+		t.Errorf("new generation replay repeated comparison: %d", len(checker.calls))
+	}
+
+	decision, err := h.autoTasks.Decide(ctx, candidate.ID, true)
+	if err != nil || decision.Task == nil {
+		t.Fatalf("approve candidate: decision=%+v, err=%v", decision, err)
+	}
+	if decision.Candidate.Status != "created" || decision.Task.Topic != "Recovery" ||
+		decision.Task.Source != msg.Source || !reflect.DeepEqual(decision.Task.SourceDetails, wantDetails) {
+		t.Errorf("owner-approved task lost persisted email provenance: %+v", decision)
+	}
+	wantSource := acceptanceSource{
+		Kind: "imap", Name: msg.Source.Name, Subject: msg.Subject,
+		Author: msg.AuthorName, Text: msg.Text, At: &msg.Timestamp, Via: model.SourceViaMessage,
+	}
+	assertSource(t, "approved email GET", h.getTask(decision.Task.ID).Source, wantSource)
+	assertSource(t, "approved email sync snapshot", h.snapshotTask(decision.Task.ID).Source, wantSource)
+	h.assertEmailEffects(2, 0, 0, 2)
+}
+
+func TestAcceptanceEmailDuplicateDecisionThresholds(t *testing.T) {
+	for _, tc := range []struct {
+		name                            string
+		verdict                         string
+		score                           float64
+		tasks, questions, notifications int
+	}{
+		{"same_at_duplicate_threshold", "same", .95, 1, 0, 0},
+		{"same_above_duplicate_threshold", "same", 1, 1, 0, 0},
+		{"different_below_review_threshold", "different", .699, 2, 0, 1},
+		{"different_at_review_threshold", "different", .70, 1, 1, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checker := &acceptanceDuplicateChecker{assessments: []model.TaskAssessment{
+				{Verdict: tc.verdict, Score: tc.score, Reason: "Scripted threshold decision"},
+			}}
+			h := newAcceptanceHarness(t, withAcceptanceDuplicateChecker(checker))
+			h.seedRecoveryTask()
+			h.extractorAI.response = `[{"summary":"Restore the site on another virtual machine","context":"","topic":"Recovery","project":"","deadline":null,"confidence":0.9}]`
+			msg := acceptanceDuplicateEmail()
+			if err := h.pipeline.Process(context.Background(), msg); err != nil {
+				t.Fatalf("Process email: %v", err)
+			}
+			h.assertEmailEffects(tc.tasks, tc.questions, tc.notifications, 1)
+			if len(checker.calls) != 1 {
+				t.Fatalf("comparisons=%d, want 1", len(checker.calls))
+			}
+			if tc.notifications == 1 {
+				delivery := h.notifier.deliveries[0]
+				if len(delivery) != 1 {
+					t.Fatalf("notified tasks=%+v, want only the newly created task", delivery)
+				}
+				task := h.getTask(delivery[0].ID)
+				if task.Summary != "Restore the site on another virtual machine" ||
+					delivery[0].SourceMessage.ID != msg.ID || delivery[0].SourceMessage.Subject != msg.Subject ||
+					delivery[0].SourceMessage.IMAPUIDValidity != msg.IMAPUIDValidity {
+					t.Errorf("notification does not identify the created email task: %+v", delivery[0])
+				}
+				assertSource(t, "new email task", task.Source, acceptanceSource{
+					Kind: "imap", Name: msg.Source.Name, Subject: msg.Subject,
+					Author: msg.AuthorName, Text: msg.Text, At: &msg.Timestamp, Via: model.SourceViaMessage,
+				})
+			}
+			if err := h.pipeline.Process(context.Background(), msg); err != nil {
+				t.Fatalf("Process committed replay: %v", err)
+			}
+			h.assertEmailEffects(tc.tasks, tc.questions, tc.notifications, 1)
+			if len(checker.calls) != 1 {
+				t.Errorf("replay repeated comparison: %d", len(checker.calls))
+			}
+		})
 	}
 }

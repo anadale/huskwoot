@@ -357,7 +357,7 @@ Both values use Go duration format; the `"d"` suffix is not supported (use `"720
 
 ### `[tasks]`
 
-Semantic comparison thresholds apply only to automatic extraction from Telegram, not to explicit agent commands or the REST API.
+Semantic comparison thresholds apply to automatic extraction from Telegram and, when `AutoTaskService` is configured, IMAP email, not to explicit agent commands or the REST API.
 
 ```toml
 [tasks]
@@ -461,9 +461,9 @@ Device registration happens automatically:
 
 ---
 
-## Telegram Task Duplicate Protection
+## Task Duplicate Protection
 
-Automatic extraction from groups and forwarded messages compares candidates against all open tasks in the target project, proposals awaiting confirmation, and previously rejected obligations. Tasks closed within the last 14 days provide context, but cannot justify automatically suppressing new work. Candidates from the same extraction are also compared with each other.
+Automatic extraction from Telegram groups, forwarded messages, and IMAP email with `AutoTaskService` configured compares candidates against all open tasks in the target project, proposals awaiting confirmation, and previously rejected obligations. The service is built only when Telegram is configured: uncertain candidates need questions in the owner's Telegram private chat. Without it, email retains queued processing and direct task creation without duplicate protection. Tasks closed within the last 14 days provide context, but cannot justify automatically suppressing new work. Candidates from the same extraction are also compared with each other.
 
 The check uses the smart model to compare the action, object, work period, and original text. Sharing a topic does not make tasks duplicates; reports for different periods may be separate tasks. An ambiguous deadline change requires a decision rather than silently modifying an existing task.
 
@@ -476,7 +476,9 @@ The check uses the smart model to compare the action, object, work period, and o
 
 Input processing results, candidates, decisions, tasks, events, and the push queue are persisted transactionally. For forwarded messages, the same transaction clears only the processed buffer snapshot; messages arriving during the AI request remain for the next batch.
 
-A group update is acknowledged to Telegram only after successful processing. Consequently, polling may wait for a group's AI request; after a persistence error, the input is retried with a delay. Explicit creation commands, the REST API, and IMAP do not use this mechanism. Existing duplicates are not automatically removed.
+A group update is acknowledged to Telegram only after successful processing. Email with the service also finishes processing synchronously before IMAP acknowledgement, so polling may wait for the AI request. After any returned IMAP handler error, remaining FETCH responses are drained without handling and the entire poll leaves its persisted cursor untouched, even when a higher UID succeeded before a lower UID failed. Handler errors are logged; FETCH errors remain observable. On retry, committed email receipts skip inference, candidates, tasks and notifications rather than repeating successful side effects. Email without the service acknowledges queueing instead; later processing errors cannot stop its cursor advancement. Explicit creation commands and the REST API do not use this mechanism.
+
+IMAP receipts distinguish mailbox generations (`UIDVALIDITY`), while decimal message UIDs, mailbox/source identifiers, project bindings and task source snapshots remain stable. Reusing a UID in a new generation is a new input, not necessarily a new task: semantic duplicate protection still applies. On a generation reset, `monitor` skips existing email; backfill retries from UID 1 with the new generation's receipts. Deployment does not proactively replay historical email behind an existing cursor, and existing duplicate tasks are not automatically removed.
 
 ---
 

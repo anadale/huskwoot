@@ -4,8 +4,9 @@
 
 ```mermaid
 flowchart TD
-    TG[TelegramChannel] -->|Group: synchronous| GP[Pipeline Group]
-    TG -->|DM / GroupDirect| MQ[Message queue]
+    TG[TelegramChannel] --> WH[Pipeline.WatchHandler]
+    WH -->|Group: synchronous| GP[Pipeline automatic input]
+    WH -->|Other inputs: queued| MQ[Message queue]
     MQ -->|DM / GroupDirect| CHAT[ChatService / agent]
     TG -->|ForwardBatch| FD[ForwardDispatcher]
     GP --> EX[Classifier / Extractor]
@@ -17,8 +18,9 @@ flowchart TD
     QUESTIONS --> DM[Owner DM: inline buttons]
     TG -->|callback_query| DECIDE[AutoTaskService.Decide]
     DECIDE --> DB
-    IMAP[IMAPChannel] --> MQ
-    MQ -->|Batch| BP[Classifier / Extractor]
+    IMAP[IMAPChannel] --> WH
+    WH -->|Batch with AutoTaskService: synchronous| GP
+    MQ -->|Batch without AutoTaskService| BP[Classifier / Extractor]
     BP --> TS[TaskService]
     CHAT --> TS
     TS --> DB
@@ -103,19 +105,25 @@ The use-case layer owns `*sql.DB` and transactions. Write method pattern:
 
 Atomicity of "entity + event + push_queue" is guaranteed by a single transaction. `Broker` does not write to the DB.
 
-### Automatic Telegram Tasks
+### Automatic Tasks
+
+Automatic Telegram Group/ForwardBatch extraction uses `AutoTaskService`; IMAP email (`MessageKindBatch`) uses it only when configured. Production builds the service only with Telegram, because pending candidates require questions in the owner's Telegram private chat. Without the service, email remains queued and goes directly to `TaskService.CreateTasks`. Groups without the service return an error; explicit agent and REST task creation remain outside this path.
 
 `AutoTaskService.Submit` compares candidates outside the SQLite transaction. References include all open tasks in the target project, tasks closed within the last 14 days, and pending/rejected candidates. New candidates from the same extraction are added to the comparison set sequentially.
 
 Before writing, the service rechecks the event revision. If another path created or changed a task during the AI request, comparison runs again. `Submit` and `Decide` are serialized within a single service instance; the network request does not occupy the sole SQLite connection.
 
-Source message receipts, candidate decisions, new tasks, events, and the push queue are persisted in one transaction. For forwarded messages, `Finalize` deletes only the message IDs in the processed snapshot; new messages are unaffected. A receipt key includes the source kind, account, chat, message ID, and SHA-256 of the text, so redelivery is skipped while an edited message undergoes a new semantic comparison.
+Source message receipts, candidate decisions, new tasks, events, and the push queue are persisted in one transaction. For forwarded messages, `Finalize` deletes only the message IDs in the processed snapshot; new messages are unaffected. A receipt key includes the source kind, account, chat, message ID, and SHA-256 of the text. IMAP keys additionally include the selected `Message.IMAPUIDValidity` generation; other source keys are unchanged. Decimal message UIDs, mailbox/source identifiers, project bindings and source snapshots remain unchanged. A committed receipt skips inference, candidate creation, tasks and notifications on redelivery; an edited message or a new mailbox generation is a new input for semantic comparison, not a guarantee of a new task.
 
 Candidate states are `pending`, `created`, `rejected`, and `duplicate`. Until the owner decides, a `pending` candidate is absent from `tasks`. The first affirmative answer atomically creates a task and changes the state; subsequent answers return the persisted result. Rejection is also final.
 
 `RunTaskQuestions` delivers unsent questions to the owner's private chat. The callback carries the candidate's stable UUID; validation checks the owner and the private message sent by the bot itself. A failure between sending to Telegram and saving the message ID may repeat the question, but does not create a second task. Actual emoji reactions are not used for this interaction.
 
-Group processing is synchronous, before the update is acknowledged, so polling may wait for the group's AI request. A failure to persist required data prevents cursor advancement; retries use a context-aware delay. DM/GroupDirect and IMAP retain their existing processing queue.
+`Pipeline.WatchHandler` and extraction share the `usesAutoTasks` decision. Groups and email with the service process synchronously before acknowledgement, so polling may wait for the AI request. DM/GroupDirect, forward batches and email without the service remain queued. Later queued/direct email processing errors do not reach IMAP and cannot prevent cursor advancement.
+
+Any handler error returned to IMAP prevents all cursor writes for that poll, including when a higher UID succeeded before a lower UID failed. Remaining FETCH responses are drained without further handling. The persisted pre-poll state stays untouched, including absent state or a previous generation during backfill. Handler errors are logged, while FETCH errors are still returned. Retrying the poll reprocesses failed input, but committed receipts suppress inference and side effects for successful emails seen again.
+
+When `UIDVALIDITY` changes, `monitor` saves `UIDNEXT-1` and skips existing email; backfill starts from UID 1 with generation-specific receipts. Deploying automatic email routing does not proactively replay historical email behind an existing cursor.
 
 ## Agent Tools
 

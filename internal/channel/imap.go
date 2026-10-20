@@ -278,6 +278,7 @@ func (w *IMAPChannel) pollOnce(ctx context.Context, cfg IMAPChannelConfig, folde
 	}()
 
 	var lastUID uint32
+	handlerFailed := false
 	for msg := range msgCh {
 		if msg == nil {
 			continue
@@ -290,11 +291,12 @@ func (w *IMAPChannel) pollOnce(ctx context.Context, cfg IMAPChannelConfig, folde
 			}
 			continue
 		}
+		converted.IMAPUIDValidity = status.UidValidity
 		if err := handler(ctx, *converted); err != nil {
 			slog.Error("message processing failed", "uid", msg.Uid, "error", err)
-			// Stop processing: the message will be retried on next poll.
-			// Using continue instead of break would advance the cursor past failed messages,
-			// causing them to be lost if later messages succeed.
+			// Retain the pre-poll cursor even if a higher UID already succeeded:
+			// FETCH responses are not guaranteed to arrive in UID order.
+			handlerFailed = true
 			break
 		}
 		if msg.Uid > lastUID {
@@ -311,7 +313,7 @@ func (w *IMAPChannel) pollOnce(ctx context.Context, cfg IMAPChannelConfig, folde
 		return fmt.Errorf("fetching messages: %w", err)
 	}
 
-	if lastUID > 0 {
+	if !handlerFailed && lastUID > 0 {
 		return w.saveImapCursor(ctx, key, lastUID, currentValidity)
 	}
 	return nil

@@ -193,7 +193,7 @@ func (f forwardClassifierFunc) Classify(ctx context.Context, msg model.Message) 
 func TestProcessForwardBatch_ReplayFiltersBeforeInference(t *testing.T) {
 	cfg, auto, buf, msg := forwardFixture(t)
 	first := msg.ForwardBatch.Forwards[0]
-	auto.processed = map[string]bool{autoInputKey(msg.Source, first.MessageID, first.Text): true}
+	auto.processed = map[string]bool{autoInputKey(msg.Source, first.MessageID, first.Text, 0): true}
 	cfg.ForwardExtractor = forwardExtractorFunc(func(_ context.Context, in model.Message, _ []model.HistoryEntry) ([]model.Task, error) {
 		if strings.Contains(in.Text, first.Text) {
 			t.Fatal("processed forward leaked into extraction")

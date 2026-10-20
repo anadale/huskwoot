@@ -59,12 +59,15 @@ api/openapi.yaml              — OpenAPI 3.1, source of truth for the REST API
 
 ```mermaid
 flowchart TD
-    Channel[Channel.Watch] --> P[Pipeline.Process]
+    Channel[Channel.Watch] --> Handler[Pipeline.WatchHandler]
+    Handler -->|Group or Batch with AutoTaskService: synchronous| P[Pipeline.Process]
+    Handler -->|Other inputs: queued| Queue[Message queue]
+    Queue --> P
     P -->|DM / GroupDirect| Chat[ChatService.HandleMessage]
-    P -->|Group / ForwardBatch| AutoExtract[Classifier / Extractor]
+    P -->|Group / ForwardBatch or Batch with AutoTaskService| AutoExtract[Classifier / Extractor]
     AutoExtract --> Auto[AutoTaskService.Submit]
     Auto --> Decisions[(receipts / candidates / tasks / events / push)]
-    P -->|Batch| Extract[Classifier / Extractor]
+    P -->|Batch without AutoTaskService| Extract[Classifier / Extractor]
     Extract --> Tasks[TaskService.CreateTasks]
     Tasks --> Notify[notifiers]
     Auto -->|Created| Notify
@@ -100,7 +103,7 @@ Atomicity of "entity + event + push_queue" is guaranteed by a single transaction
 
 ### Automatic task deduplication
 
-`AutoTaskService` applies only to automatic extraction from Telegram Group/ForwardBatch. Explicit agent commands, the REST API, and IMAP retain their existing behavior. Shared types live in `internal/model/auto_tasks.go`, interfaces in `internal/model/interfaces.go`, and the implementation in `internal/usecase/auto_tasks.go`.
+`AutoTaskService` applies to automatic extraction from Telegram Group/ForwardBatch and IMAP email (`MessageKindBatch`) when the service is configured. Production builds the service only when Telegram is configured, because pending candidates require questions in the owner's Telegram private chat. Email without the service keeps its queued/direct `TaskService.CreateTasks` path; explicit agent commands and the REST API are unchanged. Groups without the service remain an error. Shared types live in `internal/model/auto_tasks.go`, interfaces in `internal/model/interfaces.go`, and the implementation in `internal/usecase/auto_tasks.go`.
 
 The smart model compares a candidate against all open tasks in the project, tasks closed within the last 14 days, and pending/rejected candidates. Candidates from the same extraction are also considered. `Task.Confidence` is not used as a duplicate score. When the reference set is empty, the task is created without an additional AI request.
 
@@ -108,7 +111,11 @@ A `same` result with a score at or above `tasks.duplicate_threshold` (default 0.
 
 The owner receives a DM question with inline 👍/👎 buttons, not actual reactions. `SetTaskCandidates` is called before `Watch` starts; `RunTaskQuestions` delivers unsent questions. Callbacks are handled before guard/history/forward/agent processing and validate the owner, private chat, and bot-authored message. `Decide` atomically records the first decision; repeated callbacks do not create another task.
 
-Receipts, decisions, tasks, events, push jobs, and buffer `Finalize` are atomic. AI calls run outside the transaction; the event revision is rechecked before writing. The receipt key includes account/chat/message and a text hash. Group messages complete synchronous intake before the update is acknowledged; DM/GroupDirect and IMAP remain queued.
+Receipts, decisions, tasks, events, push jobs, and buffer `Finalize` are atomic. AI calls run outside the transaction; the event revision is rechecked before writing. Receipt keys include source kind, account/chat/message and a text hash; IMAP keys additionally include `Message.IMAPUIDValidity`. The decimal message UID, mailbox/source identifiers, project bindings and source snapshots stay unchanged. A committed receipt skips inference, candidates, tasks and notifications on replay, including successful emails retried after another input failed in the same poll.
+
+`Pipeline.WatchHandler` uses the same `usesAutoTasks` decision as extraction: groups and email with the service finish processing synchronously before acknowledgement; DM/GroupDirect, forward batches and email without the service remain queued. After any returned IMAP handler error, the poll drains remaining FETCH responses without handling them and makes no cursor write, regardless of response order or earlier successful UIDs. Handler errors are logged; FETCH errors are still returned. Later errors from queued/direct email processing cannot prevent cursor advancement.
+
+On a `UIDVALIDITY` change, `monitor` resets to `UIDNEXT-1` and skips existing email; backfill restarts from UID 1 with generation-specific receipts. Deploying this routing does not proactively replay historical email behind an existing cursor.
 
 ### Task source details and priority
 

@@ -106,6 +106,30 @@ func (p *Pipeline) isOwner(author string) bool {
 	return false
 }
 
+// usesAutoTasks reports whether automatic extraction from msg goes through
+// AutoTaskService. Group messages always do; email does when the service is
+// configured, otherwise it keeps the direct TaskService path.
+func (p *Pipeline) usesAutoTasks(msg model.Message) bool {
+	return msg.Kind == model.MessageKindGroup ||
+		(msg.Kind == model.MessageKindBatch && p.autoTasks != nil)
+}
+
+// WatchHandler waits for automatic intake to commit and queues other messages.
+func (p *Pipeline) WatchHandler(queue chan<- model.Message) func(context.Context, model.Message) error {
+	return func(ctx context.Context, msg model.Message) error {
+		// Do not acknowledge automatic input until its durable intake transaction commits.
+		if p.usesAutoTasks(msg) {
+			return p.Process(ctx, msg)
+		}
+		select {
+		case queue <- msg:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // Process handles a single message:
 //   - ForwardBatch → processForwardBatch (owner-less, handled by payload).
 //   - DM/GroupDirect → ChatService.HandleMessage (tool calling loop, reply via ReplyFn).
@@ -126,13 +150,13 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 		return p.processChat(ctx, msg)
 	}
 
-	if msg.Kind == model.MessageKindGroup {
-		if p.autoTasks == nil {
-			return fmt.Errorf("processing group message: AutoTaskService is not configured")
-		}
-		processed, err := p.autoTasks.Processed(ctx, autoInputKey(msg.Source, msg.ID, msg.Text))
+	if msg.Kind == model.MessageKindGroup && p.autoTasks == nil {
+		return fmt.Errorf("processing group message: AutoTaskService is not configured")
+	}
+	if p.usesAutoTasks(msg) {
+		processed, err := p.autoTasks.Processed(ctx, autoInputKey(msg.Source, msg.ID, msg.Text, msg.IMAPUIDValidity))
 		if err != nil {
-			return fmt.Errorf("checking group input receipt: %w", err)
+			return fmt.Errorf("checking input receipt: %w", err)
 		}
 		if processed {
 			return nil
@@ -154,13 +178,13 @@ func (p *Pipeline) Process(ctx context.Context, msg model.Message) error {
 	switch class {
 	case model.ClassSkip:
 		p.logger.DebugContext(ctx, "message classified as skip", "msg_id", msg.ID)
-		if msg.Kind == model.MessageKindGroup {
+		if p.usesAutoTasks(msg) {
 			_, err := p.autoTasks.Submit(ctx, model.AutoTaskSubmission{
-				InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text)},
+				InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text, msg.IMAPUIDValidity)},
 				SourceText: msg.Text,
 			})
 			if err != nil {
-				return fmt.Errorf("saving skipped group input: %w", err)
+				return fmt.Errorf("saving skipped input: %w", err)
 			}
 		}
 		return nil
@@ -231,7 +255,7 @@ func (p *Pipeline) processChat(ctx context.Context, msg model.Message) error {
 	return nil
 }
 
-// processPromise extracts tasks and submits Telegram candidates for durable decisions.
+// processPromise extracts tasks and submits automatic candidates for durable decisions.
 // Returns true only when tasks were actually created.
 func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool, error) {
 	extractor := p.extractors[msg.Kind]
@@ -254,7 +278,7 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 	if err != nil {
 		return false, fmt.Errorf("extracting task: %w", err)
 	}
-	if len(extracted) == 0 && msg.Kind != model.MessageKindGroup {
+	if len(extracted) == 0 && !p.usesAutoTasks(msg) {
 		p.logger.InfoContext(ctx, "no tasks extracted: low model confidence", "msg_id", msg.ID)
 		return false, nil
 	}
@@ -292,15 +316,15 @@ func (p *Pipeline) processPromise(ctx context.Context, msg model.Message) (bool,
 		})
 	}
 
-	if msg.Kind == model.MessageKindGroup {
+	if p.usesAutoTasks(msg) {
 		result, err := p.autoTasks.Submit(ctx, model.AutoTaskSubmission{
-			InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text)},
+			InputKeys:  []string{autoInputKey(msg.Source, msg.ID, msg.Text, msg.IMAPUIDValidity)},
 			ProjectID:  projectID,
 			Tasks:      taskReqs,
 			SourceText: msg.Text,
 		})
 		if err != nil {
-			return false, fmt.Errorf("submitting group task candidates: %w", err)
+			return false, fmt.Errorf("submitting task candidates: %w", err)
 		}
 		if len(result.Created) > 0 {
 			for i := range result.Created {
@@ -347,7 +371,7 @@ func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) e
 	ids := make([]string, 0, len(payload.Forwards))
 	unprocessed := make([]model.ForwardEntry, 0, len(payload.Forwards))
 	for _, entry := range payload.Forwards {
-		key := autoInputKey(source, entry.MessageID, entry.Text)
+		key := autoInputKey(source, entry.MessageID, entry.Text, 0)
 		processed, err := p.autoTasks.Processed(ctx, key)
 		if err != nil {
 			return fmt.Errorf("checking forward input receipt: %w", err)
@@ -499,8 +523,12 @@ func forwardSourceDetails(numbered []model.ForwardEntry, index int, counterpart 
 	return details
 }
 
-// autoInputKey separates message edits and source accounts without persisting raw text.
-func autoInputKey(source model.Source, messageID, text string) string {
+// autoInputKey separates message edits, source accounts and IMAP mailbox generations
+// without persisting raw text. Non-IMAP receipts retain their existing representation.
+func autoInputKey(source model.Source, messageID, text string, imapUIDValidity uint32) string {
+	if source.Kind == "imap" {
+		return fmt.Sprintf("%q/%q/%q/%q/%d/%x", source.Kind, source.AccountID, source.ID, messageID, imapUIDValidity, sha256.Sum256([]byte(text)))
+	}
 	return fmt.Sprintf("%q/%q/%q/%q/%x", source.Kind, source.AccountID, source.ID, messageID, sha256.Sum256([]byte(text)))
 }
 

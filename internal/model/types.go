@@ -133,6 +133,9 @@ type ForwardBatchPayload struct {
 type Message struct {
 	// ID is the unique message identifier within the channel.
 	ID string
+	// IMAPUIDValidity is the selected mailbox generation; zero when unset.
+	// It distinguishes input receipts without changing the message or source identity.
+	IMAPUIDValidity uint32
 	// Source is the channel the message came from.
 	Source Source
 	// Author is the message author's identifier.

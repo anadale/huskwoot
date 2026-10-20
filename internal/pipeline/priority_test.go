@@ -89,10 +89,8 @@ func TestProcess_PassesExtractedPriority(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			auto := &pipelineAutoTasks{}
-			taskSvc := &mockTaskService{}
 			cfg := testConfig()
 			cfg.AutoTasks = auto
-			cfg.Tasks = taskSvc
 			cfg.Classifiers = groupClassifiers(&mockClassifier{class: model.ClassPromise})
 			cfg.Extractors = groupExtractors(&mockExtractor{tasks: []model.Task{
 				{Summary: "поправить деплой", Priority: model.TaskPriorityHigh, Confidence: 0.9},
@@ -104,19 +102,11 @@ func TestProcess_PassesExtractedPriority(t *testing.T) {
 			}
 
 			var got []model.TaskPriority
-			if tc.msg.Kind == model.MessageKindGroup {
-				if len(auto.submissions) != 1 {
-					t.Fatalf("submissions = %d, want 1", len(auto.submissions))
-				}
-				for _, req := range auto.submissions[0].Tasks {
-					got = append(got, req.Priority)
-				}
-			} else {
-				taskSvc.mu.Lock()
-				for _, task := range taskSvc.createdTasks {
-					got = append(got, task.Priority)
-				}
-				taskSvc.mu.Unlock()
+			if len(auto.submissions) != 1 {
+				t.Fatalf("submissions = %d, want 1", len(auto.submissions))
+			}
+			for _, req := range auto.submissions[0].Tasks {
+				got = append(got, req.Priority)
 			}
 			if len(got) != 2 || got[0] != model.TaskPriorityHigh || got[1] != model.TaskPriorityNone {
 				t.Errorf("priorities = %v, want [3 0]", got)

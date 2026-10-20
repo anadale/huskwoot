@@ -2,14 +2,27 @@ package channel
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/emersion/go-imap"
 
+	"github.com/anadale/huskwoot/internal/devices"
+	"github.com/anadale/huskwoot/internal/events"
 	"github.com/anadale/huskwoot/internal/model"
+	"github.com/anadale/huskwoot/internal/pipeline"
+	"github.com/anadale/huskwoot/internal/push"
+	"github.com/anadale/huskwoot/internal/storage"
+	"github.com/anadale/huskwoot/internal/usecase"
 )
 
 // mockImapConn implements imapConn for testing without a real IMAP server.
@@ -21,6 +34,7 @@ type mockImapConn struct {
 	searchErr     error
 	fetchMessages []*imap.Message
 	fetchErr      error
+	fetchSent     int
 
 	loginCalled  bool
 	logoutCalled bool
@@ -42,6 +56,7 @@ func (m *mockImapConn) UidSearch(_ *imap.SearchCriteria) ([]uint32, error) {
 func (m *mockImapConn) UidFetch(_ *imap.SeqSet, _ []imap.FetchItem, ch chan *imap.Message) error {
 	for _, msg := range m.fetchMessages {
 		ch <- msg
+		m.fetchSent++
 	}
 	close(ch)
 	return m.fetchErr
@@ -223,49 +238,90 @@ func TestIMAPChannel_SendersCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TestIMAPChannel_UIDValidityChange verifies that the cursor is reset when UIDVALIDITY changes.
+// TestIMAPChannel_UIDValidityChange verifies reset policy and generation-aware delivery.
 func TestIMAPChannel_UIDValidityChange(t *testing.T) {
-	now := time.Now()
-	conn := &mockImapConn{
-		selectStatus: makeTestStatus(200, 3), // UIDVALIDITY changed from 100 to 200
-		searchUIDs:   []uint32{1, 2},
-		fetchMessages: []*imap.Message{
-			makeTestIMAPMessage(1, "Старое письмо", "alice", "example.com", "Alice", now),
-			makeTestIMAPMessage(2, "Новое письмо", "bob", "example.com", "Bob", now.Add(time.Minute)),
-		},
-	}
+	for _, mode := range []string{"backfill", "monitor"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+			conn := &mockImapConn{
+				selectStatus: makeTestStatus(200, 3),
+				searchUIDs:   []uint32{1, 2},
+				fetchMessages: []*imap.Message{
+					makeTestIMAPMessage(1, "Old email", "alice", "example.com", "Alice", now),
+					makeTestIMAPMessage(2, "New email", "bob", "example.com", "Bob", now.Add(time.Minute)),
+				},
+			}
+			cfg := IMAPChannelConfig{
+				Username:       "user@work.com",
+				Folders:        []string{"INBOX"},
+				OnFirstConnect: mode,
+			}
+			state := newMockStateStore()
+			key := imapStateKey(cfg.Username, "INBOX")
+			if err := state.SaveCursor(ctx, key, model.Cursor{MessageID: "50", FolderID: "100"}); err != nil {
+				t.Fatal(err)
+			}
+			w := newTestIMAPChannel(conn, cfg, state)
+			var received []model.Message
+			handler := func(_ context.Context, msg model.Message) error {
+				received = append(received, msg)
+				return nil
+			}
+			if err := w.pollOnce(ctx, cfg, "INBOX", handler); err != nil {
+				t.Fatal(err)
+			}
 
-	cfg := IMAPChannelConfig{
-		Username:       "user@work.com",
-		Folders:        []string{"INBOX"},
-		OnFirstConnect: "backfill",
-	}
-	state := newMockStateStore()
-	// Save an old cursor with old UIDVALIDITY=100.
-	_ = state.SaveCursor(context.Background(), imapStateKey(cfg.Username, "INBOX"), model.Cursor{
-		MessageID: "50",  // pointed to UID=50 in the old numbering
-		FolderID:  "100", // old UIDVALIDITY
-	})
+			wantInitial := 2
+			if mode == "monitor" {
+				wantInitial = 0
+			}
+			if len(received) != wantInitial {
+				t.Fatalf("after UIDVALIDITY reset want %d emails, got %d", wantInitial, len(received))
+			}
+			cursor, err := state.GetCursor(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor == nil || cursor.MessageID != "2" || cursor.FolderID != "200" {
+				t.Fatalf("reset cursor: want UID 2 in generation 200, got %+v", cursor)
+			}
 
-	w := newTestIMAPChannel(conn, cfg, state)
-
-	var received []model.Message
-	_ = w.pollOnce(context.Background(), cfg, "INBOX", func(_ context.Context, msg model.Message) error {
-		received = append(received, msg)
-		return nil
-	})
-
-	// After the cursor reset, all emails starting from UID=1 must be received.
-	if len(received) != 2 {
-		t.Fatalf("after UIDVALIDITY reset want 2 emails, got %d", len(received))
-	}
-
-	cursor, _ := state.GetCursor(context.Background(), imapStateKey(cfg.Username, "INBOX"))
-	if cursor == nil {
-		t.Fatal("cursor was not saved")
-	}
-	if cursor.FolderID != "200" {
-		t.Errorf("new UIDVALIDITY in cursor: want %q, got %q", "200", cursor.FolderID)
+			// A later arrival must be delivered after either backfilling or skipping the epoch.
+			conn.selectStatus = makeTestStatus(200, 4)
+			conn.searchUIDs = []uint32{3}
+			conn.fetchMessages = []*imap.Message{
+				makeTestIMAPMessage(3, "Later email", "alice", "example.com", "Alice", now.Add(2*time.Minute)),
+			}
+			if err := w.pollOnce(ctx, cfg, "INBOX", handler); err != nil {
+				t.Fatal(err)
+			}
+			if len(received) != wantInitial+1 {
+				t.Fatalf("later arrival: want %d total emails, got %d", wantInitial+1, len(received))
+			}
+			wantIDs := []string{"1", "2", "3"}
+			if mode == "monitor" {
+				wantIDs = []string{"3"}
+			}
+			for i, msg := range received {
+				if msg.ID != wantIDs[i] {
+					t.Errorf("email %d: want decimal UID %q, got %q", i, wantIDs[i], msg.ID)
+				}
+				if msg.Source.Kind != "imap" || msg.Source.ID != "user@work.com:INBOX" || msg.Source.AccountID != "" {
+					t.Errorf("mailbox generation changed the source identity: %+v", msg.Source)
+				}
+				if msg.IMAPUIDValidity != 200 {
+					t.Errorf("UID %s: want mailbox generation 200, got %d", msg.ID, msg.IMAPUIDValidity)
+				}
+			}
+			cursor, err = state.GetCursor(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cursor == nil || cursor.MessageID != "3" || cursor.FolderID != "200" {
+				t.Fatalf("later arrival cursor: want UID 3 in generation 200, got %+v", cursor)
+			}
+		})
 	}
 }
 
@@ -946,5 +1002,505 @@ func TestConvertIMAPMessage_NilCallbacks(t *testing.T) {
 	}
 	if got.ReplyFn != nil {
 		t.Error("ReplyFn must be nil for IMAP message")
+	}
+}
+
+type imapIntakeStore struct {
+	model.AutoTaskStore
+	failUID string
+	failure error
+	lookups []string
+	writes  []string
+}
+
+func (s *imapIntakeStore) Processed(ctx context.Context, key string) (bool, error) {
+	s.lookups = append(s.lookups, key)
+	return s.AutoTaskStore.Processed(ctx, key)
+}
+
+func (s *imapIntakeStore) RecordInputTx(ctx context.Context, tx *sql.Tx, key string, at time.Time) error {
+	s.writes = append(s.writes, key)
+	if s.failUID != "" && strings.Contains(key, fmt.Sprintf("/%q/", s.failUID)) {
+		return s.failure
+	}
+	return s.AutoTaskStore.RecordInputTx(ctx, tx, key, at)
+}
+
+type imapIntakeInference struct {
+	classified []string
+	extracted  []string
+}
+
+func (i *imapIntakeInference) Classify(_ context.Context, msg model.Message) (model.Classification, error) {
+	i.classified = append(i.classified, msg.ID)
+	return model.ClassPromise, nil
+}
+
+func (i *imapIntakeInference) Extract(_ context.Context, msg model.Message, _ []model.HistoryEntry) ([]model.Task, error) {
+	i.extracted = append(i.extracted, msg.ID)
+	return []model.Task{{Summary: "Task " + msg.ID, Source: msg.Source}}, nil
+}
+
+type imapIntakeChecker struct{}
+
+func (imapIntakeChecker) Compare(context.Context, model.CreateTaskRequest, string, []model.TaskReference) (model.TaskAssessment, error) {
+	return model.TaskAssessment{Verdict: "different", Score: 0}, nil
+}
+
+type imapIntakeNotifier struct {
+	tasks []model.Task
+}
+
+func (n *imapIntakeNotifier) Name() string { return "intake-test" }
+
+func (n *imapIntakeNotifier) Notify(_ context.Context, tasks []model.Task) error {
+	n.tasks = append(n.tasks, tasks...)
+	return nil
+}
+
+type imapIntakeHarness struct {
+	db        *sql.DB
+	store     *imapIntakeStore
+	inference *imapIntakeInference
+	notifier  *imapIntakeNotifier
+	queue     chan model.Message
+	handler   func(context.Context, model.Message) error
+}
+
+func newIMAPIntakeHarness(t *testing.T) *imapIntakeHarness {
+	t.Helper()
+	db, err := storage.OpenDB(filepath.Join(t.TempDir(), "intake.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	tasks, err := storage.NewSQLiteTaskStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	store := &imapIntakeStore{
+		AutoTaskStore: storage.NewSQLiteAutoTaskStore(db),
+		failure:       errors.New("receipt persistence failed"),
+	}
+	auto := usecase.NewAutoTaskService(usecase.AutoTaskServiceDeps{
+		DB: db, Tasks: tasks, Store: store, Checker: imapIntakeChecker{},
+		Events: events.NewSQLiteEventStore(db), Devices: devices.NewSQLiteDeviceStore(db),
+		Queue: push.NewSQLitePushQueue(db), Broker: events.NewBroker(events.BrokerConfig{}),
+		Logger: logger,
+	})
+	inference := &imapIntakeInference{}
+	notifier := &imapIntakeNotifier{}
+	pipe := pipeline.New(pipeline.Config{
+		AutoTasks:   auto,
+		Classifiers: map[model.MessageKind]model.Classifier{model.MessageKindBatch: inference},
+		Extractors:  map[model.MessageKind]model.Extractor{model.MessageKindBatch: inference},
+		Notifiers:   []model.Notifier{notifier}, Logger: logger,
+	})
+	queue := make(chan model.Message, 100)
+	return &imapIntakeHarness{
+		db: db, store: store, inference: inference, notifier: notifier,
+		queue: queue, handler: pipe.WatchHandler(queue),
+	}
+}
+
+func setIMAPIntakeResponses(conn *mockImapConn, validity uint32, uids ...uint32) {
+	conn.searchUIDs = append([]uint32(nil), uids...)
+	conn.fetchMessages = nil
+	conn.fetchSent = 0
+	var maxUID uint32
+	for _, uid := range uids {
+		if uid > maxUID {
+			maxUID = uid
+		}
+		msg := makeTestIMAPMessage(uid, fmt.Sprintf("Email %d", uid), "sender", "example.com", "Sender",
+			time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC))
+		section := &imap.BodySectionName{}
+		msg.Body = map[*imap.BodySectionName]imap.Literal{
+			section: strings.NewReader(fmt.Sprintf("Content-Type: text/plain; charset=utf-8\r\n\r\nObligation %d", uid)),
+		}
+		conn.fetchMessages = append(conn.fetchMessages, msg)
+	}
+	conn.selectStatus = makeTestStatus(validity, maxUID+1)
+}
+
+func (h *imapIntakeHarness) assertCommitted(t *testing.T, uids ...string) {
+	t.Helper()
+	for _, table := range []string{"auto_task_inputs", "auto_task_candidates", "tasks"} {
+		var count int
+		if err := h.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != len(uids) {
+			t.Errorf("%s rows = %d, want %d", table, count, len(uids))
+		}
+	}
+	var summaries []string
+	rows, err := h.db.Query("SELECT summary FROM tasks ORDER BY summary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var summary string
+		if err := rows.Scan(&summary); err != nil {
+			t.Fatal(err)
+		}
+		summaries = append(summaries, summary)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantSummaries := make([]string, 0, len(uids))
+	for _, uid := range uids {
+		wantSummaries = append(wantSummaries, "Task "+uid)
+	}
+	sort.Strings(wantSummaries)
+	if !reflect.DeepEqual(summaries, wantSummaries) && len(uids) != 0 {
+		t.Errorf("durable tasks = %v, want %v", summaries, wantSummaries)
+	}
+	var notified []string
+	for _, task := range h.notifier.tasks {
+		notified = append(notified, task.SourceMessage.ID)
+	}
+	if !reflect.DeepEqual(notified, uids) {
+		t.Errorf("notified UIDs = %v, want %v", notified, uids)
+	}
+}
+
+func TestIMAPChannel_AutoTaskHandlerFailureKeepsCursorAndRetries(t *testing.T) {
+	ctx := context.Background()
+	h := newIMAPIntakeHarness(t)
+	h.store.failUID = "2"
+	cfg := IMAPChannelConfig{Username: "owner@example.com", OnFirstConnect: "backfill"}
+	state := newMockStateStore()
+	key := imapStateKey(cfg.Username, "INBOX")
+	if err := state.SaveCursor(ctx, key, model.Cursor{MessageID: "1", FolderID: "100"}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &mockImapConn{}
+	setIMAPIntakeResponses(conn, 100, 2, 3)
+	w := newTestIMAPChannel(conn, cfg, state)
+	if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+		t.Fatalf("handler failure must only be logged: %v", err)
+	}
+	cursor, err := state.GetCursor(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.MessageID != "1" || state.saveCursorCalls != 1 || len(h.queue) != 0 {
+		t.Fatalf("failed intake acknowledged: cursor=%+v saves=%d queued=%d; want UID 1, no save, empty queue",
+			cursor, state.saveCursorCalls-1, len(h.queue))
+	}
+	if !reflect.DeepEqual(h.inference.classified, []string{"2"}) {
+		t.Errorf("classified = %v, want only failed UID 2", h.inference.classified)
+	}
+	h.assertCommitted(t)
+
+	h.store.failUID = ""
+	setIMAPIntakeResponses(conn, 100, 2, 3)
+	if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+		t.Fatal(err)
+	}
+	cursor, _ = state.GetCursor(ctx, key)
+	if cursor.MessageID != "3" || state.saveCursorCalls != 2 || len(h.queue) != 0 {
+		t.Errorf("retry cursor=%+v saves=%d queued=%d", cursor, state.saveCursorCalls-1, len(h.queue))
+	}
+	if !reflect.DeepEqual(h.inference.classified, []string{"2", "2", "3"}) ||
+		!reflect.DeepEqual(h.inference.extracted, []string{"2", "2", "3"}) {
+		t.Errorf("retry inference classified=%v extracted=%v", h.inference.classified, h.inference.extracted)
+	}
+	h.assertCommitted(t, "2", "3")
+}
+
+func TestIMAPChannel_AutoTaskSuccessBeforeFailureRetainsPollCursor(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		first             []uint32
+		failed            string
+		committed         string
+		wantInference     []string
+		wantNotifications []string
+	}{
+		{
+			name: "ascending", first: []uint32{2, 3, 4}, failed: "3", committed: "2",
+			wantInference:     []string{"2", "3", "3", "4"},
+			wantNotifications: []string{"2", "3", "4"},
+		},
+		{
+			name: "nonascending", first: []uint32{3, 2, 4}, failed: "2", committed: "3",
+			wantInference:     []string{"3", "2", "2", "4"},
+			wantNotifications: []string{"3", "2", "4"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newIMAPIntakeHarness(t)
+			h.store.failUID = tc.failed
+			cfg := IMAPChannelConfig{Username: "owner@example.com", OnFirstConnect: "backfill"}
+			state := newMockStateStore()
+			key := imapStateKey(cfg.Username, "INBOX")
+			initial := model.Cursor{MessageID: "1", FolderID: "100", UpdatedAt: time.Now()}
+			if err := state.SaveCursor(ctx, key, initial); err != nil {
+				t.Fatal(err)
+			}
+			conn := &mockImapConn{}
+			setIMAPIntakeResponses(conn, 100, tc.first...)
+			w := newTestIMAPChannel(conn, cfg, state)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatalf("handler failure must only be logged: %v", err)
+			}
+			cursor, _ := state.GetCursor(ctx, key)
+			if !reflect.DeepEqual(cursor, &initial) || state.saveCursorCalls != 1 {
+				t.Errorf("failed poll changed cursor: got %+v, saves=%d; want untouched %+v and no save",
+					cursor, state.saveCursorCalls-1, initial)
+			}
+			if len(h.queue) != 0 || len(h.store.lookups) != 2 ||
+				!reflect.DeepEqual(h.inference.classified, []string{tc.committed, tc.failed}) {
+				t.Fatalf("trailing UID 4 handled or queued: lookups=%v classified=%v queued=%d",
+					h.store.lookups, h.inference.classified, len(h.queue))
+			}
+			h.assertCommitted(t, tc.committed)
+			committedKey := h.store.lookups[0]
+			processed, err := h.store.AutoTaskStore.Processed(ctx, committedKey)
+			if err != nil || !processed {
+				t.Fatalf("prior success has no durable receipt: processed=%v error=%v", processed, err)
+			}
+			failedKey := h.store.lookups[1]
+			processed, err = h.store.AutoTaskStore.Processed(ctx, failedKey)
+			if err != nil || processed {
+				t.Fatalf("failed receipt transaction was not rolled back: processed=%v error=%v", processed, err)
+			}
+
+			h.store.failUID = ""
+			// The mock search does not filter by cursor; explicitly return the retry set
+			// and rebuild every MIME reader, reversing the initial nonascending order.
+			setIMAPIntakeResponses(conn, 100, 2, 3, 4)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ = state.GetCursor(ctx, key)
+			if cursor.MessageID != "4" || cursor.FolderID != "100" || state.saveCursorCalls != 2 || len(h.queue) != 0 {
+				t.Errorf("successful retry cursor=%+v saves=%d queued=%d; want UID 4, one save, empty queue",
+					cursor, state.saveCursorCalls-1, len(h.queue))
+			}
+			if !reflect.DeepEqual(h.inference.classified, tc.wantInference) ||
+				!reflect.DeepEqual(h.inference.extracted, tc.wantInference) {
+				t.Errorf("committed replay repeated inference: classified=%v extracted=%v want=%v",
+					h.inference.classified, h.inference.extracted, tc.wantInference)
+			}
+			if len(h.store.lookups) != 5 || len(h.store.writes) != 4 {
+				t.Errorf("receipt lookup/write attempts = %d/%d, want 5/4", len(h.store.lookups), len(h.store.writes))
+			}
+			writesForCommitted := 0
+			for _, key := range h.store.writes {
+				if key == committedKey {
+					writesForCommitted++
+				}
+			}
+			if writesForCommitted != 1 {
+				t.Errorf("committed UID %s repeated submission: receipt writes=%d", tc.committed, writesForCommitted)
+			}
+			h.assertCommitted(t, tc.wantNotifications...)
+		})
+	}
+}
+
+func TestIMAPChannel_AutoTaskFailureDrainsFetchAndPreservesFetchError(t *testing.T) {
+	for _, fetchFails := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fetch_error_%t", fetchFails), func(t *testing.T) {
+			ctx := context.Background()
+			h := newIMAPIntakeHarness(t)
+			h.store.failUID = "2"
+			cfg := IMAPChannelConfig{Username: "owner@example.com"}
+			state := newMockStateStore()
+			key := imapStateKey(cfg.Username, "INBOX")
+			initial := model.Cursor{MessageID: "1", FolderID: "100"}
+			if err := state.SaveCursor(ctx, key, initial); err != nil {
+				t.Fatal(err)
+			}
+			uids := []uint32{3, 2}
+			for uid := uint32(4); uid <= 30; uid++ {
+				uids = append(uids, uid)
+			}
+			conn := &mockImapConn{}
+			setIMAPIntakeResponses(conn, 100, uids...)
+			fetchErr := errors.New("FETCH connection interrupted")
+			if fetchFails {
+				conn.fetchErr = fetchErr
+			}
+			w := newTestIMAPChannel(conn, cfg, state)
+			done := make(chan error, 1)
+			go func() { done <- w.pollOnce(ctx, cfg, "INBOX", h.handler) }()
+			select {
+			case err := <-done:
+				if fetchFails && !errors.Is(err, fetchErr) {
+					t.Errorf("FETCH error lost after handler failure: %v", err)
+				}
+				if !fetchFails && err != nil {
+					t.Errorf("handler error unexpectedly returned: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("poll blocked instead of draining more than ten trailing FETCH responses")
+			}
+			if conn.fetchSent != len(uids) {
+				t.Errorf("FETCH sent %d responses, want all %d drained", conn.fetchSent, len(uids))
+			}
+			cursor, _ := state.GetCursor(ctx, key)
+			if !reflect.DeepEqual(cursor, &initial) || state.saveCursorCalls != 1 {
+				t.Errorf("failure changed cursor: %+v, saves=%d; want untouched cursor and no save",
+					cursor, state.saveCursorCalls-1)
+			}
+			if !reflect.DeepEqual(h.inference.classified, []string{"3", "2"}) ||
+				len(h.store.lookups) != 2 || len(h.queue) != 0 {
+				t.Errorf("trailing responses handled: classified=%v lookups=%v queued=%d",
+					h.inference.classified, h.store.lookups, len(h.queue))
+			}
+			h.assertCommitted(t, "3")
+		})
+	}
+}
+
+func TestIMAPChannel_AutoTaskBackfillFailureDoesNotWriteCursor(t *testing.T) {
+	for _, changedGeneration := range []bool{false, true} {
+		t.Run(fmt.Sprintf("changed_generation_%t", changedGeneration), func(t *testing.T) {
+			ctx := context.Background()
+			h := newIMAPIntakeHarness(t)
+			h.store.failUID = "2"
+			cfg := IMAPChannelConfig{Username: "owner@example.com", OnFirstConnect: "backfill"}
+			state := newMockStateStore()
+			key := imapStateKey(cfg.Username, "INBOX")
+			var initial *model.Cursor
+			if changedGeneration {
+				initial = &model.Cursor{MessageID: "50", FolderID: "100", UpdatedAt: time.Now()}
+				if err := state.SaveCursor(ctx, key, *initial); err != nil {
+					t.Fatal(err)
+				}
+			}
+			savesBefore := state.saveCursorCalls
+			conn := &mockImapConn{}
+			setIMAPIntakeResponses(conn, 200, 1, 2, 3)
+			w := newTestIMAPChannel(conn, cfg, state)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ := state.GetCursor(ctx, key)
+			if !reflect.DeepEqual(cursor, initial) || state.saveCursorCalls != savesBefore {
+				t.Errorf("failed backfill saved new generation: got %+v saves=%d, want %+v and no save",
+					cursor, state.saveCursorCalls-savesBefore, initial)
+			}
+			if !reflect.DeepEqual(h.inference.classified, []string{"1", "2"}) ||
+				len(h.store.lookups) != 2 || len(h.queue) != 0 {
+				t.Errorf("backfill continued after failure: classified=%v lookups=%v queued=%d",
+					h.inference.classified, h.store.lookups, len(h.queue))
+			}
+			h.assertCommitted(t, "1")
+			if h.notifier.tasks[0].SourceMessage.IMAPUIDValidity != 200 {
+				t.Error("backfill did not deliver the selected mailbox generation")
+			}
+			h.store.failUID = ""
+			setIMAPIntakeResponses(conn, 200, 1, 2, 3)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ = state.GetCursor(ctx, key)
+			if cursor == nil || cursor.MessageID != "3" || cursor.FolderID != "200" ||
+				state.saveCursorCalls != savesBefore+1 {
+				t.Errorf("successful backfill did not save new generation once: cursor=%+v saves=%d",
+					cursor, state.saveCursorCalls-savesBefore)
+			}
+			if !reflect.DeepEqual(h.inference.classified, []string{"1", "2", "2", "3"}) {
+				t.Errorf("backfill repeated committed input inference: %v", h.inference.classified)
+			}
+			h.assertCommitted(t, "1", "2", "3")
+		})
+	}
+}
+
+func TestIMAPChannel_AutoTaskMonitorSkipsExistingBeforeDurableIntake(t *testing.T) {
+	for _, changedGeneration := range []bool{false, true} {
+		t.Run(fmt.Sprintf("changed_generation_%t", changedGeneration), func(t *testing.T) {
+			ctx := context.Background()
+			h := newIMAPIntakeHarness(t)
+			cfg := IMAPChannelConfig{Username: "owner@example.com", OnFirstConnect: "monitor"}
+			state := newMockStateStore()
+			key := imapStateKey(cfg.Username, "INBOX")
+			if changedGeneration {
+				if err := state.SaveCursor(ctx, key, model.Cursor{MessageID: "50", FolderID: "100"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			savesBefore := state.saveCursorCalls
+			conn := &mockImapConn{}
+			setIMAPIntakeResponses(conn, 200, 1, 2, 3)
+			w := newTestIMAPChannel(conn, cfg, state)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ := state.GetCursor(ctx, key)
+			if cursor == nil || cursor.MessageID != "3" || cursor.FolderID != "200" ||
+				state.saveCursorCalls != savesBefore+1 || conn.fetchSent != 0 || len(h.store.lookups) != 0 {
+				t.Fatalf("monitor did not skip existing messages: cursor=%+v saves=%d fetched=%d lookups=%v",
+					cursor, state.saveCursorCalls-savesBefore, conn.fetchSent, h.store.lookups)
+			}
+			h.assertCommitted(t)
+			skipped := *cursor
+			h.store.failUID = "4"
+			setIMAPIntakeResponses(conn, 200, 4)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ = state.GetCursor(ctx, key)
+			if !reflect.DeepEqual(cursor, &skipped) || state.saveCursorCalls != savesBefore+1 {
+				t.Errorf("failed new email changed monitor cursor: %+v saves=%d", cursor, state.saveCursorCalls-savesBefore)
+			}
+			h.assertCommitted(t)
+			h.store.failUID = ""
+			setIMAPIntakeResponses(conn, 200, 4)
+			if err := w.pollOnce(ctx, cfg, "INBOX", h.handler); err != nil {
+				t.Fatal(err)
+			}
+			cursor, _ = state.GetCursor(ctx, key)
+			if cursor.MessageID != "4" || cursor.FolderID != "200" || state.saveCursorCalls != savesBefore+2 {
+				t.Errorf("monitor retry cursor=%+v saves=%d", cursor, state.saveCursorCalls-savesBefore)
+			}
+			if !reflect.DeepEqual(h.inference.classified, []string{"4", "4"}) {
+				t.Errorf("monitor classified old input or skipped retry: %v", h.inference.classified)
+			}
+			h.assertCommitted(t, "4")
+		})
+	}
+}
+
+func TestIMAPChannel_WithoutAutoTasksAcknowledgesQueuedEmail(t *testing.T) {
+	ctx := context.Background()
+	cfg := IMAPChannelConfig{Username: "owner@example.com"}
+	state := newMockStateStore()
+	key := imapStateKey(cfg.Username, "INBOX")
+	if err := state.SaveCursor(ctx, key, model.Cursor{MessageID: "1", FolderID: "100"}); err != nil {
+		t.Fatal(err)
+	}
+	conn := &mockImapConn{}
+	setIMAPIntakeResponses(conn, 100, 2, 3)
+	inference := &imapIntakeInference{}
+	pipe := pipeline.New(pipeline.Config{
+		Classifiers: map[model.MessageKind]model.Classifier{model.MessageKindBatch: inference},
+		Extractors:  map[model.MessageKind]model.Extractor{model.MessageKindBatch: inference},
+	})
+	queue := make(chan model.Message, 2)
+	w := newTestIMAPChannel(conn, cfg, state)
+	if err := w.pollOnce(ctx, cfg, "INBOX", pipe.WatchHandler(queue)); err != nil {
+		t.Fatal(err)
+	}
+	cursor, _ := state.GetCursor(ctx, key)
+	if cursor.MessageID != "3" || state.saveCursorCalls != 2 || len(queue) != 2 || len(inference.classified) != 0 {
+		t.Fatalf("no-service email did not retain queued acknowledgement: cursor=%+v saves=%d queued=%d classified=%v",
+			cursor, state.saveCursorCalls-1, len(queue), inference.classified)
+	}
+	for _, wantUID := range []string{"2", "3"} {
+		msg := <-queue
+		if msg.ID != wantUID || msg.IMAPUIDValidity != 100 || msg.Kind != model.MessageKindBatch {
+			t.Errorf("queued email lost identity: %+v", msg)
+		}
 	}
 }

@@ -146,11 +146,11 @@ Carry the selected mailbox generation in an optional in-memory message field and
 - Modify: `internal/pipeline/auto_tasks_test.go`
 - Modify: `internal/pipeline/pipeline_forward_test.go`
 
-- [ ] Write failing receipt-identity regressions first: reused mailbox/UID/body across different `UIDVALIDITY` values must yield distinct keys, while the same generation and input retain the same key. The IMAP epoch regression must also fail until delivered messages carry the selected generation. Pipeline inference/replay is verified after email routing in Task 2.
-- [ ] Add and populate `Message.IMAPUIDValidity` in `pollOnce` without changing `Message.ID`, `Source.ID`, `Source.AccountID`, cursor keys or project-binding identifiers.
-- [ ] Extend `autoInputKey` and migrate every regular/forward/test caller. Encode the generation only for IMAP; preserve existing Telegram group and forward receipt strings byte-for-byte.
-- [ ] Cover receipt-key equality within one generation and separation for different generations, a different UID or an edited body; zero-generation synthetic inputs stay deterministic. Retain existing group/forward replay behavior; different email receipts do not imply another task must be created.
-- [ ] Extend the IMAP epoch-reset regression for backfill and monitor modes, asserting delivered generation and existing cursor policy. Run `go test ./internal/channel/... ./internal/pipeline/...`.
+- [x] Write failing receipt-identity regressions first: reused mailbox/UID/body across different `UIDVALIDITY` values must yield distinct keys, while the same generation and input retain the same key. The IMAP epoch regression must also fail until delivered messages carry the selected generation. Pipeline inference/replay is verified after email routing in Task 2.
+- [x] Add and populate `Message.IMAPUIDValidity` in `pollOnce` without changing `Message.ID`, `Source.ID`, `Source.AccountID`, cursor keys or project-binding identifiers.
+- [x] Extend `autoInputKey` and migrate every regular/forward/test caller. Encode the generation only for IMAP; preserve existing Telegram group and forward receipt strings byte-for-byte.
+- [x] Cover receipt-key equality within one generation and separation for different generations, a different UID or an edited body; zero-generation synthetic inputs stay deterministic. Retain existing group/forward replay behavior; different email receipts do not imply another task must be created.
+- [x] Extend the IMAP epoch-reset regression for backfill and monitor modes, asserting delivered generation and existing cursor policy. Run `go test ./internal/channel/... ./internal/pipeline/...`.
 
 ### Task 2: Route email through AutoTaskService in the pipeline
 
@@ -159,11 +159,11 @@ Carry the selected mailbox generation in an optional in-memory message field and
 - Modify: `internal/pipeline/pipeline_test.go`
 - Modify: `internal/pipeline/auto_tasks_test.go`
 
-- [ ] Write `TestProcess_Batch_SubmitsToAutoTasks` first with a configured `pipelineAutoTasks` result and no `tasks` proxy: the email is submitted with its generation-aware key, project, requests and `SourceText`; the direct `TaskService` path is not used. Confirm failure before the routing fix.
-- [ ] Add `usesAutoTasks` and use it for receipt lookup, skip receipts, empty extraction and submission; keep topic clearing and the missing-service error group-only and shared log/error text source-neutral.
-- [ ] Cover committed replay skipping inference, `ClassSkip` and empty extraction recording receipts, receipt/submission errors returning from `Process`, and notifications containing only `result.Created` with `SourceMessage`.
-- [ ] Preserve email topic, mailbox/subject/source snapshot and project binding across the new path. Move the two direct-path/error-notifier tests explicitly onto `cfg.AutoTasks = nil` and rename them `…_WithoutAutoTasks`; adjust owner-bypass, topic and source tests that relied on the mock proxy.
-- [ ] Check the generation transition through `Process`: equal mailbox/UID/body in a new generation reaches classification, with stable source/project/provenance; same-generation replay does not. Run `go test ./internal/pipeline/...`, retaining existing group and forward semantics.
+- [x] Write `TestProcess_Batch_SubmitsToAutoTasks` first with a configured `pipelineAutoTasks` result and no `tasks` proxy: the email is submitted with its generation-aware key, project, requests and `SourceText`; the direct `TaskService` path is not used. Confirm failure before the routing fix.
+- [x] Add `usesAutoTasks` and use it for receipt lookup, skip receipts, empty extraction and submission; keep topic clearing and the missing-service error group-only and shared log/error text source-neutral.
+- [x] Cover committed replay skipping inference, `ClassSkip` and empty extraction recording receipts, receipt/submission errors returning from `Process`, and notifications containing only `result.Created` with `SourceMessage`.
+- [x] Preserve email topic, mailbox/subject/source snapshot and project binding across the new path. Move the two direct-path/error-notifier tests explicitly onto `cfg.AutoTasks = nil` and rename them `…_WithoutAutoTasks`; adjust owner-bypass, topic and source tests that relied on the mock proxy.
+- [x] Check the generation transition through `Process`: equal mailbox/UID/body in a new generation reaches classification, with stable source/project/provenance; same-generation replay does not. Run `go test ./internal/pipeline/...`, retaining existing group and forward semantics.
 
 ### Task 3: Acknowledge automatic email intake only after processing succeeds
 
@@ -174,33 +174,33 @@ Carry the selected mailbox generation in an optional in-memory message field and
 - Modify: `internal/channel/imap_test.go`
 - Modify: `internal/pipeline/auto_tasks_test.go`
 
-- [ ] Extract the current callback unchanged as `Pipeline.WatchHandler(queue)` and use it in `main.go`: preserve group-only synchronous processing and the queued path during this mechanical move. Then write `TestIMAPChannel_AutoTaskHandlerFailureKeepsCursorAndRetries` using mocked `pollOnce` and that actual callback. Seed a saved UID and deliver a failing email followed by another email. Confirm the test fails because the existing callback enqueues/acknowledges before processing, rather than using a test-only copy or treating an undefined method as the reproduction.
-- [ ] Change the extracted callback to use `usesAutoTasks`: automatic email and groups process synchronously; no-service email, DM, GroupDirect and forward batches retain the context-aware queued path. The failing-first regression must retain the saved UID, leave the queue empty and prevent handling of later responses.
-- [ ] Add cursor regressions for saved UID 1 with arrivals `2 success, 3 failure, 4` and `3 success, 2 failure, 4`. Both must leave cursor 1 untouched, with no cursor-save call and no handler call for UID 4. Confirm these fail before adding the poll-local failure flag and guarded cursor save; retain `TestIMAPChannel_HandlerError_StopsCursorAdvance`'s existing first-failure expectation.
-- [ ] Inject a receipt lookup or submission failure, not a duplicate-checker error. For the out-of-order case, let UID 3 commit before UID 2 fails, then retry with fresh responses ordered `2,3,4`: UID 2 retries, committed UID 3 skips inference/submission/notification, UID 4 processes and the successful poll saves cursor 4. Assert unique receipts and exactly-once committed candidate/task/notification effects across both polls.
-- [ ] Preserve unconditional FETCH draining and fetch-error handling. Include more trailing responses than the fetch channel's capacity, a handler failure together with a FETCH error, and failure with absent/changed-generation backfill state. Assert no cursor write, no subsequent handling, observable FETCH error and unchanged first-connect monitor/reset behavior; handler errors alone are still not returned by `pollOnce`.
-- [ ] Reuse the existing mocked IMAP connection/state fixtures with fresh MIME readers on each poll; explicitly configure each poll's UID/message set because the search mock does not implement server filtering. Assert persisted cursor state and save-call counts rather than expecting the callback error from `pollOnce`.
-- [ ] Cover the missing-service group error and cancellation on the queued path as observable boundaries; retain existing Telegram group cursor and no-service email behavior. Run `go test ./internal/channel/... ./internal/pipeline/...`.
+- [x] Extract the current callback unchanged as `Pipeline.WatchHandler(queue)` and use it in `main.go`: preserve group-only synchronous processing and the queued path during this mechanical move. Then write `TestIMAPChannel_AutoTaskHandlerFailureKeepsCursorAndRetries` using mocked `pollOnce` and that actual callback. Seed a saved UID and deliver a failing email followed by another email. Confirm the test fails because the existing callback enqueues/acknowledges before processing, rather than using a test-only copy or treating an undefined method as the reproduction.
+- [x] Change the extracted callback to use `usesAutoTasks`: automatic email and groups process synchronously; no-service email, DM, GroupDirect and forward batches retain the context-aware queued path. The failing-first regression must retain the saved UID, leave the queue empty and prevent handling of later responses.
+- [x] Add cursor regressions for saved UID 1 with arrivals `2 success, 3 failure, 4` and `3 success, 2 failure, 4`. Both must leave cursor 1 untouched, with no cursor-save call and no handler call for UID 4. Confirm these fail before adding the poll-local failure flag and guarded cursor save; retain `TestIMAPChannel_HandlerError_StopsCursorAdvance`'s existing first-failure expectation.
+- [x] Inject a receipt lookup or submission failure, not a duplicate-checker error. For the out-of-order case, let UID 3 commit before UID 2 fails, then retry with fresh responses ordered `2,3,4`: UID 2 retries, committed UID 3 skips inference/submission/notification, UID 4 processes and the successful poll saves cursor 4. Assert unique receipts and exactly-once committed candidate/task/notification effects across both polls.
+- [x] Preserve unconditional FETCH draining and fetch-error handling. Include more trailing responses than the fetch channel's capacity, a handler failure together with a FETCH error, and failure with absent/changed-generation backfill state. Assert no cursor write, no subsequent handling, observable FETCH error and unchanged first-connect monitor/reset behavior; handler errors alone are still not returned by `pollOnce`.
+- [x] Reuse the existing mocked IMAP connection/state fixtures with fresh MIME readers on each poll; explicitly configure each poll's UID/message set because the search mock does not implement server filtering. Assert persisted cursor state and save-call counts rather than expecting the callback error from `pollOnce`.
+- [x] Cover the missing-service group error and cancellation on the queued path as observable boundaries; retain existing Telegram group cursor and no-service email behavior. Run `go test ./internal/channel/... ./internal/pipeline/...`.
 
 ### Task 4: Verify duplicate email decisions with the real automatic-task service
 
 **Files:**
 - Modify: `internal/api/acceptance_test.go`
 
-- [ ] Add a focused acceptance-harness option for a hand-written scripted duplicate checker and access to pending candidates, without changing production service behavior.
-- [ ] Model `inbox#91`/`inbox#93`: an open Inbox task and an uncertain email candidate produce no new task, one pending question and the original email source snapshot. Retain `TestAcceptanceEmailTaskReturnsSubject`.
-- [ ] Replay the same committed email in the same generation: no second candidate, task or notification. Change only the generation with the same UID/body and prove the new input reaches classification/comparison; let the checker decide whether it creates another task.
-- [ ] Cover `same` at or above the duplicate threshold producing no task/question and `different` below the review threshold creating a task and notifier delivery. These direct-pipeline scenarios supplement, not replace, Task 3's production-handler/cursor regression.
-- [ ] Run `go test ./internal/api/...`.
+- [x] Add a focused acceptance-harness option for a hand-written scripted duplicate checker and access to pending candidates, without changing production service behavior.
+- [x] Model `inbox#91`/`inbox#93`: an open Inbox task and an uncertain email candidate produce no new task, one pending question and the original email source snapshot. Retain `TestAcceptanceEmailTaskReturnsSubject`.
+- [x] Replay the same committed email in the same generation: no second candidate, task or notification. Change only the generation with the same UID/body and prove the new input reaches classification/comparison; let the checker decide whether it creates another task.
+- [x] Cover `same` at or above the duplicate threshold producing no task/question and `different` below the review threshold creating a task and notifier delivery. These direct-pipeline scenarios supplement, not replace, Task 3's production-handler/cursor regression.
+- [x] Run `go test ./internal/api/...`.
 
 ### Task 5: Verify acceptance criteria
 
 **Files:**
 - Modify: `docs/plans/20261020-email-auto-task-dedup.md` — record verified outcomes
 
-- [ ] Verify every Overview criterion against the decision, replay, epoch-transition and actual-handler/cursor scenarios, including higher-successful-UID-before-lower-failure and reversed-order retry; ensure group/forward receipt compatibility and the no-service queued/direct fallback.
-- [ ] Run the local runtime smoke described in Testing Strategy using temporary SQLite and synthetic dependencies: observe an intake error, successful retry, idempotent replay and a newly classified mailbox generation without external calls.
-- [ ] Run `go test ./...`, `go vet ./...`, and `gofmt -l .` at the final integration boundary; all tests/static checks pass and no Go formatting changes remain.
+- [x] Verify every Overview criterion against the decision, replay, epoch-transition and actual-handler/cursor scenarios, including higher-successful-UID-before-lower-failure and reversed-order retry; ensure group/forward receipt compatibility and the no-service queued/direct fallback.
+- [x] Run the local runtime smoke described in Testing Strategy using temporary SQLite and synthetic dependencies: observe an intake error, successful retry, idempotent replay and a newly classified mailbox generation without external calls.
+- [x] Run `go test ./...`, `go vet ./...`, and `gofmt -l .` at the final integration boundary; all tests/static checks pass and no Go formatting changes remain.
 
 ### Task 6: [Final] Update documentation
 
@@ -210,10 +210,22 @@ Carry the selected mailbox generation in an optional in-memory message field and
 - Modify: `docs/development/architecture.md`
 - Modify: `docs/plans/20261020-email-auto-task-dedup.md` → `docs/plans/completed/20261020-email-auto-task-dedup.md`
 
-- [ ] Update `AGENTS.md` flow and automatic-task rules: email uses `AutoTaskService` when configured and its production callback waits for processing before acknowledgement; only no-service email keeps the old queued/direct fallback. Document generation-aware receipts, stable source/project identities and no cursor write after any IMAP handler failure.
-- [ ] Rename README «Telegram Task Duplicate Protection» to «Task Duplicate Protection» and explain email, the Telegram requirement for questions, synchronous automatic intake, replay after a failed poll and unchanged first-connect/UIDVALIDITY reset policy.
-- [ ] Update the architecture flowchart and «Automatic Telegram Tasks» section for email routing, acknowledgement boundary, receipts, failure-safe cursor advancement without assuming FETCH order, and the monitor/backfill distinction after `UIDVALIDITY` changes.
-- [ ] After all implementation and verification tasks are complete, move this plan to `docs/plans/completed/20261020-email-auto-task-dedup.md`.
+- [x] Update `AGENTS.md` flow and automatic-task rules: email uses `AutoTaskService` when configured and its production callback waits for processing before acknowledgement; only no-service email keeps the old queued/direct fallback. Document generation-aware receipts, stable source/project identities and no cursor write after any IMAP handler failure.
+- [x] Rename README «Telegram Task Duplicate Protection» to «Task Duplicate Protection» and explain email, the Telegram requirement for questions, synchronous automatic intake, replay after a failed poll and unchanged first-connect/UIDVALIDITY reset policy.
+- [x] Update the architecture flowchart and «Automatic Telegram Tasks» section for email routing, acknowledgement boundary, receipts, failure-safe cursor advancement without assuming FETCH order, and the monitor/backfill distinction after `UIDVALIDITY` changes.
+- [x] After all implementation and verification tasks are complete, move this plan to `docs/plans/completed/20261020-email-auto-task-dedup.md`.
+
+## Verified Outcomes
+
+Local verification completed on 2026-10-21 with synthetic messages and temporary SQLite databases:
+
+- `go test ./...` passed across all packages; `go vet ./...` passed; `gofmt -l .` produced no paths.
+- Automatic email acceptance covers pending owner decisions, preserved source snapshots after approval, duplicate suppression at and above `0.95`, creation below `0.70`, and pending review at `0.70`. Same-generation replay repeats neither inference nor committed effects; a generation-only change reaches classification and comparison.
+- The actual production `Pipeline.WatchHandler` was exercised through mocked IMAP polling. Both ascending `2,3,4` and nonascending `3,2,4` delivery retain the exact persisted pre-poll cursor when processing fails; the retry uses fresh responses ordered `2,3,4`, skips committed receipts, and saves UID `4` only after success.
+- Poll regressions cover draining more trailing FETCH responses than the channel capacity, simultaneous handler/FETCH errors, absent or changed-generation backfill state, unchanged monitor/reset behavior, queued no-service email, missing-service groups, and queued-path cancellation. Existing Telegram group/forward receipt and replay checks pass.
+- A throwaway Go command ran the real production callback, automatic-task service, task/project services and SQLite stores without external endpoints. A receipt-write failure rolled back all candidate/task/receipt effects and was returned to the caller. Retry produced one pending candidate; replay performed no new inference; a new generation was compared and skipped as a duplicate; a distinct input created one task and one notification. Every automatic-email stage left the queue empty. Approval preserved email provenance and the mailbox project binding.
+
+Real mailbox delivery, Telegram question delivery and deployment were not exercised. Existing production tasks were not changed.
 
 ## Post-Completion
 

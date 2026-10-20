@@ -121,11 +121,11 @@ func TestProcess_Group_StoresSourceDetails(t *testing.T) {
 }
 
 func TestProcess_Batch_SourceDetailsKeepSubject(t *testing.T) {
-	taskSvc := &mockTaskService{}
+	auto := &pipelineAutoTasks{}
 	cfg := testConfig()
 	cfg.Classifiers = groupClassifiers(&mockClassifier{class: model.ClassPromise})
 	cfg.Extractors = groupExtractors(&mockExtractor{tasks: []model.Task{{Summary: "подготовить отчёт", Confidence: 0.9}}})
-	cfg.Tasks = taskSvc
+	cfg.AutoTasks = auto
 	msg := testBatchMsg()
 	msg.Subject = "Отчёт за Q1"
 	msg.Timestamp = time.Date(2026, 10, 17, 8, 0, 0, 0, time.UTC)
@@ -134,12 +134,10 @@ func TestProcess_Batch_SourceDetailsKeepSubject(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	taskSvc.mu.Lock()
-	defer taskSvc.mu.Unlock()
-	if len(taskSvc.createdTasks) != 1 {
-		t.Fatalf("created tasks = %d, want 1", len(taskSvc.createdTasks))
+	if len(auto.submissions) != 1 || len(auto.submissions[0].Tasks) != 1 {
+		t.Fatalf("submissions = %+v, want one email task", auto.submissions)
 	}
-	got := taskSvc.createdTasks[0].SourceDetails
+	got := auto.submissions[0].Tasks[0].SourceDetails
 	if got == nil {
 		t.Fatal("SourceDetails = nil")
 	}
@@ -148,6 +146,9 @@ func TestProcess_Batch_SourceDetailsKeepSubject(t *testing.T) {
 	}
 	if got.Link != "" || got.Via != model.SourceViaMessage {
 		t.Errorf("link/via = %q/%q", got.Link, got.Via)
+	}
+	if got.At == nil || !got.At.Equal(msg.Timestamp) {
+		t.Errorf("At = %v, want %v", got.At, msg.Timestamp)
 	}
 }
 
