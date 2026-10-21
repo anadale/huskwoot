@@ -479,6 +479,9 @@ func (p *Pipeline) processForwardBatch(ctx context.Context, msg model.Message) e
 			reply(projectNotFoundWarning)
 		}
 		if len(result.Created) > 0 {
+			if result.Created[0].ProjectID != projectID && result.Created[0].ProjectID == p.taskStore.DefaultProjectID() {
+				projectName = "Inbox"
+			}
 			lines := make([]string, len(result.Created))
 			for i, task := range result.Created {
 				lines[i] = "— " + task.Summary

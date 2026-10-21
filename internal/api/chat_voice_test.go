@@ -101,7 +101,10 @@ func (s *voiceTestTaskStore) UpdateTaskTx(_ context.Context, _ *sql.Tx, _ string
 	return nil
 }
 func (s *voiceTestTaskStore) MoveTaskTx(_ context.Context, _ *sql.Tx, _, _ string) error { return nil }
-func (s *voiceTestTaskStore) DefaultProjectID() string                                   { return "" }
+func (s *voiceTestTaskStore) DeleteProjectTx(_ context.Context, _ *sql.Tx, _, _ string) ([]string, error) {
+	panic("unexpected DeleteProjectTx call in voice test")
+}
+func (s *voiceTestTaskStore) DefaultProjectID() string { return "" }
 func (s *voiceTestTaskStore) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
 	return nil
 }

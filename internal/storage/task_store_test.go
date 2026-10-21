@@ -3,6 +3,8 @@ package storage_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/storage"
+	"github.com/anadale/huskwoot/internal/storage/migrations"
+	"github.com/pressly/goose/v3"
 )
 
 // --- helpers ---
@@ -91,6 +95,143 @@ func newTask(projectID string, summary string) *model.Task {
 }
 
 // --- Projects ---
+
+func TestProjectColorMigrationUpgradeAndDown(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, ".", 17); err != nil {
+		t.Fatalf("migrate to 17: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects (id, name, slug, description, task_counter, created_at) VALUES ('legacy', 'Legacy', 'legacy', '', 0, '2026-10-21T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpTo(db, ".", 18); err != nil {
+		t.Fatalf("migrate to 18: %v", err)
+	}
+	var color string
+	if err := db.QueryRow(`SELECT color FROM projects WHERE id = 'legacy'`).Scan(&color); err != nil || color != "" {
+		t.Fatalf("legacy color=%q, err=%v; want Auto", color, err)
+	}
+	if _, err := db.Exec(`INSERT INTO projects (id, name, slug, created_at) VALUES ('default', 'Default', 'default', '2026-10-21T00:00:00Z')`); err != nil {
+		t.Fatalf("insert using color default: %v", err)
+	}
+	if err := db.QueryRow(`SELECT color FROM projects WHERE id = 'default'`).Scan(&color); err != nil || color != "" {
+		t.Fatalf("default color=%q, err=%v; want Auto", color, err)
+	}
+	if _, err := db.Exec(`UPDATE projects SET color = NULL WHERE id = 'legacy'`); err == nil {
+		t.Fatal("color must not accept NULL")
+	}
+	if err := goose.DownTo(db, ".", 17); err != nil {
+		t.Fatalf("downgrade to 17: %v", err)
+	}
+	if _, err := db.Exec(`SELECT color FROM projects`); err == nil {
+		t.Fatal("downgrade must remove color")
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM projects WHERE id = 'legacy'`).Scan(&name); err != nil || name != "Legacy" {
+		t.Fatalf("downgrade lost project: name=%q err=%v", name, err)
+	}
+	if err := goose.UpTo(db, ".", 18); err != nil {
+		t.Fatalf("reapply migration: %v", err)
+	}
+}
+
+func TestSQLiteTaskStoreProjectColorReadsAndReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "colors.db")
+	db, err := storage.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	store, err := storage.NewSQLiteTaskStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := store.GetProject(ctx, store.DefaultProjectID())
+	if err != nil || inbox == nil || inbox.Color != "" {
+		t.Fatalf("Inbox must default to Auto: project=%+v err=%v", inbox, err)
+	}
+	p := &model.Project{Name: "Color", Slug: "color", Color: "purple"}
+	if err := createProjectHelper(t, db, store, p); err != nil {
+		t.Fatal(err)
+	}
+	assertReads := func(want string) {
+		t.Helper()
+		got, err := store.GetProject(ctx, p.ID)
+		if err != nil || got == nil || got.Color != want {
+			t.Fatalf("GetProject: project=%+v err=%v want color=%q", got, err, want)
+		}
+		got, err = store.FindProjectByName(ctx, p.Name)
+		if err != nil || got == nil || got.Color != want {
+			t.Fatalf("FindProjectByName: project=%+v err=%v want color=%q", got, err, want)
+		}
+		projects, err := store.ListProjects(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, project := range projects {
+			if project.ID == p.ID {
+				found = true
+				if project.Color != want {
+					t.Fatalf("ListProjects color=%q want=%q", project.Color, want)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("ListProjects omitted project")
+		}
+		if err := withTx(t, db, func(tx *sql.Tx) error {
+			project, err := store.GetProjectTx(ctx, tx, p.ID)
+			if err != nil {
+				return err
+			}
+			if project == nil || project.Color != want {
+				t.Fatalf("GetProjectTx: project=%+v want color=%q", project, want)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertReads("purple")
+	description := "Preserve color"
+	if err := updateProjectHelper(t, db, store, p.ID, model.ProjectUpdate{Description: &description}); err != nil {
+		t.Fatal(err)
+	}
+	assertReads("purple")
+	color := "teal"
+	if err := updateProjectHelper(t, db, store, p.ID, model.ProjectUpdate{Color: &color}); err != nil {
+		t.Fatal(err)
+	}
+	assertReads("teal")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = storage.OpenDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = storage.NewSQLiteTaskStore(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertReads("teal")
+	color = ""
+	if err := updateProjectHelper(t, db, store, p.ID, model.ProjectUpdate{Color: &color}); err != nil {
+		t.Fatal(err)
+	}
+	assertReads("")
+}
 
 func TestSQLiteTaskStore_DefaultProject_CreatedAutomatically(t *testing.T) {
 	store, _ := newTaskStore(t)
@@ -1908,5 +2049,220 @@ func TestSQLiteTaskStore_InvalidSourceDetailsJSON_YieldsNil(t *testing.T) {
 	}
 	if len(listed) != 1 || listed[0].SourceDetails != nil {
 		t.Errorf("ListTasks: got %+v, want one task with nil SourceDetails", listed)
+	}
+}
+
+func TestTaskStoreDeleteProjectTxMovesAllStatusesInNumberOrder(t *testing.T) {
+	ctx := context.Background()
+	store, db := newTaskStore(t)
+	project := newProject("Delete ordered")
+	if err := createProjectHelper(t, db, store, project); err != nil {
+		t.Fatal(err)
+	}
+	inboxID := store.DefaultProjectID()
+	existing := newTask(inboxID, "Existing Inbox task")
+	if err := createTaskHelper(t, db, store, existing); err != nil {
+		t.Fatal(err)
+	}
+	// A removed task leaves a counter gap that moving tasks must not reuse.
+	removed := newTask(inboxID, "Removed Inbox task")
+	if err := createTaskHelper(t, db, store, removed); err != nil {
+		t.Fatal(err)
+	}
+	if err := withTx(t, db, func(tx *sql.Tx) error {
+		return store.DeleteTaskTx(ctx, tx, removed.ID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var originals []model.Task
+	for _, status := range []string{"cancelled", "open", "done"} {
+		task := newTask(project.ID, "Task "+status)
+		task.Topic = "Deletion"
+		task.Priority = model.TaskPriorityMedium
+		task.SourceDetails = &model.TaskSourceDetails{Text: "Synthetic source", Via: "message"}
+		if err := createTaskHelper(t, db, store, task); err != nil {
+			t.Fatal(err)
+		}
+		if err := updateTaskHelper(t, db, store, task.ID, model.TaskUpdate{Status: &status}); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := store.GetTask(ctx, task.ID)
+		if err != nil || snapshot == nil {
+			t.Fatalf("GetTask: task=%+v err=%v", snapshot, err)
+		}
+		originals = append(originals, *snapshot)
+	}
+	// Reverse the assigned numbers to distinguish number order from insertion order.
+	for i, task := range originals {
+		if _, err := db.ExecContext(ctx, `UPDATE tasks SET number = ? WHERE id = ?`, 30-i*10, task.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var moved []string
+	if err := withTx(t, db, func(tx *sql.Tx) error {
+		var err error
+		moved, err = store.DeleteProjectTx(ctx, tx, project.ID, inboxID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{originals[2].ID, originals[1].ID, originals[0].ID}
+	if !reflect.DeepEqual(moved, wantIDs) {
+		t.Fatalf("moved=%v, want %v", moved, wantIDs)
+	}
+	for i, id := range moved {
+		got, err := store.GetTask(ctx, id)
+		if err != nil || got == nil {
+			t.Fatalf("GetTask: task=%+v err=%v", got, err)
+		}
+		want := originals[len(originals)-1-i]
+		if got.ProjectID != inboxID || got.Number != i+3 || got.ProjectSlug != "inbox" {
+			t.Errorf("moved task destination=%s/%s#%d, want Inbox #%d", got.ProjectID, got.ProjectSlug, got.Number, i+3)
+		}
+		if got.Status != want.Status || got.Summary != want.Summary || got.Details != want.Details ||
+			got.Topic != want.Topic || got.Priority != want.Priority || !got.CreatedAt.Equal(want.CreatedAt) ||
+			!reflect.DeepEqual(got.ClosedAt, want.ClosedAt) || !reflect.DeepEqual(got.SourceDetails, want.SourceDetails) {
+			t.Errorf("move changed task metadata: got=%+v want=%+v", got, want)
+		}
+	}
+	deleted, err := store.GetProject(ctx, project.ID)
+	if err != nil || deleted != nil {
+		t.Fatalf("deleted project=%+v err=%v", deleted, err)
+	}
+	inbox, err := store.GetProject(ctx, inboxID)
+	if err != nil || inbox == nil || inbox.TaskCounter != 5 {
+		t.Fatalf("Inbox=%+v err=%v; want counter 5", inbox, err)
+	}
+	next := newTask(inboxID, "Next Inbox task")
+	if err := createTaskHelper(t, db, store, next); err != nil || next.Number != 6 {
+		t.Fatalf("next task number=%d err=%v; want 6", next.Number, err)
+	}
+}
+
+func TestTaskStoreDeleteProjectTxEmptyAndMissing(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		name := "empty"
+		if missing {
+			name = "missing"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store, db := newTaskStore(t)
+			projectID := "missing-project"
+			if !missing {
+				project := newProject("Empty project")
+				if err := createProjectHelper(t, db, store, project); err != nil {
+					t.Fatal(err)
+				}
+				projectID = project.ID
+			}
+			err := withTx(t, db, func(tx *sql.Tx) error {
+				ids, err := store.DeleteProjectTx(ctx, tx, projectID, store.DefaultProjectID())
+				if len(ids) != 0 {
+					t.Errorf("moved IDs=%v, want none", ids)
+				}
+				return err
+			})
+			if missing {
+				if !errors.Is(err, sql.ErrNoRows) {
+					t.Fatalf("missing project error=%v, want sql.ErrNoRows", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			project, err := store.GetProject(ctx, projectID)
+			if err != nil || project != nil {
+				t.Fatalf("project=%+v err=%v; want absent", project, err)
+			}
+			inbox, err := store.GetProject(ctx, store.DefaultProjectID())
+			if err != nil || inbox == nil || inbox.TaskCounter != 0 {
+				t.Fatalf("Inbox=%+v err=%v; want unchanged counter", inbox, err)
+			}
+		})
+	}
+}
+
+func TestTaskStoreDeleteProjectTxAliasCascadeAndRollback(t *testing.T) {
+	for _, rollback := range []bool{false, true} {
+		name := "commit"
+		if rollback {
+			name = "rollback"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store, db := newTaskStore(t)
+			var foreignKeys int
+			if err := db.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil || foreignKeys != 1 {
+				t.Fatalf("foreign_keys=%d err=%v; want enabled", foreignKeys, err)
+			}
+			project := newProject("Aliased project")
+			if err := createProjectHelper(t, db, store, project); err != nil {
+				t.Fatal(err)
+			}
+			if err := addAliasHelper(t, db, store, project.ID, "deleted-alias"); err != nil {
+				t.Fatal(err)
+			}
+			if err := addAliasHelper(t, db, store, store.DefaultProjectID(), "inbox-alias"); err != nil {
+				t.Fatal(err)
+			}
+			task := newTask(project.ID, "Task preserved by rollback")
+			if err := createTaskHelper(t, db, store, task); err != nil {
+				t.Fatal(err)
+			}
+			abort := errors.New("abort project deletion")
+			err := withTx(t, db, func(tx *sql.Tx) error {
+				ids, err := store.DeleteProjectTx(ctx, tx, project.ID, store.DefaultProjectID())
+				if err != nil {
+					return err
+				}
+				if !reflect.DeepEqual(ids, []string{task.ID}) {
+					t.Errorf("moved IDs=%v, want %s", ids, task.ID)
+				}
+				var aliases int
+				if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM project_aliases WHERE project_id = ?`, project.ID).Scan(&aliases); err != nil {
+					return err
+				}
+				if aliases != 0 {
+					t.Errorf("aliases inside transaction=%d, want cascade deletion", aliases)
+				}
+				if rollback {
+					return abort
+				}
+				return nil
+			})
+			if rollback && !errors.Is(err, abort) || !rollback && err != nil {
+				t.Fatal(err)
+			}
+			projectAfter, err := store.GetProject(ctx, project.ID)
+			if err != nil || (projectAfter != nil) != rollback {
+				t.Fatalf("project=%+v err=%v; rollback=%v", projectAfter, err, rollback)
+			}
+			aliases, err := store.ListAliasesForProject(ctx, project.ID)
+			wantAliases := []string{}
+			if rollback {
+				wantAliases = []string{"deleted-alias"}
+			}
+			if err != nil || !reflect.DeepEqual(aliases, wantAliases) {
+				t.Fatalf("aliases=%v err=%v, want %v", aliases, err, wantAliases)
+			}
+			aliases, err = store.ListAliasesForProject(ctx, store.DefaultProjectID())
+			if err != nil || !reflect.DeepEqual(aliases, []string{"inbox-alias"}) {
+				t.Fatalf("unrelated aliases=%v err=%v", aliases, err)
+			}
+			got, err := store.GetTask(ctx, task.ID)
+			wantProjectID := store.DefaultProjectID()
+			wantCounter := 1
+			if rollback {
+				wantProjectID = project.ID
+				wantCounter = 0
+			}
+			if err != nil || got == nil || got.ProjectID != wantProjectID || got.Number != 1 {
+				t.Fatalf("task=%+v err=%v, want project=%s number=1", got, err, wantProjectID)
+			}
+			inbox, err := store.GetProject(ctx, store.DefaultProjectID())
+			if err != nil || inbox == nil || inbox.TaskCounter != wantCounter {
+				t.Fatalf("Inbox=%+v err=%v, want counter=%d", inbox, err, wantCounter)
+			}
+		})
 	}
 }

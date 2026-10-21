@@ -315,6 +315,8 @@ type Project struct {
 	Slug string
 	// Description is the project description.
 	Description string
+	// Color is the theme palette slot; an empty string selects Auto.
+	Color string
 	// Aliases is the list of keyword aliases for this project, sorted lexicographically.
 	// Always non-nil; empty slice if no aliases are defined.
 	Aliases []string
@@ -362,6 +364,8 @@ type ProjectUpdate struct {
 	Description *string
 	// Slug is the new project slug (nil means no change).
 	Slug *string
+	// Color is the new palette slot (nil means no change; empty string selects Auto).
+	Color *string
 	// Aliases is the replacement set of aliases (nil means no change; &[]string{} clears all aliases).
 	Aliases *[]string
 }

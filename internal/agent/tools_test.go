@@ -247,6 +247,10 @@ func (m *mockProjectService) UpdateProject(_ context.Context, id string, upd mod
 	return m.updateProjectResult, m.updateProjectErr
 }
 
+func (m *mockProjectService) DeleteProject(_ context.Context, _ string) ([]model.Task, error) {
+	return nil, nil
+}
+
 func (m *mockProjectService) ListProjects(_ context.Context) ([]model.Project, error) {
 	return m.listResult, m.listErr
 }

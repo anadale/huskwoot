@@ -115,7 +115,7 @@ func TestVoiceE2ESmoke(t *testing.T) {
 		t.Fatalf("SSE status=%d, want 200", sseResp.StatusCode)
 	}
 	sseCh := readSSEEvents(sseResp.Body)
-	waitBrokerActive(t, broker, device.ID, 2*time.Second)
+	// The successful response already has a broker subscription and initial SQL mark.
 
 	// POST /v1/chat/voice with a tiny fake opus payload.
 	body, ct := buildVoiceMultipart(t, []byte("fake-opus"), "audio/ogg;codecs=opus", map[string]any{

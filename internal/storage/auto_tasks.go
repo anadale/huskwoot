@@ -74,6 +74,51 @@ func (s *SQLiteAutoTaskStore) UpdateCandidateTx(ctx context.Context, tx *sql.Tx,
 	return nil
 }
 
+// ReassignProjectTx moves candidates of every status while preserving their decisions and questions.
+func (s *SQLiteAutoTaskStore) ReassignProjectTx(ctx context.Context, tx *sql.Tx, fromProjectID, toProjectID string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id, payload, question_chat_id, question_message_id FROM auto_task_candidates WHERE project_id = ? ORDER BY id`, fromProjectID)
+	if err != nil {
+		return fmt.Errorf("list automatic task candidates for reassignment: %w", err)
+	}
+	defer rows.Close()
+	type candidateRow struct {
+		id        string
+		candidate model.TaskCandidate
+	}
+	var candidates []candidateRow
+	for rows.Next() {
+		var row candidateRow
+		var payload string
+		var chatID int64
+		var messageID int
+		if err := rows.Scan(&row.id, &payload, &chatID, &messageID); err != nil {
+			return fmt.Errorf("read automatic task candidate for reassignment: %w", err)
+		}
+		if err := json.Unmarshal([]byte(payload), &row.candidate); err != nil {
+			return fmt.Errorf("decode automatic task candidate %q for reassignment: %w", row.id, err)
+		}
+		row.candidate.Task.ProjectID = toProjectID
+		row.candidate.QuestionChatID, row.candidate.QuestionMsgID = chatID, messageID
+		candidates = append(candidates, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate automatic task candidates for reassignment: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close automatic task candidates for reassignment: %w", err)
+	}
+	for _, row := range candidates {
+		payload, err := json.Marshal(row.candidate)
+		if err != nil {
+			return fmt.Errorf("encode automatic task candidate %q for reassignment: %w", row.id, err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE auto_task_candidates SET project_id = ?, payload = ? WHERE id = ?`, toProjectID, string(payload), row.id); err != nil {
+			return fmt.Errorf("reassign automatic task candidate %q: %w", row.id, err)
+		}
+	}
+	return nil
+}
+
 func scanAutoCandidate(row interface{ Scan(...any) error }) (*model.TaskCandidate, error) {
 	var payload string
 	var chatID int64

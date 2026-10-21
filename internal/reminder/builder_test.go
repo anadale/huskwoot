@@ -61,6 +61,9 @@ func (m *mockTaskStore) UpdateTaskTx(_ context.Context, _ *sql.Tx, _ string, _ m
 	return nil
 }
 func (m *mockTaskStore) MoveTaskTx(_ context.Context, _ *sql.Tx, _, _ string) error { return nil }
+func (m *mockTaskStore) DeleteProjectTx(_ context.Context, _ *sql.Tx, _, _ string) ([]string, error) {
+	panic("unexpected DeleteProjectTx call in reminder test")
+}
 func (m *mockTaskStore) AddProjectAliasTx(_ context.Context, _ *sql.Tx, _, _ string) error {
 	return nil
 }

@@ -239,14 +239,16 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 	}
 	pushTemplates := push.NewTemplates(cfg.DateTime.Timezone)
 
+	autoTaskStore := storage.NewSQLiteAutoTaskStore(db)
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
-		DB:      db,
-		Tasks:   taskStore,
-		Meta:    metaStore,
-		Events:  eventStore,
-		Devices: deviceStore,
-		Queue:   pushQueue,
-		Broker:  broker,
+		DB:        db,
+		Tasks:     taskStore,
+		Meta:      metaStore,
+		AutoTasks: autoTaskStore,
+		Events:    eventStore,
+		Devices:   deviceStore,
+		Queue:     pushQueue,
+		Broker:    broker,
 	})
 	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
 		DB:      db,
@@ -276,7 +278,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 			Devices:            deviceStore,
 			Queue:              pushQueue,
 			Broker:             broker,
-			Store:              storage.NewSQLiteAutoTaskStore(db),
+			Store:              autoTaskStore,
 			Checker:            checker,
 			DuplicateThreshold: cfg.Tasks.DuplicateThreshold,
 			ReviewThreshold:    cfg.Tasks.ReviewThreshold,
@@ -515,7 +517,7 @@ func run(parentCtx context.Context, configDir string, logLevelStr string) error 
 			VoiceMaxBytes:  cfg.API.VoiceMaxBytes,
 			VoiceDuration:  cfg.Transcriber.MaxDuration,
 			Transcriber:    transcriber,
-			TaskStore:      taskStore,
+			TaskStore:      sqliteTaskStore,
 			VoiceRateLimit: cfg.API.VoiceRateLimitPerMinute,
 		})
 		go func() {

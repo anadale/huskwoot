@@ -17,6 +17,8 @@ import (
 // ErrTaskCandidateNotFound indicates an unknown automatic task decision.
 var ErrTaskCandidateNotFound = errors.New("automatic task candidate not found")
 
+var errAutoTaskDestinationMissing = errors.New("automatic task destination not found")
+
 // AutoTaskServiceDeps collects the stores and checker used for automatic tasks.
 type AutoTaskServiceDeps struct {
 	DB                 *sql.DB
@@ -104,6 +106,10 @@ func (s *autoTaskService) Submit(ctx context.Context, submission model.AutoTaskS
 		}
 		refs, replay, err := s.readSubmission(ctx, submission, projectID)
 		if err != nil {
+			if errors.Is(err, errAutoTaskDestinationMissing) && projectID != s.tasks.DefaultProjectID() {
+				projectID = s.tasks.DefaultProjectID()
+				continue
+			}
 			return model.AutoTaskResult{}, err
 		}
 		if replay {
@@ -120,6 +126,10 @@ func (s *autoTaskService) Submit(ctx context.Context, submission model.AutoTaskS
 		}
 		result, changed, err := s.commitSubmission(ctx, submission, projectID, candidates, activeIDs, revision)
 		if err != nil {
+			if errors.Is(err, errAutoTaskDestinationMissing) && projectID != s.tasks.DefaultProjectID() {
+				projectID = s.tasks.DefaultProjectID()
+				continue
+			}
 			return model.AutoTaskResult{}, err
 		}
 		if changed {
@@ -155,6 +165,13 @@ func (s *autoTaskService) readSubmission(ctx context.Context, submission model.A
 			return nil, false, fmt.Errorf("commit automatic task replay: %w", err)
 		}
 		return nil, true, nil
+	}
+	project, err := s.tasks.GetProjectTx(ctx, tx, projectID)
+	if err != nil {
+		return nil, false, fmt.Errorf("read automatic task project: %w", err)
+	}
+	if project == nil {
+		return nil, false, fmt.Errorf("automatic task project %q: %w", projectID, errAutoTaskDestinationMissing)
 	}
 	refs, err := s.store.ReferencesTx(ctx, tx, projectID, s.now().Add(-14*24*time.Hour))
 	if err != nil {
@@ -258,7 +275,7 @@ func (s *autoTaskService) commitSubmission(ctx context.Context, submission model
 		return model.AutoTaskResult{}, false, fmt.Errorf("read automatic task project: %w", err)
 	}
 	if project == nil {
-		return model.AutoTaskResult{}, false, fmt.Errorf("automatic task project %q not found", projectID)
+		return model.AutoTaskResult{}, false, fmt.Errorf("automatic task project %q: %w", projectID, errAutoTaskDestinationMissing)
 	}
 	var result model.AutoTaskResult
 	var notifications []model.Event

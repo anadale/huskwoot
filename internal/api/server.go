@@ -85,7 +85,8 @@ type Config struct {
 	VoiceDuration time.Duration
 	// Transcriber is the speech-to-text backend. Used by Task 9b to return 503 when nil.
 	Transcriber model.Transcriber
-	// TaskStore is the task/project store used by POST /v1/chat/voice to validate projectId.
+	// TaskStore is the uncached task/project store on the Events database. Snapshot
+	// reads use it directly; POST /v1/chat/voice also uses it to validate projectId.
 	TaskStore model.TaskStore
 	// VoiceRateLimit is the per-device rate limit for POST /v1/chat/voice, per minute. 0 → default 10.
 	VoiceRateLimit int
@@ -184,6 +185,7 @@ func (s *Server) routes() http.Handler {
 				v1.Post("/projects", ph.create)
 				v1.Get("/projects/{id}", ph.get)
 				v1.Patch("/projects/{id}", ph.update)
+				v1.Delete("/projects/{id}", ph.delete)
 			}
 
 			if s.cfg.Tasks != nil {
@@ -215,8 +217,8 @@ func (s *Server) routes() http.Handler {
 				v1.Get("/events", eh.stream)
 			}
 
-			if s.cfg.Events != nil && s.cfg.Projects != nil && s.cfg.Tasks != nil {
-				sh := newSyncHandler(s.cfg.Projects, s.cfg.Tasks, s.cfg.Events, s.logger)
+			if s.cfg.Events != nil && s.cfg.TaskStore != nil && s.cfg.Tasks != nil {
+				sh := newSyncHandler(s.cfg.TaskStore.ListProjects, s.cfg.Tasks, s.cfg.Events, s.logger)
 				v1.Get("/sync/snapshot", sh.snapshot)
 			}
 		})

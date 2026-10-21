@@ -106,6 +106,10 @@ type TaskStore interface {
 	CreateProjectTx(ctx context.Context, tx *sql.Tx, project *Project) error
 	// UpdateProjectTx applies changes to a project within the given transaction.
 	UpdateProjectTx(ctx context.Context, tx *sql.Tx, id string, upd ProjectUpdate) error
+	// DeleteProjectTx moves every task to Inbox in old-number order, then deletes
+	// the project in the caller's transaction. It returns the ordered moved IDs.
+	// A missing project returns an error wrapping sql.ErrNoRows.
+	DeleteProjectTx(ctx context.Context, tx *sql.Tx, projectID, inboxID string) ([]string, error)
 	// GetProject returns a project by UUID. Returns nil, nil if not found.
 	GetProject(ctx context.Context, id string) (*Project, error)
 	// GetProjectTx reads a project by UUID within the given transaction.
@@ -177,6 +181,8 @@ type MetaStore interface {
 	Get(ctx context.Context, key string) (string, error)
 	// SetTx sets the value for the given key within the given transaction.
 	SetTx(ctx context.Context, tx *sql.Tx, key, value string) error
+	// DeleteProjectBindingsTx removes only bindings to projectID in the caller's transaction.
+	DeleteProjectBindingsTx(ctx context.Context, tx *sql.Tx, projectID string) error
 	// Values returns all values whose keys start with the given prefix.
 	// Returns nil, nil if no matching keys are found.
 	Values(ctx context.Context, prefix string) ([]string, error)
@@ -373,6 +379,10 @@ type AutoTaskStore interface {
 	UpdateCandidateTx(ctx context.Context, tx *sql.Tx, candidate TaskCandidate) error
 	GetCandidate(ctx context.Context, candidateID string) (*TaskCandidate, error)
 	GetCandidateTx(ctx context.Context, tx *sql.Tx, candidateID string) (*TaskCandidate, error)
+	// ReassignProjectTx moves every candidate status to the destination in the
+	// caller's transaction, updating both the project column and task payload.
+	// Question and decision metadata remain unchanged.
+	ReassignProjectTx(ctx context.Context, tx *sql.Tx, fromProjectID, toProjectID string) error
 	PendingQuestions(ctx context.Context, limit int) ([]TaskCandidate, error)
 	MarkQuestionSent(ctx context.Context, candidateID string, chatID int64, messageID int) error
 }

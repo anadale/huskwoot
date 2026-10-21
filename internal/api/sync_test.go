@@ -21,12 +21,14 @@ import (
 )
 
 type syncTestHarness struct {
-	t          *testing.T
-	db         *sql.DB
-	server     *api.Server
-	token      string
-	taskSvc    model.TaskService
-	projectSvc model.ProjectService
+	t           *testing.T
+	db          *sql.DB
+	server      *api.Server
+	token       string
+	taskSvc     model.TaskService
+	projectSvc  model.ProjectService
+	rawTasks    model.TaskStore
+	cachedTasks *storage.CachedTaskStore
 }
 
 func newSyncHarness(t *testing.T) *syncTestHarness {
@@ -46,7 +48,8 @@ func newSyncHarness(t *testing.T) *syncTestHarness {
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
 		DB: db, Tasks: tasks, Meta: meta, Events: eventStore,
-		Devices: deviceStore, Queue: pushQueue, Broker: broker,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
+		Devices:   deviceStore, Queue: pushQueue, Broker: broker,
 	})
 	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
 		DB: db, Tasks: tasks, Events: eventStore,
@@ -57,18 +60,20 @@ func newSyncHarness(t *testing.T) *syncTestHarness {
 	createTestDevice(t, db, "sync-device", token)
 
 	srv := api.New(api.Config{
-		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		DB:       db,
-		Devices:  deviceStore,
-		Projects: projectSvc,
-		Tasks:    taskSvc,
-		Events:   eventStore,
-		Broker:   broker,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DB:        db,
+		Devices:   deviceStore,
+		Projects:  projectSvc,
+		Tasks:     taskSvc,
+		TaskStore: sqliteTasks,
+		Events:    eventStore,
+		Broker:    broker,
 	})
 
 	return &syncTestHarness{
 		t: t, db: db, server: srv, token: token,
 		taskSvc: taskSvc, projectSvc: projectSvc,
+		rawTasks: sqliteTasks, cachedTasks: tasks,
 	}
 }
 
@@ -254,5 +259,168 @@ func TestSyncSnapshotEmpty(t *testing.T) {
 	}
 	if resp.LastSeq != 0 {
 		t.Fatalf("last_seq=%d, want 0", resp.LastSeq)
+	}
+}
+
+type heldSyncInvalidationStore struct {
+	*storage.CachedTaskStore
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *heldSyncInvalidationStore) Invalidate() {
+	close(s.entered)
+	<-s.release
+	s.CachedTaskStore.Invalidate()
+}
+
+func TestSyncSnapshotOmitsDeletedProjectBeforeCacheInvalidation(t *testing.T) {
+	h := newSyncHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	project, err := h.projectSvc.CreateProject(ctx, model.CreateProjectRequest{Name: "Snapshot deletion"})
+	if err != nil {
+		t.Fatalf("CreateProject: %v", err)
+	}
+	if _, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{ProjectID: project.ID, Summary: "Moved open task"}); err != nil {
+		t.Fatalf("CreateTask: %v", err)
+	}
+	warm, err := h.cachedTasks.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	if !syncProjectsContain(warm, project.ID) {
+		t.Fatal("warm cache does not contain project")
+	}
+	held := &heldSyncInvalidationStore{
+		CachedTaskStore: h.cachedTasks,
+		entered:         make(chan struct{}),
+		release:         make(chan struct{}),
+	}
+	deletion := usecase.NewProjectService(usecase.ProjectServiceDeps{
+		DB: h.db, Tasks: held, Meta: storage.NewSQLiteMetaStore(h.db),
+		AutoTasks: storage.NewSQLiteAutoTaskStore(h.db),
+		Events:    events.NewSQLiteEventStore(h.db),
+		Devices:   devices.NewSQLiteDeviceStore(h.db), Queue: push.NewSQLitePushQueue(h.db),
+		Broker: events.NewBroker(events.BrokerConfig{}),
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := deletion.DeleteProject(ctx, project.ID)
+		done <- err
+	}()
+	defer func() {
+		close(held.release)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("DeleteProject: %v", err)
+			}
+		case <-ctx.Done():
+			t.Error("DeleteProject did not finish after releasing cache invalidation")
+		}
+	}()
+	select {
+	case <-held.entered:
+	case err := <-done:
+		t.Fatalf("DeleteProject returned before cache invalidation: %v", err)
+	case <-ctx.Done():
+		t.Fatal("cache invalidation was not reached")
+	}
+	eventStore := events.NewSQLiteEventStore(h.db)
+	lastSeq, err := eventStore.MaxSeq(ctx)
+	if err != nil {
+		t.Fatalf("MaxSeq: %v", err)
+	}
+	durable, err := eventStore.SinceSeq(ctx, lastSeq-1, 1)
+	if err != nil {
+		t.Fatalf("SinceSeq: %v", err)
+	}
+	if len(durable) != 1 || durable[0].Kind != model.EventProjectDeleted || durable[0].EntityID != project.ID {
+		t.Fatalf("last durable event=%+v, want project_deleted for %s", durable, project.ID)
+	}
+	rec := h.get("/v1/sync/snapshot")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var snapshot struct {
+		Projects  []model.Project `json:"projects"`
+		OpenTasks []struct {
+			ProjectID string `json:"projectId"`
+		} `json:"openTasks"`
+		LastSeq int64 `json:"lastSeq"`
+	}
+	decodeJSONResp(t, rec.Body, &snapshot)
+	if snapshot.LastSeq != lastSeq {
+		t.Errorf("lastSeq=%d, want committed deletion seq %d", snapshot.LastSeq, lastSeq)
+	}
+	if syncProjectsContain(snapshot.Projects, project.ID) {
+		t.Error("snapshot contains the deleted project")
+	}
+	if len(snapshot.OpenTasks) != 1 || snapshot.OpenTasks[0].ProjectID != h.rawTasks.DefaultProjectID() {
+		t.Errorf("openTasks=%+v, want the moved task in Inbox", snapshot.OpenTasks)
+	}
+	stale, err := h.cachedTasks.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("cached ListProjects: %v", err)
+	}
+	if !syncProjectsContain(stale, project.ID) {
+		t.Fatal("cache was invalidated before the snapshot assertion")
+	}
+}
+
+func syncProjectsContain(projects []model.Project, id string) bool {
+	for _, project := range projects {
+		if project.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSyncSnapshotSQLProjectReadFailureDoesNotUseWarmCache(t *testing.T) {
+	h := newSyncHarness(t)
+	ctx := context.Background()
+	warm, err := h.projectSvc.ListProjects(ctx)
+	if err != nil || len(warm) == 0 {
+		t.Fatalf("warm cache=%+v, err=%v", warm, err)
+	}
+	if _, err := h.db.ExecContext(ctx, "DROP TABLE projects"); err != nil {
+		t.Fatalf("drop isolated projects table: %v", err)
+	}
+	rec := h.get("/v1/sync/snapshot")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500; body=%s", rec.Code, rec.Body.String())
+	}
+	var response api.ErrorResponse
+	decodeJSONResp(t, rec.Body, &response)
+	if response.Error.Code != api.ErrorCodeInternal || response.Error.Message != "failed to retrieve projects" {
+		t.Errorf("error=%+v, want project-read internal error", response.Error)
+	}
+	cached, err := h.projectSvc.ListProjects(ctx)
+	if err != nil || len(cached) != len(warm) {
+		t.Fatalf("cached projects=%+v, err=%v; want warm cache still available", cached, err)
+	}
+}
+
+func TestSyncSnapshotDoesNotRequireProjectService(t *testing.T) {
+	h := newSyncHarness(t)
+	h.server = api.New(api.Config{
+		DB:        h.db,
+		Devices:   devices.NewSQLiteDeviceStore(h.db),
+		Tasks:     h.taskSvc,
+		TaskStore: h.rawTasks,
+		Events:    events.NewSQLiteEventStore(h.db),
+	})
+	rec := h.get("/v1/sync/snapshot")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 without ProjectService; body=%s", rec.Code, rec.Body.String())
+	}
+	var snapshot struct {
+		Projects []model.Project `json:"projects"`
+	}
+	decodeJSONResp(t, rec.Body, &snapshot)
+	if !syncProjectsContain(snapshot.Projects, h.rawTasks.DefaultProjectID()) {
+		t.Fatal("snapshot does not contain Inbox without ProjectService")
 	}
 }

@@ -81,8 +81,8 @@ func (s *SQLiteTaskStore) CreateProjectTx(ctx context.Context, tx *sql.Tx, p *mo
 	p.CreatedAt = time.Now().UTC()
 
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO projects (id, name, slug, description, task_counter, created_at) VALUES (?, ?, ?, ?, 0, ?)`,
-		p.ID, p.Name, p.Slug, p.Description, p.CreatedAt.Format(time.RFC3339),
+		`INSERT INTO projects (id, name, slug, description, color, task_counter, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)`,
+		p.ID, p.Name, p.Slug, p.Description, p.Color, p.CreatedAt.Format(time.RFC3339),
 	)
 	if err != nil {
 		return fmt.Errorf("creating project %q: %w", p.Name, err)
@@ -107,6 +107,10 @@ func (s *SQLiteTaskStore) UpdateProjectTx(ctx context.Context, tx *sql.Tx, id st
 	if upd.Slug != nil {
 		setClauses = append(setClauses, "slug = ?")
 		args = append(args, *upd.Slug)
+	}
+	if upd.Color != nil {
+		setClauses = append(setClauses, "color = ?")
+		args = append(args, *upd.Color)
 	}
 
 	if len(setClauses) == 0 {
@@ -166,8 +170,8 @@ func scanProject(ctx context.Context, q projectQuerier, id string) (*model.Proje
 	var createdAtStr string
 
 	err := q.QueryRowContext(ctx,
-		`SELECT id, name, slug, description, task_counter, created_at FROM projects WHERE id = ?`, id,
-	).Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.TaskCounter, &createdAtStr)
+		`SELECT id, name, slug, description, color, task_counter, created_at FROM projects WHERE id = ?`, id,
+	).Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.Color, &p.TaskCounter, &createdAtStr)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -247,7 +251,7 @@ func (s *SQLiteTaskStore) ListAliasesForProject(ctx context.Context, projectID s
 // ListProjects returns all projects ordered by created_at, with their aliases.
 func (s *SQLiteTaskStore) ListProjects(ctx context.Context) ([]model.Project, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT p.id, p.name, p.slug, p.description, p.task_counter, p.created_at,
+		SELECT p.id, p.name, p.slug, p.description, p.color, p.task_counter, p.created_at,
 		       GROUP_CONCAT(pa.alias, char(31))
 		FROM projects p
 		LEFT JOIN project_aliases pa ON p.id = pa.project_id
@@ -264,7 +268,7 @@ func (s *SQLiteTaskStore) ListProjects(ctx context.Context) ([]model.Project, er
 		var p model.Project
 		var createdAtStr string
 		var aliasConcat sql.NullString
-		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.TaskCounter, &createdAtStr, &aliasConcat); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.Color, &p.TaskCounter, &createdAtStr, &aliasConcat); err != nil {
 			return nil, fmt.Errorf("scanning project: %w", err)
 		}
 		p.CreatedAt, err = time.Parse(time.RFC3339, createdAtStr)
@@ -292,8 +296,8 @@ func (s *SQLiteTaskStore) FindProjectByName(ctx context.Context, name string) (*
 	var createdAtStr string
 
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, slug, description, task_counter, created_at FROM projects WHERE name = ?`, name,
-	).Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.TaskCounter, &createdAtStr)
+		`SELECT id, name, slug, description, color, task_counter, created_at FROM projects WHERE name = ?`, name,
+	).Scan(&p.ID, &p.Name, &p.Slug, &p.Description, &p.Color, &p.TaskCounter, &createdAtStr)
 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -655,6 +659,49 @@ func (s *SQLiteTaskStore) MoveTaskTx(ctx context.Context, tx *sql.Tx, taskID, ne
 	}
 
 	return nil
+}
+
+// DeleteProjectTx moves every task to Inbox in number order, then deletes the project.
+func (s *SQLiteTaskStore) DeleteProjectTx(ctx context.Context, tx *sql.Tx, projectID, inboxID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM tasks WHERE project_id = ? ORDER BY number`, projectID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("listing tasks for project %q: %w", projectID, err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scanning task for project %q: %w", projectID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterating tasks for project %q: %w", projectID, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing tasks for project %q: %w", projectID, err)
+	}
+	for _, id := range ids {
+		if err := s.MoveTaskTx(ctx, tx, id, inboxID); err != nil {
+			return nil, fmt.Errorf("moving task before deleting project %q: %w", projectID, err)
+		}
+	}
+	result, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("deleting project %q: %w", projectID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("checking project deletion %q: %w", projectID, err)
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("project %q not found: %w", projectID, sql.ErrNoRows)
+	}
+	return ids, nil
 }
 
 // ListClosedOlderThan returns full snapshots of tasks with status

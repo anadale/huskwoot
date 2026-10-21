@@ -21,6 +21,8 @@ var (
 	ErrAliasNotFound          = errors.New("alias not found for project")
 	ErrAliasForbiddenForInbox = errors.New("aliases are not allowed for the Inbox project")
 	ErrProjectNotFound        = errors.New("project not found")
+	ErrColorInvalid           = errors.New("project color must be Auto or a supported palette slot")
+	ErrInboxProtected         = errors.New("Inbox name and slug cannot be changed")
 )
 
 // ProjectServiceDeps collects the dependencies for ProjectService.
@@ -31,6 +33,8 @@ type ProjectServiceDeps struct {
 	Tasks model.TaskStore
 	// Meta is the channel metadata store (write methods are tx-aware).
 	Meta model.MetaStore
+	// AutoTasks is required to reassign candidates atomically with project deletion.
+	AutoTasks model.AutoTaskStore
 	// Events is the domain event store; shares the same transaction.
 	Events model.EventStore
 	// Devices is the client device store (source of active device IDs).
@@ -42,26 +46,28 @@ type ProjectServiceDeps struct {
 }
 
 type projectService struct {
-	db      *sql.DB
-	store   model.TaskStore
-	meta    model.MetaStore
-	events  model.EventStore
-	devices model.DeviceStore
-	queue   model.PushQueue
-	broker  model.Broker
+	db        *sql.DB
+	store     model.TaskStore
+	meta      model.MetaStore
+	autoTasks model.AutoTaskStore
+	events    model.EventStore
+	devices   model.DeviceStore
+	queue     model.PushQueue
+	broker    model.Broker
 }
 
 // NewProjectService creates a ProjectService that wraps write operations in a
 // transaction and publishes events via EventStore/Broker/PushQueue.
 func NewProjectService(deps ProjectServiceDeps) model.ProjectService {
 	return &projectService{
-		db:      deps.DB,
-		store:   deps.Tasks,
-		meta:    deps.Meta,
-		events:  deps.Events,
-		devices: deps.Devices,
-		queue:   deps.Queue,
-		broker:  deps.Broker,
+		db:        deps.DB,
+		store:     deps.Tasks,
+		meta:      deps.Meta,
+		autoTasks: deps.AutoTasks,
+		events:    deps.Events,
+		devices:   deps.Devices,
+		queue:     deps.Queue,
+		broker:    deps.Broker,
 	}
 }
 
@@ -71,6 +77,7 @@ type projectSnapshot struct {
 	Name        string    `json:"name"`
 	Slug        string    `json:"slug"`
 	Description string    `json:"description,omitempty"`
+	Color       string    `json:"color"`
 	Aliases     []string  `json:"aliases"`
 	TaskCounter int       `json:"task_counter"`
 	CreatedAt   time.Time `json:"created_at"`
@@ -86,6 +93,7 @@ func makeProjectSnapshot(p *model.Project) projectSnapshot {
 		Name:        p.Name,
 		Slug:        p.Slug,
 		Description: p.Description,
+		Color:       p.Color,
 		Aliases:     aliases,
 		TaskCounter: p.TaskCounter,
 		CreatedAt:   p.CreatedAt,
@@ -128,7 +136,19 @@ func setDiff(a, b []string) []string {
 	return result
 }
 
+func validProjectColor(color string) bool {
+	switch color {
+	case "", "blue", "purple", "teal", "orange", "pink":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *projectService) CreateProject(ctx context.Context, req model.CreateProjectRequest) (*model.Project, error) {
+	if !validProjectColor(req.Color) {
+		return nil, ErrColorInvalid
+	}
 	// Validate and normalize aliases upfront.
 	var normalizedAliases []string
 	if len(req.Aliases) > 0 {
@@ -161,10 +181,9 @@ func (s *projectService) CreateProject(ctx context.Context, req model.CreateProj
 		Name:        req.Name,
 		Description: req.Description,
 		Slug:        req.Slug,
+		Color:       req.Color,
 	}
-	if p.Slug == "" {
-		p.Slug = Slugify(p.Name)
-	}
+	inferredSlug := p.Slug == ""
 
 	activeIDs, err := s.listActiveDeviceIDs(ctx)
 	if err != nil {
@@ -173,8 +192,8 @@ func (s *projectService) CreateProject(ctx context.Context, req model.CreateProj
 
 	var pendingEvent model.Event
 	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
-		if err := s.store.CreateProjectTx(ctx, tx, p); err != nil {
-			return fmt.Errorf("создание проекта: %w", err)
+		if err := s.createProjectTx(ctx, tx, p, inferredSlug); err != nil {
+			return err
 		}
 		for _, a := range normalizedAliases {
 			if err := s.store.AddProjectAliasTx(ctx, tx, p.ID, a); err != nil {
@@ -203,6 +222,12 @@ func (s *projectService) CreateProject(ctx context.Context, req model.CreateProj
 }
 
 func (s *projectService) UpdateProject(ctx context.Context, id string, upd model.ProjectUpdate) (*model.Project, error) {
+	if id == s.store.DefaultProjectID() && (upd.Name != nil || upd.Slug != nil) {
+		return nil, ErrInboxProtected
+	}
+	if upd.Color != nil && !validProjectColor(*upd.Color) {
+		return nil, ErrColorInvalid
+	}
 	// Validate and normalize aliases upfront if provided.
 	var normalizedNewAliases []string
 	if upd.Aliases != nil {
@@ -271,6 +296,9 @@ func (s *projectService) UpdateProject(ctx context.Context, id string, upd model
 		if upd.Slug != nil {
 			changedFields = append(changedFields, "slug")
 		}
+		if upd.Color != nil {
+			changedFields = append(changedFields, "color")
+		}
 
 		if upd.Aliases != nil {
 			toAdd := setDiff(normalizedNewAliases, p.Aliases)
@@ -328,6 +356,68 @@ func (s *projectService) UpdateProject(ctx context.Context, id string, upd model
 	return updated, nil
 }
 
+func (s *projectService) DeleteProject(ctx context.Context, id string) ([]model.Task, error) {
+	inboxID := s.store.DefaultProjectID()
+	if id == inboxID {
+		return nil, ErrInboxProtected
+	}
+	activeIDs, err := s.listActiveDeviceIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var moved []model.Task
+	var pendingEvents []model.Event
+	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
+		if err := s.autoTasks.ReassignProjectTx(ctx, tx, id, inboxID); err != nil {
+			return fmt.Errorf("reassigning project candidates: %w", err)
+		}
+		if err := s.meta.DeleteProjectBindingsTx(ctx, tx, id); err != nil {
+			return fmt.Errorf("deleting project bindings: %w", err)
+		}
+		ids, err := s.store.DeleteProjectTx(ctx, tx, id, inboxID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("deleting project %q: %w", id, ErrProjectNotFound)
+			}
+			return fmt.Errorf("deleting project: %w", err)
+		}
+		moved = make([]model.Task, 0, len(ids))
+		pendingEvents = make([]model.Event, 0, len(ids)+1)
+		for _, taskID := range ids {
+			task, err := s.store.GetTaskTx(ctx, tx, taskID)
+			if err != nil {
+				return fmt.Errorf("reading moved task %q: %w", taskID, err)
+			}
+			if task == nil {
+				return fmt.Errorf("reading moved task %q: %w", taskID, sql.ErrNoRows)
+			}
+			moved = append(moved, *task)
+		}
+		for i := range moved {
+			ev, err := s.recordEvent(ctx, tx, model.EventTaskMoved, moved[i].ID, wrapTaskPayload(&moved[i], nil), activeIDs)
+			if err != nil {
+				return err
+			}
+			pendingEvents = append(pendingEvents, ev)
+		}
+		ev, err := s.recordEvent(ctx, tx, model.EventProjectDeleted, id, struct {
+			ID string `json:"id"`
+		}{ID: id}, activeIDs)
+		if err != nil {
+			return err
+		}
+		pendingEvents = append(pendingEvents, ev)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	s.invalidateProjectCache()
+	for _, ev := range pendingEvents {
+		s.notify(ev)
+	}
+	return moved, nil
+}
+
 func (s *projectService) ListProjects(ctx context.Context) ([]model.Project, error) {
 	return s.store.ListProjects(ctx)
 }
@@ -339,10 +429,16 @@ func (s *projectService) FindProjectByName(ctx context.Context, name string) (*m
 func (s *projectService) ResolveProjectForChannel(ctx context.Context, channelID string) (string, error) {
 	pid, err := s.meta.Get(ctx, "project:"+channelID)
 	if err != nil {
-		return "", fmt.Errorf("чтение маппинга канала: %w", err)
+		return "", fmt.Errorf("reading channel project binding: %w", err)
 	}
 	if pid != "" {
-		return pid, nil
+		project, err := s.store.GetProject(ctx, pid)
+		if err != nil {
+			return "", fmt.Errorf("reading channel project: %w", err)
+		}
+		if project != nil {
+			return project.ID, nil
+		}
 	}
 	return s.store.DefaultProjectID(), nil
 }
@@ -350,7 +446,7 @@ func (s *projectService) ResolveProjectForChannel(ctx context.Context, channelID
 func (s *projectService) EnsureChannelProject(ctx context.Context, channelID, name string) (*model.Project, error) {
 	existing, err := s.store.FindProjectByName(ctx, name)
 	if err != nil {
-		return nil, fmt.Errorf("поиск проекта: %w", err)
+		return nil, fmt.Errorf("finding project: %w", err)
 	}
 
 	activeIDs, err := s.listActiveDeviceIDs(ctx)
@@ -364,15 +460,24 @@ func (s *projectService) EnsureChannelProject(ctx context.Context, channelID, na
 	)
 	if err := s.runInTx(ctx, func(tx *sql.Tx) error {
 		if existing == nil {
-			p := &model.Project{Name: name, Slug: Slugify(name)}
-			if err := s.store.CreateProjectTx(ctx, tx, p); err != nil {
-				return fmt.Errorf("создание проекта: %w", err)
+			p := &model.Project{Name: name}
+			if err := s.createProjectTx(ctx, tx, p, true); err != nil {
+				return err
 			}
 			existing = p
 			created = true
+		} else {
+			fresh, err := s.store.GetProjectTx(ctx, tx, existing.ID)
+			if err != nil {
+				return fmt.Errorf("reading project before binding: %w", err)
+			}
+			if fresh == nil {
+				return ErrProjectNotFound
+			}
+			existing = fresh
 		}
 		if err := s.meta.SetTx(ctx, tx, "project:"+channelID, existing.ID); err != nil {
-			return fmt.Errorf("сохранение маппинга канала: %w", err)
+			return fmt.Errorf("saving channel project binding: %w", err)
 		}
 		if created {
 			ev, err := s.recordEvent(ctx, tx, model.EventProjectCreated, existing.ID, makeProjectSnapshot(existing), activeIDs)
@@ -392,6 +497,36 @@ func (s *projectService) EnsureChannelProject(ctx context.Context, channelID, na
 	}
 	appendTouchedProjects(ctx, []model.Project{*existing})
 	return existing, nil
+}
+
+// createProjectTx allocates inferred slugs using the transaction's uniqueness
+// constraint. Only slug collisions are retried; name and explicit-slug conflicts
+// retain their normal conflict behavior.
+func (s *projectService) createProjectTx(ctx context.Context, tx *sql.Tx, p *model.Project, inferred bool) error {
+	base := p.Slug
+	if inferred {
+		base = Slugify(p.Name)
+		p.Slug = base
+	}
+	for suffix := 2; ; suffix++ {
+		err := s.store.CreateProjectTx(ctx, tx, p)
+		if err == nil {
+			return nil
+		}
+		// Context wrappers may contain the user-controlled project name.
+		// Only the underlying database error identifies a slug collision.
+		cause := err
+		for inner := errors.Unwrap(cause); inner != nil; inner = errors.Unwrap(cause) {
+			cause = inner
+		}
+		if !inferred || !strings.Contains(cause.Error(), "UNIQUE constraint failed: projects.slug") {
+			return fmt.Errorf("creating project: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("creating project: %w", err)
+		}
+		p.Slug = fmt.Sprintf("%s-%d", base, suffix)
+	}
 }
 
 // listActiveDeviceIDs returns a list of non-revoked device IDs, or an empty

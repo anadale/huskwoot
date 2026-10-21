@@ -90,6 +90,7 @@
   "tool_update_project_param_slug": "New project slug (letters, digits, and hyphens only)",
   "agent_project_updated": "updated",
   "agent_project_slug_conflict": "a project with this slug already exists",
+  "agent_inbox_protected": "Inbox name and slug cannot be changed; you can still edit its description",
   "tool_add_project_alias_desc": "Add an alias to a project",
   "tool_add_project_alias_param_ref": "Project UUID, slug, or alias",
   "tool_add_project_alias_param_alias": "Alias to add (2–32 characters, letters/digits/hyphens)",

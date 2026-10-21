@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/anadale/huskwoot/internal/devices"
 	"github.com/anadale/huskwoot/internal/model"
 	"github.com/anadale/huskwoot/internal/usecase"
 )
@@ -211,6 +213,34 @@ func (m *mockTaskStoreForTasks) MoveTaskTx(_ context.Context, _ *sql.Tx, taskID,
 		}
 	}
 	return nil
+}
+func (m *mockTaskStoreForTasks) DeleteProjectTx(ctx context.Context, tx *sql.Tx, projectID, inboxID string) ([]string, error) {
+	if m.projects[projectID] == nil {
+		return nil, fmt.Errorf("deleting project %q: %w", projectID, sql.ErrNoRows)
+	}
+	var tasks []*model.Task
+	nextNumber := 0
+	for _, task := range m.tasks {
+		if task.ProjectID == projectID {
+			tasks = append(tasks, task)
+		}
+		if task.ProjectID == inboxID && task.Number > nextNumber {
+			nextNumber = task.Number
+		}
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Number < tasks[j].Number })
+	ids := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		if err := m.MoveTaskTx(ctx, tx, task.ID, inboxID); err != nil {
+			return nil, err
+		}
+		nextNumber++
+		task.Number = nextNumber
+		task.UpdatedAt = time.Now().UTC()
+		ids = append(ids, task.ID)
+	}
+	delete(m.projects, projectID)
+	return ids, nil
 }
 
 func (m *mockTaskStoreForTasks) DefaultProjectID() string { return m.defaultPID }
@@ -494,6 +524,27 @@ func TestTaskServiceCreatePassesProjectID(t *testing.T) {
 	}
 	if task.ProjectID != "custom-proj" {
 		t.Fatalf("ProjectID=%q, want %q", task.ProjectID, "custom-proj")
+	}
+}
+
+func TestTaskServiceCreateTasksMissingProjectWrapsNotFound(t *testing.T) {
+	for _, projectID := range []string{"missing-project", ""} {
+		t.Run(projectID, func(t *testing.T) {
+			f := newTestFixture(t)
+			if projectID == "" {
+				delete(f.tasks.projects, f.tasks.defaultPID)
+			}
+			_, err := f.svc.CreateTasks(context.Background(), model.CreateTasksRequest{
+				ProjectID: projectID,
+				Tasks:     []model.CreateTaskRequest{{Summary: "Send report"}},
+			})
+			if !errors.Is(err, usecase.ErrProjectNotFound) {
+				t.Fatalf("missing destination error = %v, want ErrProjectNotFound", err)
+			}
+			if f.tasks.createCalled != 0 || len(f.events.recorded()) != 0 || len(f.broker.notifiedEvents()) != 0 {
+				t.Fatal("missing destination produced task writes or notifications")
+			}
+		})
 	}
 }
 
@@ -1343,6 +1394,130 @@ func TestTaskSnapshotSourcePayload(t *testing.T) {
 				if _, ok := src[key]; ok {
 					t.Errorf("task.source.%s = %#v, want absent", key, src[key])
 				}
+			}
+		})
+	}
+}
+
+// taskDestinationDeletionBarrier pauses only the creator, after its project
+// precheck and before BeginTx. Project deletion uses the unwrapped device store.
+type taskDestinationDeletionBarrier struct {
+	model.DeviceStore
+	once    sync.Once
+	started chan struct{}
+	resume  chan struct{}
+}
+
+func (b *taskDestinationDeletionBarrier) ListActiveIDs(ctx context.Context) ([]string, error) {
+	var err error
+	b.once.Do(func() {
+		close(b.started)
+		select {
+		case <-b.resume:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return b.DeviceStore.ListActiveIDs(ctx)
+}
+
+func TestTaskServiceCreateDestinationDeletedAfterPrecheck(t *testing.T) {
+	for _, operation := range []string{"CreateTask", "CreateTasks"} {
+		t.Run(operation, func(t *testing.T) {
+			h := newProjectDeletionHarness(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			realDevices := devices.NewSQLiteDeviceStore(h.db)
+			projectDeps := h.deps()
+			projectDeps.Devices = realDevices
+			projects := usecase.NewProjectService(projectDeps)
+			project, err := projects.CreateProject(ctx, model.CreateProjectRequest{Name: "Deleted destination"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			barrier := &taskDestinationDeletionBarrier{
+				DeviceStore: realDevices,
+				started:     make(chan struct{}),
+				resume:      make(chan struct{}),
+			}
+			creator := usecase.NewTaskService(usecase.TaskServiceDeps{
+				DB: h.db, Tasks: h.tasks, Devices: barrier, Events: h.events, Broker: h.broker,
+			})
+			type createResult struct {
+				tasks []model.Task
+				err   error
+			}
+			result := make(chan createResult, 1)
+			go func() {
+				if operation == "CreateTask" {
+					task, err := creator.CreateTask(ctx, model.CreateTaskRequest{
+						ProjectID: project.ID, Summary: "Must not fall back to Inbox",
+					})
+					var tasks []model.Task
+					if task != nil {
+						tasks = append(tasks, *task)
+					}
+					result <- createResult{tasks: tasks, err: err}
+					return
+				}
+				tasks, err := creator.CreateTasks(ctx, model.CreateTasksRequest{
+					ProjectID: project.ID,
+					Tasks: []model.CreateTaskRequest{
+						{Summary: "First task must not survive"},
+						{Summary: "Second task must not survive"},
+					},
+				})
+				result <- createResult{tasks: tasks, err: err}
+			}()
+			select {
+			case <-barrier.started:
+			case got := <-result:
+				t.Fatalf("create returned before the precheck barrier: %+v", got)
+			case <-ctx.Done():
+				t.Fatal("create did not reach the precheck barrier")
+			}
+			// Delete through the real service while the creator holds no transaction.
+			if _, err := projects.DeleteProject(ctx, project.ID); err != nil {
+				t.Fatal(err)
+			}
+			deleted, err := h.tasks.GetProject(ctx, project.ID)
+			if err != nil || deleted != nil {
+				t.Fatalf("destination after deletion=%+v err=%v", deleted, err)
+			}
+			before, err := h.events.MaxSeq(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			notifiedBefore := len(h.broker.notifiedEvents())
+			close(barrier.resume)
+			select {
+			case got := <-result:
+				if !errors.Is(got.err, usecase.ErrProjectNotFound) {
+					t.Errorf("create error=%v, want ErrProjectNotFound", got.err)
+				}
+				if len(got.tasks) != 0 {
+					t.Errorf("create returned tasks=%+v after destination deletion", got.tasks)
+				}
+			case <-ctx.Done():
+				t.Fatal("create did not finish after destination deletion")
+			}
+			tasks, err := h.tasks.ListTasks(ctx, "", model.TaskFilter{})
+			if err != nil || len(tasks) != 0 {
+				t.Errorf("persisted tasks=%+v err=%v, want no tasks in any project", tasks, err)
+			}
+			inbox, err := h.tasks.ListTasks(ctx, h.tasks.DefaultProjectID(), model.TaskFilter{})
+			if err != nil || len(inbox) != 0 {
+				t.Errorf("Inbox tasks=%+v err=%v, want no fallback", inbox, err)
+			}
+			after, err := h.events.MaxSeq(ctx)
+			if err != nil || after != before {
+				t.Errorf("event sequence after failed create=%d, want %d; err=%v", after, before, err)
+			}
+			if notifiedAfter := len(h.broker.notifiedEvents()); notifiedAfter != notifiedBefore {
+				t.Errorf("published events after failed create=%d, want %d", notifiedAfter, notifiedBefore)
 			}
 		})
 	}

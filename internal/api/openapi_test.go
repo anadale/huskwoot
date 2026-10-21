@@ -170,7 +170,8 @@ func newFullServer(t *testing.T) *api.Server {
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
 		DB: db, Tasks: taskStore, Meta: meta, Events: eventStore,
-		Devices: deviceStore, Queue: pushQueue, Broker: broker,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
+		Devices:   deviceStore, Queue: pushQueue, Broker: broker,
 	})
 	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
 		DB: db, Tasks: taskStore, Events: eventStore,

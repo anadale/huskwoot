@@ -1114,6 +1114,7 @@ func TestChatEndpointsUnavailableIfServiceNotConfigured(t *testing.T) {
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
 		DB: db, Tasks: tasks, Meta: meta, Events: eventStore, Queue: pushQueue, Broker: broker,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
 	})
 
 	srv := api.New(api.Config{

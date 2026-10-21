@@ -195,7 +195,7 @@ func (s *taskService) CreateTasks(ctx context.Context, req model.CreateTasksRequ
 		return nil, fmt.Errorf("получение проекта %s: %w", projectID, err)
 	}
 	if project == nil {
-		return nil, fmt.Errorf("проект %s не найден", projectID)
+		return nil, fmt.Errorf("create tasks in project %q: %w", projectID, ErrProjectNotFound)
 	}
 
 	activeIDs, err := s.devices.ListActiveIDs(ctx)
@@ -208,6 +208,14 @@ func (s *taskService) CreateTasks(ctx context.Context, req model.CreateTasksRequ
 		return nil, fmt.Errorf("открытие транзакции: %w", err)
 	}
 	defer tx.Rollback()
+
+	project, err = s.tasks.GetProjectTx(ctx, tx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("read task destination project %q: %w", projectID, err)
+	}
+	if project == nil {
+		return nil, fmt.Errorf("create tasks in project %q: %w", projectID, ErrProjectNotFound)
+	}
 
 	created := make([]model.Task, 0, len(req.Tasks))
 	pendingEvents := make([]model.Event, 0, len(req.Tasks))

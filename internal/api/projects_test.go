@@ -49,13 +49,14 @@ func newProjectsHarness(t *testing.T) *projectsTestHarness {
 	broker := events.NewBroker(events.BrokerConfig{})
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
-		DB:      db,
-		Tasks:   tasks,
-		Meta:    meta,
-		Events:  eventStore,
-		Devices: nil,
-		Queue:   pushQueue,
-		Broker:  broker,
+		DB:        db,
+		Tasks:     tasks,
+		Meta:      meta,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
+		Events:    eventStore,
+		Devices:   nil,
+		Queue:     pushQueue,
+		Broker:    broker,
 	})
 
 	token := "projects-test-token"
@@ -106,6 +107,283 @@ func decodeJSONResp(t *testing.T, body io.Reader, dst any) {
 }
 
 // ---- tests ----
+
+func TestDeleteProjectEmptyReturnsArray(t *testing.T) {
+	h := newProjectsHarness(t)
+	p, err := h.projectSvc.CreateProject(context.Background(), model.CreateProjectRequest{Name: "Empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := h.do(http.MethodDelete, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]json.RawMessage
+	decodeJSONResp(t, rec.Body, &response)
+	if string(response["movedTasks"]) != "[]" {
+		t.Fatalf("movedTasks=%s want []", response["movedTasks"])
+	}
+	rec = h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET deleted project status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDeleteProjectInboxAndUnknown(t *testing.T) {
+	h := newTasksHarness(t)
+	for _, tc := range []struct {
+		name   string
+		id     string
+		status int
+		code   string
+	}{
+		{name: "Inbox", id: h.inboxID, status: http.StatusForbidden, code: api.ErrorCodeInboxProtected},
+		{name: "unknown", id: "00000000-0000-4000-8000-000000000099", status: http.StatusNotFound, code: api.ErrorCodeNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec := h.do(http.MethodDelete, "/v1/projects/"+tc.id, nil)
+			if rec.Code != tc.status {
+				t.Fatalf("DELETE status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if body := readErrorBody(t, rec.Body); body.Error.Code != tc.code {
+				t.Fatalf("DELETE code=%q want=%q", body.Error.Code, tc.code)
+			}
+			after, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+			if err != nil || after != before {
+				t.Fatalf("rejected deletion emitted events: before=%d after=%d err=%v", before, after, err)
+			}
+		})
+	}
+	rec := h.do(http.MethodGet, "/v1/projects/"+h.inboxID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET Inbox status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+func TestDeleteProjectMovesAllStatusesInOldNumberOrder(t *testing.T) {
+	h := newTasksHarness(t)
+	ctx := context.Background()
+	p, err := h.projectSvc.CreateProject(ctx, model.CreateProjectRequest{Name: "Delete via HTTP"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{Summary: "Existing Inbox task"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Date(2026, time.November, 1, 10, 0, 0, 0, time.UTC)
+	statuses := []string{"open", "done", "cancelled"}
+	ids := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		task, err := h.taskSvc.CreateTask(ctx, model.CreateTaskRequest{
+			ProjectID: p.ID, Summary: "Task " + status, Details: "Preserved details",
+			Topic: "Release", Priority: 2, Deadline: &deadline,
+			Source:        model.Source{Kind: "client", ID: h.device.ID},
+			SourceDetails: &model.TaskSourceDetails{Text: "Synthetic source", Via: "api"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, task.ID)
+		switch status {
+		case "done":
+			if _, err := h.taskSvc.CompleteTask(ctx, task.ID); err != nil {
+				t.Fatal(err)
+			}
+		case "cancelled":
+			if _, err := h.taskSvc.UpdateTask(ctx, task.ID, model.TaskUpdate{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	rec := h.do(http.MethodDelete, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		MovedTasks []json.RawMessage `json:"movedTasks"`
+	}
+	decodeJSONResp(t, rec.Body, &response)
+	if len(response.MovedTasks) != len(ids) {
+		t.Fatalf("movedTasks count=%d want=%d", len(response.MovedTasks), len(ids))
+	}
+	for i, raw := range response.MovedTasks {
+		var task taskResp
+		if err := json.Unmarshal(raw, &task); err != nil {
+			t.Fatal(err)
+		}
+		if task.ID != ids[i] || task.Number != i+3 || task.ProjectID != h.inboxID ||
+			task.ProjectSlug != "inbox" || task.Status != statuses[i] {
+			t.Fatalf("moved task[%d]=%+v", i, task)
+		}
+		if task.Ref == "" || task.Summary != "Task "+statuses[i] || task.Details != "Preserved details" ||
+			task.Topic != "Release" || task.Priority != 2 || task.Deadline == nil ||
+			!task.Deadline.Equal(deadline) || task.Source == nil || task.Source.Text != "Synthetic source" ||
+			task.CreatedAt.IsZero() || task.UpdatedAt.IsZero() || (task.ClosedAt != nil) != (statuses[i] != "open") {
+			t.Fatalf("incomplete moved Task DTO[%d]=%+v", i, task)
+		}
+		got := h.do(http.MethodGet, "/v1/tasks/"+task.ID, nil)
+		if got.Code != http.StatusOK || !bytes.Equal(raw, bytes.TrimSpace(got.Body.Bytes())) {
+			t.Fatalf("moved Task DTO differs from GET: moved=%s GET status=%d body=%s", raw, got.Code, got.Body.String())
+		}
+	}
+	rec = h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET deleted project status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := readErrorBody(t, rec.Body); body.Error.Code != api.ErrorCodeNotFound {
+		t.Fatalf("GET deleted project error=%q", body.Error.Code)
+	}
+}
+
+func TestProjectColorCreateAndReads(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		color *string
+		want  string
+	}{
+		{name: "absent defaults to Auto"},
+		{name: "explicit Auto", color: new("")},
+		{name: "blue", color: new("blue"), want: "blue"},
+		{name: "purple", color: new("purple"), want: "purple"},
+		{name: "teal", color: new("teal"), want: "teal"},
+		{name: "orange", color: new("orange"), want: "orange"},
+		{name: "pink", color: new("pink"), want: "pink"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newProjectsHarness(t)
+			body := map[string]string{"name": "Palette"}
+			if tc.color != nil {
+				body["color"] = *tc.color
+			}
+			rec := h.do(http.MethodPost, "/v1/projects", body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("create status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var created map[string]any
+			decodeJSONResp(t, rec.Body, &created)
+			if value, ok := created["color"]; !ok || value != tc.want {
+				t.Fatalf("created color=%v present=%v want=%q", value, ok, tc.want)
+			}
+			id, ok := created["id"].(string)
+			if !ok || id == "" {
+				t.Fatal("missing project ID")
+			}
+			rec = h.do(http.MethodGet, "/v1/projects/"+id, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("get status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var got map[string]any
+			decodeJSONResp(t, rec.Body, &got)
+			if value, ok := got["color"]; !ok || value != tc.want {
+				t.Fatalf("get color=%v present=%v want=%q", value, ok, tc.want)
+			}
+			rec = h.do(http.MethodGet, "/v1/projects", nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var listed struct {
+				Projects []map[string]any `json:"projects"`
+			}
+			decodeJSONResp(t, rec.Body, &listed)
+			found := false
+			for _, p := range listed.Projects {
+				value, ok := p["color"]
+				if !ok {
+					t.Fatal("list must emit color, including Auto")
+				}
+				if p["id"] == id {
+					found = true
+					if value != tc.want {
+						t.Fatalf("list color=%v want=%q", value, tc.want)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("created project missing from list")
+			}
+		})
+	}
+}
+
+func TestProjectColorPatchOnlyPreserveAndReset(t *testing.T) {
+	h := newProjectsHarness(t)
+	p, err := h.projectSvc.CreateProject(context.Background(), model.CreateProjectRequest{Name: "Palette", Color: "purple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		body map[string]string
+		want string
+	}{
+		{"absent preserves", map[string]string{"description": "Updated"}, "purple"},
+		{"color only", map[string]string{"color": "blue"}, "blue"},
+		{"reset Auto", map[string]string{"color": ""}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := h.do(http.MethodPatch, "/v1/projects/"+p.ID, tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("PATCH status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			var got map[string]any
+			decodeJSONResp(t, rec.Body, &got)
+			if value, ok := got["color"]; !ok || value != tc.want {
+				t.Fatalf("PATCH color=%v present=%v want=%q", value, ok, tc.want)
+			}
+			persisted, err := h.projectSvc.FindProjectByName(context.Background(), "Palette")
+			if err != nil || persisted == nil || persisted.Color != tc.want {
+				t.Fatalf("persisted project=%+v err=%v want color=%q", persisted, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestProjectColorInvalidReturns422WithoutMutation(t *testing.T) {
+	for _, color := range []string{"Blue", " blue", "blue ", "#007AFF", "green", "auto"} {
+		for _, method := range []string{http.MethodPost, http.MethodPatch} {
+			t.Run(method+"_"+color, func(t *testing.T) {
+				h := newProjectsHarness(t)
+				p, err := h.projectSvc.CreateProject(context.Background(), model.CreateProjectRequest{Name: "Palette", Color: "pink"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				before, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				target := "/v1/projects"
+				if method == http.MethodPatch {
+					target += "/" + p.ID
+				}
+				rec := h.do(method, target, map[string]string{"name": "Not persisted", "color": color})
+				if rec.Code != http.StatusUnprocessableEntity {
+					t.Fatalf("status=%d want 422 body=%s", rec.Code, rec.Body.String())
+				}
+				body := readErrorBody(t, rec.Body)
+				if body.Error.Code != api.ErrorCodeColorInvalid {
+					t.Fatalf("error code=%q want color_invalid", body.Error.Code)
+				}
+				projects, err := h.projectSvc.ListProjects(context.Background())
+				if err != nil || len(projects) != 2 {
+					t.Fatalf("projects=%+v err=%v", projects, err)
+				}
+				original, err := h.projectSvc.FindProjectByName(context.Background(), "Palette")
+				if err != nil || original == nil || original.Color != "pink" {
+					t.Fatalf("original mutated: project=%+v err=%v", original, err)
+				}
+				after, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+				if err != nil || after != before {
+					t.Fatalf("invalid request recorded event: before=%d after=%d err=%v", before, after, err)
+				}
+			})
+		}
+	}
+}
 
 func TestGetMeReturnsOwnerAndVersion(t *testing.T) {
 	h := newProjectsHarness(t)
@@ -649,5 +927,72 @@ func TestPatchProjectAliasConflictsWithName(t *testing.T) {
 	body := readErrorBody(t, rec.Body)
 	if body.Error.Code != api.ErrorCodeAliasConflictsWithName {
 		t.Fatalf("code=%q, want %q", body.Error.Code, api.ErrorCodeAliasConflictsWithName)
+	}
+}
+
+func TestProjectInboxProtectionAndEditableMetadata(t *testing.T) {
+	h := newProjectsHarness(t)
+	store, err := storage.NewSQLiteTaskStore(h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := store.DefaultProjectID()
+	for _, body := range []map[string]string{
+		{"name": "Inbox"}, {"name": ""}, {"slug": "inbox"}, {"slug": ""},
+		{"name": "Other", "color": "teal", "description": "blocked"},
+	} {
+		rec := h.do(http.MethodPatch, "/v1/projects/"+id, body)
+		var response struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		decodeJSONResp(t, rec.Body, &response)
+		if rec.Code != http.StatusForbidden || response.Error.Code != "inbox_protected" {
+			t.Fatalf("body=%v status=%d error=%s", body, rec.Code, response.Error.Code)
+		}
+	}
+	rec := h.do(http.MethodPatch, "/v1/projects/"+id, map[string]string{"color": "teal", "description": "Editable"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var p model.Project
+	decodeJSONResp(t, rec.Body, &p)
+	if p.Name != "Inbox" || p.Slug != "inbox" || p.Color != "teal" || p.Description != "Editable" {
+		t.Fatalf("updated Inbox=%+v", p)
+	}
+}
+
+func TestProjectGeneratedSlugsAndExplicitConflict(t *testing.T) {
+	h := newProjectsHarness(t)
+	create := func(name, slug string) model.Project {
+		t.Helper()
+		rec := h.do(http.MethodPost, "/v1/projects", map[string]string{"name": name, "slug": slug})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var p model.Project
+		decodeJSONResp(t, rec.Body, &p)
+		return p
+	}
+	first := create("Работа", "")
+	rec := h.do(http.MethodPatch, "/v1/projects/"+first.ID, map[string]string{"name": "Дом"})
+	var renamed model.Project
+	decodeJSONResp(t, rec.Body, &renamed)
+	if rec.Code != http.StatusOK || renamed.Slug != "rabota" {
+		t.Fatalf("rename status=%d project=%+v", rec.Code, renamed)
+	}
+	if got := create("Работа", "").Slug; got != "rabota-2" {
+		t.Fatalf("slug=%q", got)
+	}
+	for i, name := range []string{"X", "X!", "X?"} {
+		want := []string{"x", "x-2", "x-3"}[i]
+		if got := create(name, "").Slug; got != want {
+			t.Fatalf("slug=%q want=%q", got, want)
+		}
+	}
+	rec = h.do(http.MethodPost, "/v1/projects", map[string]string{"name": "Explicit", "slug": "x"})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }

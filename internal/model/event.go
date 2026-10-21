@@ -27,6 +27,8 @@ const (
 	EventProjectCreated EventKind = "project_created"
 	// EventProjectUpdated — project fields changed (name, description, slug).
 	EventProjectUpdated EventKind = "project_updated"
+	// EventProjectDeleted — a project was deleted; payload contains its top-level id.
+	EventProjectDeleted EventKind = "project_deleted"
 	// EventChatReply — an agent reply in a chat session (DM/GroupDirect).
 	EventChatReply EventKind = "chat_reply"
 	// EventReminderSummary — a periodic digest was generated.

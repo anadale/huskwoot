@@ -17,20 +17,19 @@ type snapshotResponse struct {
 }
 
 type syncHandler struct {
-	projects model.ProjectService
+	projects func(context.Context) ([]model.Project, error)
 	tasks    model.TaskService
 	events   model.EventStore
 	logger   *slog.Logger
 }
 
-func newSyncHandler(projects model.ProjectService, tasks model.TaskService, events model.EventStore, logger *slog.Logger) *syncHandler {
+func newSyncHandler(projects func(context.Context) ([]model.Project, error), tasks model.TaskService, events model.EventStore, logger *slog.Logger) *syncHandler {
 	return &syncHandler{projects: projects, tasks: tasks, events: events, logger: logger}
 }
 
-// snapshot returns a state snapshot. last_seq is read BEFORE reading the
-// collections: if a new event arrives between reading last_seq and reading
-// projects/tasks, the client will catch it via SinceSeq(last_seq). This may
-// cause duplicates during replay but never gaps.
+// snapshot reads the replay cursor before uncached projects and open tasks.
+// The collections may describe different moments after that cursor; this is
+// not a transactional snapshot. Clients retain the original cursor for replay.
 func (h *syncHandler) snapshot(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -41,7 +40,7 @@ func (h *syncHandler) snapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	projects, err := h.projects.ListProjects(ctx)
+	projects, err := h.projects(ctx)
 	if err != nil {
 		h.logError(ctx, "list projects", err)
 		WriteError(w, http.StatusInternalServerError, ErrorCodeInternal, "failed to retrieve projects")

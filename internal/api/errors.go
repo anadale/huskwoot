@@ -19,6 +19,8 @@ const (
 	ErrorCodeInternal         = "internal"
 	ErrorCodeUnavailable      = "unavailable"
 	ErrorCodeTimeout          = "timeout"
+	ErrorCodeColorInvalid     = "color_invalid"
+	ErrorCodeInboxProtected   = "inbox_protected"
 
 	ErrorCodeAliasInvalid           = "alias_invalid"
 	ErrorCodeAliasTaken             = "alias_taken"

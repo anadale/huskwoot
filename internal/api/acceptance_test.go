@@ -287,7 +287,8 @@ func newAcceptanceHarness(t *testing.T, options ...acceptanceHarnessOption) *acc
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
 		DB: db, Tasks: taskStore, Meta: storage.NewSQLiteMetaStore(db), Events: eventStore,
-		Devices: deviceStore, Queue: pushQueue, Broker: broker,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
+		Devices:   deviceStore, Queue: pushQueue, Broker: broker,
 	})
 	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
 		DB: db, Tasks: taskStore, Events: eventStore,
@@ -362,16 +363,17 @@ func newAcceptanceHarness(t *testing.T, options ...acceptanceHarnessOption) *acc
 	token := "acceptance-token"
 	device := createTestDevice(t, db, "acceptance-device", token)
 	srv := api.New(api.Config{
-		Logger:   logger,
-		DB:       db,
-		Devices:  deviceStore,
-		Projects: projectSvc,
-		Tasks:    taskSvc,
-		Chat:     chatSvc,
-		History:  history,
-		Events:   eventStore,
-		Broker:   broker,
-		Owner:    api.OwnerInfo{UserName: "Gregory"},
+		Logger:    logger,
+		DB:        db,
+		Devices:   deviceStore,
+		Projects:  projectSvc,
+		Tasks:     taskSvc,
+		TaskStore: sqliteTasks,
+		Chat:      chatSvc,
+		History:   history,
+		Events:    eventStore,
+		Broker:    broker,
+		Owner:     api.OwnerInfo{UserName: "Gregory"},
 	})
 
 	return &acceptanceHarness{

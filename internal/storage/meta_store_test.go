@@ -3,6 +3,7 @@ package storage_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -258,5 +259,138 @@ func TestSQLiteMetaStore_IsolatedByChannel(t *testing.T) {
 	}
 	if got2 != "Проект-Б" {
 		t.Errorf("ch2: want %q, got %q", "Проект-Б", got2)
+	}
+}
+
+func TestSQLiteMetaStore_DeleteProjectBindingsTx(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		projectID string
+		want      map[string]string
+	}{
+		{
+			name:      "matching bindings removed",
+			projectID: "target",
+			want: map[string]string{
+				"project:first":   "",
+				"project:second":  "",
+				"project:similar": "target-extra",
+				"project:other":   "other",
+			},
+		},
+		{
+			name:      "missing project is a no-op",
+			projectID: "missing",
+			want: map[string]string{
+				"project:first":   "target",
+				"project:second":  "target",
+				"project:similar": "target-extra",
+				"project:other":   "other",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			store := storage.NewSQLiteMetaStore(db)
+			ctx := context.Background()
+			for key, value := range map[string]string{
+				"project:first":   "target",
+				"project:second":  "target",
+				"project:similar": "target-extra",
+				"project:other":   "other",
+			} {
+				if err := setMetaHelper(t, db, store, key, value); err != nil {
+					t.Fatalf("SetTx(%q): %v", key, err)
+				}
+			}
+			if err := withTx(t, db, func(tx *sql.Tx) error {
+				return store.DeleteProjectBindingsTx(ctx, tx, tc.projectID)
+			}); err != nil {
+				t.Fatalf("DeleteProjectBindingsTx: %v", err)
+			}
+			for key, want := range tc.want {
+				got, err := store.Get(ctx, key)
+				if err != nil {
+					t.Fatalf("Get(%q): %v", key, err)
+				}
+				if got != want {
+					t.Errorf("Get(%q) = %q, want %q", key, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestSQLiteMetaStore_DeleteProjectBindingsTx_Empty(t *testing.T) {
+	db := openTestDB(t)
+	store := storage.NewSQLiteMetaStore(db)
+	ctx := context.Background()
+	if err := withTx(t, db, func(tx *sql.Tx) error {
+		return store.DeleteProjectBindingsTx(ctx, tx, "missing")
+	}); err != nil {
+		t.Fatalf("DeleteProjectBindingsTx: %v", err)
+	}
+	values, err := store.Values(ctx, "project:")
+	if err != nil {
+		t.Fatalf("Values: %v", err)
+	}
+	if len(values) != 0 {
+		t.Fatalf("Values = %v, want no bindings", values)
+	}
+}
+
+func TestSQLiteMetaStore_DeleteProjectBindingsTx_Rollback(t *testing.T) {
+	db := openTestDB(t)
+	store := storage.NewSQLiteMetaStore(db)
+	ctx := context.Background()
+	for _, key := range []string{"project:first", "project:second"} {
+		if err := setMetaHelper(t, db, store, key, "target"); err != nil {
+			t.Fatalf("SetTx(%q): %v", key, err)
+		}
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	defer tx.Rollback()
+	if err := store.DeleteProjectBindingsTx(ctx, tx, "target"); err != nil {
+		t.Fatalf("DeleteProjectBindingsTx: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	for _, key := range []string{"project:first", "project:second"} {
+		got, err := store.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		if got != "target" {
+			t.Errorf("Get(%q) after rollback = %q, want target", key, got)
+		}
+	}
+}
+
+func TestSQLiteMetaStore_DeleteProjectBindingsTx_ClosedTransaction(t *testing.T) {
+	db := openTestDB(t)
+	store := storage.NewSQLiteMetaStore(db)
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTx: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	err = store.DeleteProjectBindingsTx(ctx, tx, "target")
+	if !errors.Is(err, sql.ErrTxDone) {
+		t.Fatalf("DeleteProjectBindingsTx error = %v, want wrapped sql.ErrTxDone", err)
+	}
+}
+
+func TestSQLiteMetaStore_DeleteProjectBindingsTx_NilTransaction(t *testing.T) {
+	db := openTestDB(t)
+	store := storage.NewSQLiteMetaStore(db)
+	if err := store.DeleteProjectBindingsTx(context.Background(), nil, "target"); err == nil {
+		t.Fatal("DeleteProjectBindingsTx with nil transaction should return an error")
 	}
 }

@@ -21,8 +21,8 @@ const (
 	lastEventIDHeader = "Last-Event-ID"
 )
 
-// sseReplayBatchSize is the upper limit for a single SinceSeq call during replay.
-// Declared as var so tests can substitute a smaller value without creating hundreds of events.
+// sseReplayBatchSize bounds each materialized durable event page.
+// Tests can substitute a smaller value without creating hundreds of events.
 var sseReplayBatchSize = 500
 
 type eventsHandler struct {
@@ -36,9 +36,8 @@ func newEventsHandler(eventStore model.EventStore, broker model.Broker, heartbea
 	return &eventsHandler{events: eventStore, broker: broker, heartbeat: heartbeat, logger: logger}
 }
 
-// stream handles GET /v1/events: performs replay from Last-Event-ID,
-// subscribes to the broker, and streams live events with periodic keepalive.
-// Always unsubscribes from the broker before returning.
+// stream subscribes before establishing its initial durable mark. Broker payloads
+// are wakeups only; SQL supplies every frame, in durable sequence order.
 func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -54,7 +53,18 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	deviceID := DeviceIDFromContext(ctx)
-	lastID := parseLastEventID(r.Header.Get(lastEventIDHeader))
+	cursor, replay := parseLastEventID(r.Header.Get(lastEventIDHeader))
+	ch, cancel := h.broker.Subscribe(deviceID)
+	defer cancel()
+	target, err := h.events.MaxSeq(ctx)
+	if err != nil {
+		h.logError(ctx, "initial MaxSeq", err)
+		WriteError(w, http.StatusInternalServerError, ErrorCodeInternal, "failed to read event cursor")
+		return
+	}
+	if !replay {
+		cursor = target
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -63,20 +73,12 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	ch, cancel := h.broker.Subscribe(deviceID)
-	defer cancel()
-
-	// replayedSeq is the highest seq delivered during the replay phase. An event
-	// with the same seq may already be in the broker channel (Broker.Notify fired
-	// between Subscribe and replay) — the live loop must drop it to avoid the
-	// client seeing a duplicate seq.
-	var replayedSeq int64
-	if lastID > 0 {
-		seq, okReplay := h.replay(ctx, w, flusher, lastID)
-		if !okReplay {
+	if replay {
+		var keepGoing bool
+		cursor, keepGoing = h.drainThrough(ctx, w, flusher, cursor, target)
+		if !keepGoing {
 			return
 		}
-		replayedSeq = seq
 	}
 
 	heartbeat := h.heartbeat
@@ -86,9 +88,7 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
 
-	// Сразу после подключения шлём keepalive с текущим maxSeq, чтобы клиент
-	// немедленно (не дожидаясь первого тика) узнал, насколько он отстаёт.
-	if !h.writeKeepalive(ctx, w, flusher) {
+	if !writeKeepalive(w, flusher, target) {
 		return
 	}
 
@@ -96,108 +96,100 @@ func (h *eventsHandler) stream(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case ev, open := <-ch:
-			if !open {
-				// Broker disconnected a slow subscriber. The client will reconnect
-				// and replay from Last-Event-ID.
-				return
-			}
-			if ev.Seq <= replayedSeq {
-				continue
-			}
-			if !writeSSEEvent(w, flusher, ev) {
+		case _, open := <-ch:
+			if !open || !h.broker.IsActive(deviceID) {
 				return
 			}
 		case <-ticker.C:
-			if !h.writeKeepalive(ctx, w, flusher) {
+			if !h.broker.IsActive(deviceID) {
 				return
 			}
+		}
+		target, err = h.events.MaxSeq(ctx)
+		if err != nil {
+			h.logError(ctx, "wake MaxSeq", err)
+			return
+		}
+		if ctx.Err() != nil || !h.broker.IsActive(deviceID) {
+			return
+		}
+		var keepGoing bool
+		cursor, keepGoing = h.drainThrough(ctx, w, flusher, cursor, target)
+		if !keepGoing || !writeKeepalive(w, flusher, target) {
+			return
 		}
 	}
 }
 
-// writeKeepalive sends a heartbeat comment carrying the server's current max
-// event seq, e.g. ":keepalive 105\n\n". The client compares it to its own
-// cursor to compute how many events it is behind — this surfaces divergence
-// even on a silently stalled stream (the connection looks alive but delivers
-// nothing). On a MaxSeq error a plain ":keepalive\n\n" is sent: the connection
-// is still alive, only the seq is unknown for this tick.
-func (h *eventsHandler) writeKeepalive(ctx context.Context, w http.ResponseWriter, flusher http.Flusher) bool {
-	maxSeq, err := h.events.MaxSeq(ctx)
-	if err != nil {
-		h.logError(ctx, "keepalive MaxSeq", err)
-		if _, werr := fmt.Fprint(w, ":keepalive\n\n"); werr != nil {
-			return false
-		}
-		flusher.Flush()
-		return true
-	}
-	if _, werr := fmt.Fprintf(w, ":keepalive %d\n\n", maxSeq); werr != nil {
+// writeKeepalive reports a server mark, not a client acknowledgement.
+func writeKeepalive(w http.ResponseWriter, flusher http.Flusher, maxSeq int64) bool {
+	if _, err := fmt.Fprintf(w, ":keepalive %d\n\n", maxSeq); err != nil {
 		return false
 	}
 	flusher.Flush()
 	return true
 }
 
-// replay page-fetches events with seq > lastID. Returns the last actually
-// delivered seq and a continuation flag: false means close the connection
-// (reset or error), true means proceed in live mode.
-// The upper bound is fixed by a MaxSeq snapshot on entry: new events
-// (seq > maxSeq) will arrive via the broker channel opened before replay.
-func (h *eventsHandler) replay(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, lastID int64) (int64, bool) {
-	maxSeq, err := h.events.MaxSeq(ctx)
-	if err != nil {
-		h.logError(ctx, "replay MaxSeq", err)
-		return 0, false
-	}
-
-	// Client cursor is ahead of the server: retention wipe or instance was recreated.
-	if lastID > maxSeq {
-		writeResetEvent(w, flusher, maxSeq)
-		return 0, false
-	}
-
-	// Retention deletes events from the head of the sequence by created_at, and seq
-	// is monotonically increasing with time, so retention always leaves a contiguous
-	// tail starting from some MinSeq. Natural AUTOINCREMENT gaps arise after
-	// transaction rollbacks and do not indicate retention loss. The check
-	// "MinSeq > lastID+1" reliably distinguishes a retention loss (the client
-	// genuinely missed events) from a rollback gap (nothing was lost).
-	minSeq, err := h.events.MinSeq(ctx)
-	if err != nil {
-		h.logError(ctx, "replay MinSeq", err)
-		return 0, false
-	}
-	if minSeq > 0 && minSeq > lastID+1 {
-		writeResetEvent(w, flusher, maxSeq)
-		return 0, false
-	}
-
-	cursor := lastID
-	for cursor < maxSeq {
-		if err := ctx.Err(); err != nil {
+// drainThrough delivers retained SQL rows through a fixed target. Bounds are read
+// after each page is materialized, before any of that page's frames are written.
+// Retention by source timestamp can leave non-prefix holes invisible to MinSeq;
+// numeric gaps alone therefore never imply lost events.
+func (h *eventsHandler) drainThrough(ctx context.Context, w http.ResponseWriter, flusher http.Flusher, cursor, target int64) (int64, bool) {
+	for {
+		if ctx.Err() != nil {
 			return cursor, false
 		}
-		batch, err := h.events.SinceSeq(ctx, cursor, sseReplayBatchSize)
+		page, err := h.events.SinceSeq(ctx, cursor, sseReplayBatchSize)
 		if err != nil {
-			h.logError(ctx, "replay SinceSeq", err)
+			h.logError(ctx, "drain SinceSeq", err)
 			return cursor, false
 		}
-		if len(batch) == 0 {
-			// No data in the range (cursor, maxSeq]. Retention loss was already
-			// ruled out by the MinSeq check above, so we get here only when all
-			// seq values between cursor and maxSeq are AUTOINCREMENT gaps. Just
-			// finish replay.
+		minSeq, err := h.events.MinSeq(ctx)
+		if err != nil {
+			h.logError(ctx, "drain MinSeq", err)
+			return cursor, false
+		}
+		maxSeq, err := h.events.MaxSeq(ctx)
+		if err != nil {
+			h.logError(ctx, "drain MaxSeq", err)
+			return cursor, false
+		}
+		if cursor > maxSeq || (minSeq > cursor && minSeq-cursor > 1) {
+			writeResetEvent(w, flusher, maxSeq)
+			return cursor, false
+		}
+		if ctx.Err() != nil || (h.broker != nil && !h.broker.IsActive(DeviceIDFromContext(ctx))) {
+			return cursor, false
+		}
+		if cursor >= target {
 			return cursor, true
 		}
-		for _, ev := range batch {
-			if !writeSSEEvent(w, flusher, ev) {
+		if len(page) == 0 {
+			// Bounds were rechecked after the empty read. Without detectable
+			// loss there is still no safe acknowledgement of the missing tail.
+			return cursor, false
+		}
+		advanced := false
+		for _, ev := range page {
+			if ev.Seq > target {
+				return cursor, true
+			}
+			if ev.Seq <= cursor {
+				continue
+			}
+			if ctx.Err() != nil || !writeSSEEvent(w, flusher, ev) {
 				return cursor, false
 			}
+			cursor = ev.Seq
+			advanced = true
+			if cursor == target {
+				return cursor, true
+			}
 		}
-		cursor = batch[len(batch)-1].Seq
+		if !advanced {
+			return cursor, false
+		}
 	}
-	return cursor, true
 }
 
 func (h *eventsHandler) logError(ctx context.Context, op string, err error) {
@@ -234,15 +226,20 @@ func writeResetEvent(w http.ResponseWriter, flusher http.Flusher, maxSeq int64) 
 	flusher.Flush()
 }
 
-// parseLastEventID parses the Last-Event-ID header. An empty or invalid
-// string is treated as 0 (client connecting for the first time).
-func parseLastEventID(header string) int64 {
+// parseLastEventID distinguishes explicit zero (replay) from a missing or invalid
+// cursor (new events only). Only nonnegative decimal int64 values are accepted.
+func parseLastEventID(header string) (int64, bool) {
 	if header == "" {
-		return 0
+		return 0, false
+	}
+	for _, digit := range header {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
 	}
 	n, err := strconv.ParseInt(header, 10, 64)
-	if err != nil || n < 0 {
-		return 0
+	if err != nil {
+		return 0, false
 	}
-	return n
+	return n, true
 }

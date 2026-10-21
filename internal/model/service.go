@@ -41,6 +41,8 @@ type CreateProjectRequest struct {
 	Slug string
 	// Description is the project description (optional).
 	Description string
+	// Color is the theme palette slot (optional; empty string selects Auto).
+	Color string
 	// Aliases is the initial set of keyword aliases (optional; validated in the use-case layer).
 	Aliases []string
 }
@@ -90,12 +92,15 @@ type ProjectService interface {
 	CreateProject(ctx context.Context, req CreateProjectRequest) (*Project, error)
 	// UpdateProject applies changes to a project.
 	UpdateProject(ctx context.Context, id string, upd ProjectUpdate) (*Project, error)
+	// DeleteProject moves every task to Inbox and deletes the project atomically.
+	// Returned tasks retain their original project-number order.
+	DeleteProject(ctx context.Context, id string) ([]Task, error)
 	// ListProjects returns all projects.
 	ListProjects(ctx context.Context) ([]Project, error)
 	// FindProjectByName finds a project by name. Returns nil, nil if not found.
 	FindProjectByName(ctx context.Context, name string) (*Project, error)
 	// ResolveProjectForChannel returns the UUID of the project bound to the given channel.
-	// If no mapping is found, returns the Inbox ID.
+	// If no mapping exists or its project was deleted, returns the Inbox ID.
 	ResolveProjectForChannel(ctx context.Context, channelID string) (string, error)
 	// EnsureChannelProject idempotently creates a project and binds it to the channel.
 	EnsureChannelProject(ctx context.Context, channelID, name string) (*Project, error)

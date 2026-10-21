@@ -23,6 +23,7 @@ type projectDTO struct {
 	Slug        string    `json:"slug"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
+	Color       string    `json:"color"`
 	Aliases     []string  `json:"aliases"`
 	TaskCounter int       `json:"taskCounter"`
 	CreatedAt   time.Time `json:"createdAt"`
@@ -38,6 +39,7 @@ func toProjectDTO(p *model.Project) projectDTO {
 		Slug:        p.Slug,
 		Name:        p.Name,
 		Description: p.Description,
+		Color:       p.Color,
 		Aliases:     aliases,
 		TaskCounter: p.TaskCounter,
 		CreatedAt:   p.CreatedAt,
@@ -49,16 +51,18 @@ type createProjectRequest struct {
 	Name        string   `json:"name"`
 	Slug        string   `json:"slug,omitempty"`
 	Description string   `json:"description,omitempty"`
+	Color       string   `json:"color,omitempty"`
 	Aliases     []string `json:"aliases,omitempty"`
 }
 
 // updateProjectRequest is the request body for PATCH /v1/projects/{id}. Omitted fields are
-// left unchanged; an empty string is treated as an explicit clear (for Description).
+// left unchanged; an empty string explicitly clears Description or resets Color to Auto.
 // Aliases, when present, replaces the full alias set (replace-set semantics).
 type updateProjectRequest struct {
 	Name        *string   `json:"name,omitempty"`
 	Slug        *string   `json:"slug,omitempty"`
 	Description *string   `json:"description,omitempty"`
+	Color       *string   `json:"color,omitempty"`
 	Aliases     *[]string `json:"aliases,omitempty"`
 }
 
@@ -125,9 +129,14 @@ func (h *projectsHandler) create(w http.ResponseWriter, r *http.Request) {
 		Name:        req.Name,
 		Slug:        req.Slug,
 		Description: req.Description,
+		Color:       req.Color,
 		Aliases:     req.Aliases,
 	})
 	if err != nil {
+		if errors.Is(err, usecase.ErrColorInvalid) {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeColorInvalid, err.Error())
+			return
+		}
 		if isUniqueConstraintErr(err) {
 			WriteError(w, http.StatusConflict, ErrorCodeConflict, "project with this name or slug already exists")
 			return
@@ -150,14 +159,22 @@ func (h *projectsHandler) update(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusBadRequest, ErrorCodeBadRequest, err.Error())
 		return
 	}
-	if req.Name == nil && req.Slug == nil && req.Description == nil && req.Aliases == nil {
+	if req.Name == nil && req.Slug == nil && req.Description == nil && req.Color == nil && req.Aliases == nil {
 		WriteError(w, http.StatusUnprocessableEntity, ErrorCodeUnprocessable, "no fields provided")
 		return
 	}
 
-	upd := model.ProjectUpdate{Name: req.Name, Slug: req.Slug, Description: req.Description, Aliases: req.Aliases}
+	upd := model.ProjectUpdate{Name: req.Name, Slug: req.Slug, Description: req.Description, Color: req.Color, Aliases: req.Aliases}
 	p, err := h.service.UpdateProject(r.Context(), id, upd)
 	if err != nil {
+		if errors.Is(err, usecase.ErrInboxProtected) {
+			WriteError(w, http.StatusForbidden, ErrorCodeInboxProtected, err.Error())
+			return
+		}
+		if errors.Is(err, usecase.ErrColorInvalid) {
+			WriteError(w, http.StatusUnprocessableEntity, ErrorCodeColorInvalid, err.Error())
+			return
+		}
 		if errors.Is(err, usecase.ErrProjectNotFound) {
 			WriteError(w, http.StatusNotFound, ErrorCodeNotFound, "project not found")
 			return
@@ -175,6 +192,28 @@ func (h *projectsHandler) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, toProjectDTO(p))
+}
+
+func (h *projectsHandler) delete(w http.ResponseWriter, r *http.Request) {
+	moved, err := h.service.DeleteProject(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		if errors.Is(err, usecase.ErrInboxProtected) {
+			WriteError(w, http.StatusForbidden, ErrorCodeInboxProtected, err.Error())
+			return
+		}
+		if isNotFoundErr(err) {
+			WriteError(w, http.StatusNotFound, ErrorCodeNotFound, "project not found")
+			return
+		}
+		h.logError(r.Context(), "delete project", err)
+		WriteError(w, http.StatusInternalServerError, ErrorCodeInternal, "failed to delete project")
+		return
+	}
+	out := make([]taskDTO, 0, len(moved))
+	for i := range moved {
+		out = append(out, toTaskDTO(&moved[i]))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"movedTasks": out})
 }
 
 func (h *projectsHandler) logError(ctx context.Context, op string, err error) {

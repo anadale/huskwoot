@@ -11,6 +11,7 @@ import (
 
 	huskwootI18n "github.com/anadale/huskwoot/internal/i18n"
 	"github.com/anadale/huskwoot/internal/model"
+	"github.com/anadale/huskwoot/internal/usecase"
 )
 
 type updateProjectTool struct {
@@ -92,6 +93,9 @@ func (t *updateProjectTool) Execute(ctx context.Context, args string) (string, e
 
 	updated, err := t.projects.UpdateProject(ctx, p.ID, upd)
 	if err != nil {
+		if errors.Is(err, usecase.ErrInboxProtected) {
+			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_inbox_protected", nil))
+		}
 		if isProjectUniqueConstraintErr(err) {
 			return "", errors.New(huskwootI18n.Translate(t.loc, "agent_project_slug_conflict", nil))
 		}

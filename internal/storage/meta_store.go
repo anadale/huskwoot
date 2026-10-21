@@ -65,6 +65,17 @@ func (s *SQLiteMetaStore) SetTx(ctx context.Context, tx *sql.Tx, key, value stri
 	return nil
 }
 
+// DeleteProjectBindingsTx removes bindings to the project within the given transaction.
+func (s *SQLiteMetaStore) DeleteProjectBindingsTx(ctx context.Context, tx *sql.Tx, projectID string) error {
+	if tx == nil {
+		return fmt.Errorf("deleting project bindings %q: tx cannot be nil", projectID)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM channel_projects WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("deleting project bindings %q: %w", projectID, err)
+	}
+	return nil
+}
+
 // Values returns all values whose keys start with the given prefix.
 // Returns nil, nil if no matching keys are found.
 // Supported prefix: "project:".

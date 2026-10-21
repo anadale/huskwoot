@@ -50,13 +50,14 @@ func newTasksHarness(t *testing.T) *tasksTestHarness {
 	deviceStore := devices.NewSQLiteDeviceStore(db)
 
 	projectSvc := usecase.NewProjectService(usecase.ProjectServiceDeps{
-		DB:      db,
-		Tasks:   tasks,
-		Meta:    meta,
-		Events:  eventStore,
-		Devices: deviceStore,
-		Queue:   pushQueue,
-		Broker:  broker,
+		DB:        db,
+		Tasks:     tasks,
+		Meta:      meta,
+		AutoTasks: storage.NewSQLiteAutoTaskStore(db),
+		Events:    eventStore,
+		Devices:   deviceStore,
+		Queue:     pushQueue,
+		Broker:    broker,
 	})
 	taskSvc := usecase.NewTaskService(usecase.TaskServiceDeps{
 		DB:      db,
@@ -151,6 +152,162 @@ type listResp struct {
 }
 
 // ---- tests ----
+
+func TestCreateTaskDeletedDestinationReturns404BeforePrecheck(t *testing.T) {
+	h := newTasksHarness(t)
+	p, err := h.projectSvc.CreateProject(context.Background(), model.CreateProjectRequest{Name: "Already deleted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET before deletion status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = h.do(http.MethodDelete, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	before, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec = h.do(http.MethodPost, "/v1/tasks", map[string]string{"projectId": p.ID, "summary": "Do not create"})
+	assertTaskDestinationNotFound(t, rec)
+	rec = h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	assertTaskDestinationNotFound(t, rec)
+	after, err := events.NewSQLiteEventStore(h.db).MaxSeq(context.Background())
+	if err != nil || after != before {
+		t.Fatalf("failed create emitted events: before=%d after=%d err=%v", before, after, err)
+	}
+}
+
+type taskCreatePrecheckBarrier struct {
+	model.DeviceStore
+	started chan struct{}
+	resume  chan struct{}
+}
+
+func (b *taskCreatePrecheckBarrier) ListActiveIDs(ctx context.Context) ([]string, error) {
+	close(b.started)
+	select {
+	case <-b.resume:
+		return b.DeviceStore.ListActiveIDs(ctx)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestCreateTaskDestinationDeletedAfterPrecheckReturns404(t *testing.T) {
+	h := newTasksHarness(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p, err := h.projectSvc.CreateProject(ctx, model.CreateProjectRequest{Name: "Deleted between check and write"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := storage.NewSQLiteTaskStore(h.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &taskCreatePrecheckBarrier{
+		DeviceStore: devices.NewSQLiteDeviceStore(h.db),
+		started:     make(chan struct{}), resume: make(chan struct{}),
+	}
+	taskService := usecase.NewTaskService(usecase.TaskServiceDeps{
+		DB: h.db, Tasks: raw, Devices: barrier,
+		Events: events.NewSQLiteEventStore(h.db),
+		Queue:  push.NewSQLitePushQueue(h.db), Broker: events.NewBroker(events.BrokerConfig{}),
+	})
+	server := api.New(api.Config{
+		DB: h.db, Devices: barrier.DeviceStore, Projects: h.projectSvc, Tasks: taskService,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	body, err := json.Marshal(map[string]string{"projectId": p.ID, "summary": "Must not survive deletion"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks", bytes.NewReader(body)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+h.token)
+	req.Header.Set("Content-Type", "application/json")
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, req)
+		result <- rec
+	}()
+	// The real TaskService has finished GetProject but has not begun its write transaction.
+	select {
+	case <-barrier.started:
+	case rec := <-result:
+		t.Fatalf("POST completed before precheck barrier: status=%d body=%s", rec.Code, rec.Body.String())
+	case <-ctx.Done():
+		t.Fatal("task create did not reach precheck barrier")
+	}
+	rec := h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET at precheck status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	rec = h.do(http.MethodDelete, "/v1/projects/"+p.ID, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE before write status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	before, err := events.NewSQLiteEventStore(h.db).MaxSeq(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.resume)
+	select {
+	case rec := <-result:
+		assertTaskDestinationNotFound(t, rec)
+	case <-ctx.Done():
+		t.Fatal("task create did not finish after deletion committed")
+	}
+	rec = h.do(http.MethodGet, "/v1/projects/"+p.ID, nil)
+	assertTaskDestinationNotFound(t, rec)
+	after, err := events.NewSQLiteEventStore(h.db).MaxSeq(ctx)
+	if err != nil || after != before {
+		t.Fatalf("failed tx create emitted events: before=%d after=%d err=%v", before, after, err)
+	}
+	tasks, err := h.taskSvc.ListTasks(ctx, "", model.TaskFilter{})
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("failed create persisted tasks=%+v err=%v", tasks, err)
+	}
+}
+
+func TestCreateTaskInvalidInputIs422NotMissingProject(t *testing.T) {
+	h := newTasksHarness(t)
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{name: "blank summary", body: map[string]any{"projectId": h.inboxID, "summary": " "}},
+		{name: "invalid priority", body: map[string]any{"projectId": h.inboxID, "summary": "Valid", "priority": 4}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := h.do(http.MethodPost, "/v1/tasks", tc.body)
+			if rec.Code != http.StatusUnprocessableEntity {
+				t.Fatalf("POST status=%d want 422 body=%s", rec.Code, rec.Body.String())
+			}
+			if body := readErrorBody(t, rec.Body); body.Error.Code != api.ErrorCodeUnprocessable {
+				t.Fatalf("POST invalid input code=%q", body.Error.Code)
+			}
+			rec = h.do(http.MethodGet, "/v1/projects/"+h.inboxID, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET valid project status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func assertTaskDestinationNotFound(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d want 404 body=%s", rec.Code, rec.Body.String())
+	}
+	if body := readErrorBody(t, rec.Body); body.Error.Code != api.ErrorCodeNotFound {
+		t.Fatalf("error code=%q want not_found", body.Error.Code)
+	}
+}
 
 func TestListTasksFilterByProjectAndStatus(t *testing.T) {
 	h := newTasksHarness(t)

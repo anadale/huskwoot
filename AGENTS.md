@@ -117,6 +117,10 @@ Receipts, decisions, tasks, events, push jobs, and buffer `Finalize` are atomic.
 
 On a `UIDVALIDITY` change, `monitor` resets to `UIDNEXT-1` and skips existing email; backfill restarts from UID 1 with generation-specific receipts. Deploying this routing does not proactively replay historical email behind an existing cursor.
 
+Project deletion and automatic submission have different destination semantics. Explicit `TaskService.CreateTasks` wraps `ErrProjectNotFound` (preserving `errors.Is`) both when the preliminary `GetProject` finds no destination and when `GetProjectTx` finds it missing before writes; REST maps both boundaries to 404 `not_found`, not 422 or a string-classified 500. Only `AutoTaskService.Submit` redirects a vanished non-Inbox destination: `errAutoTaskDestinationMissing` is produced only by a nil, error-free transactional project read. It switches the effective destination to Inbox and repeats the complete revision → references → assessment → commit cycle, rebuilding candidates and within-batch references rather than patching an assessed payload or re-extracting source text. A revision change retries the current destination; missing Inbox, cancellation and unrelated storage errors terminate.
+
+Submission reads original `InputKeys` and committed receipts before destination/reference lookup. A committed replay after deletion skips assessment and creation but still executes `Finalize`. The write transaction rechecks revision then destination, and atomically saves candidates/tasks/events/push, original receipts and `Finalize`; failures roll everything back. Forward finalization deletes only captured buffer IDs, preserving forwards received during inference. `Decide` rereads the candidate with `GetCandidateTx`, uses its reassigned destination without a separate fallback, preserves question metadata, and records the first decision/created task atomically. Repeated decisions return the recorded result without another task.
+
 ### Task source details and priority
 
 Every task stores a snapshot of where it came from in `tasks.source_details` (JSON of `model.TaskSourceDetails`, migration `016_task_priority_source.sql`). It is taken at creation time and never points at `messages`: channel history is trimmed by TTL and `MaxMessages`, so a reference would rot. Fields: `Name` (chat title or mailbox), `Subject` (IMAP), `Author`, `Text`, `At`, `ReplyTo{Author, Text}`, `Link`, `Via`. `Capped()` truncates `Text` to 1000 runes and `ReplyTo.Text` to 500; `CreateTaskTx` stores the capped copy. An empty or malformed column reads as `nil` details without failing the read. `source_kind`/`source_id` keep their meaning.
@@ -169,6 +173,8 @@ Pipeline `processForwardBatch`:
 7. If `DeleteForwardsAfterExtract && len(result.Created) > 0`: call `payload.DeleteFn`; errors → `slog.Warn` only.
 8. Reply with created tasks and counts of pending candidates and skipped duplicates.
 
+Forward confirmation uses `result.Created[0].ProjectID`: when Submit has redirected creation to Inbox, the reply names Inbox rather than the originally captured project name. It performs no second Submit or postcommit project GET.
+
 Transactional invariant: "decisions + tasks + snapshot buffer clear" are atomic. New forwards arriving during inference remain buffered. On crash between commit and Telegram delete, results are saved and forwards may remain in DM. Sweeper handles restart recovery.
 
 ### TelegramChannel.Watch internals
@@ -189,7 +195,22 @@ For Group messages, `watchHandler` waits for `Pipeline.Process` before acknowled
 
 ### MetaStore and project binding
 
-Key `"project:"+channelID` → `projectID`. `ProjectService.ResolveProjectForChannel(channelID)` — lookup in MetaStore, fallback to `DefaultProjectID()` (Inbox).
+Key `"project:"+channelID` → `projectID`. `ProjectService.ResolveProjectForChannel(channelID)` is read-only: an empty binding returns `DefaultProjectID()` (Inbox); a nonempty binding is checked with uncached `GetProject`, missing projects fall back to Inbox, and read errors propagate. It never deletes a potentially concurrently replaced binding. `EnsureChannelProject` rechecks an externally found project with `GetProjectTx` inside the binding transaction and binds the fresh object; nil returns `ErrProjectNotFound`, and read errors propagate, without binding, replacement creation or project event. An initially absent name still creates a project. Explicit `set_project` does not silently redirect to Inbox; deletion after successful resolution still makes explicit task creation fail with typed not-found.
+
+### Project management contracts
+
+`Project.Color` is a persistent theme palette slot: `""` (Auto), `blue`, `purple`, `teal`, `orange`, or `pink`, never a stored hex color. All project reads and REST/event snapshots include color. POST omission uses Auto; PATCH omission keeps the current value and `{"color":""}` resets it. Color-only PATCH is valid; unsupported values return `ErrColorInvalid` → 422 `color_invalid`. `project_updated.changedFields` is ordered `name`, `description`, `slug`, `color`, `aliases`. Supplied scalar fields are listed even when their values are unchanged; `aliases` is listed only when the alias set changes.
+
+Inbox is identified by `DefaultProjectID()`. Any supplied Name or Slug update, even an unchanged value, and deletion return `ErrInboxProtected` → 403 `inbox_protected`; color and description remain editable. The agent exposes a localized protected-operation error. An ordinary rename never changes the slug. `CreateProject` and initially absent `EnsureChannelProject` allocate inferred slugs within the create transaction: first unused `Slugify(name)`, then `-2`, `-3`, etc. Explicit occupied slugs remain 409; project names are also unique.
+
+`ProjectService.DeleteProject(ctx, id) ([]model.Task, error)` requires `ProjectServiceDeps.AutoTasks`. Production constructs `storage.NewSQLiteAutoTaskStore(db)` unconditionally before ProjectService, including without Telegram, and shares it with `AutoTaskServiceDeps.Store` when automatic extraction is enabled. Dormant candidates must remain reassignable.
+
+Deletion rejects Inbox, then atomically reassigns every candidate status (both `project_id` and decoded `Task.ProjectID`, preserving question/decision metadata), removes only bindings to the deleted project, moves every open/done/cancelled task to Inbox in ascending old-number order using new Inbox counter values, and deletes the project (aliases cascade). It rereads moved tasks and inserts one wrapped `task_moved` per task followed by `project_deleted`, then commits before cache invalidation and ordered Broker notification. Failure rolls back all state and events. `DELETE /v1/projects/{id}` returns 200 `{"movedTasks":[...]}` with full REST task DTOs in move order, or 404 `not_found` for a missing project. `project_deleted` has entity_id equal to the project UUID and top-level data `{"id":"..."}`, with no push notification; it is deliberately distinct from physical purge's wrapped `task_deleted` data `{"task":{...}}`, whose identifier is `data.task.id`.
+
+Exact transaction-aware store ownership:
+- `AutoTaskStore.ReassignProjectTx(ctx, tx, fromProjectID, toProjectID string) error` updates every candidate status, its project column and JSON task payload while retaining metadata.
+- `MetaStore.DeleteProjectBindingsTx(ctx, tx, projectID string) error` removes only that project's channel bindings.
+- `TaskStore.DeleteProjectTx(ctx, tx, projectID, inboxID string) ([]string, error)` moves all tasks in old-number order through `MoveTaskTx`, deletes the project last, returns ordered task IDs, and reports `sql.ErrNoRows` when the project is missing.
 
 ## SQLite stores
 
@@ -197,9 +218,9 @@ All backed by a single `huskwoot.db`. `storage.OpenDB` enables WAL, foreign keys
 
 Stores:
 - `SQLiteStateStore` — read cursors. Table `cursors`.
-- `SQLiteMetaStore` — channel metadata. Table `channel_projects`. Single write method: `SetTx(ctx, tx, key, value)`.
+- `SQLiteMetaStore` — channel metadata. Table `channel_projects`. Tx-aware writes: `SetTx(ctx, tx, key, value)` and `DeleteProjectBindingsTx(ctx, tx, projectID)`.
 - `SQLiteTaskStore` — projects and tasks. Automatically inserts Inbox on creation (INSERT OR IGNORE). Write methods are tx-aware; for reads inside a transaction: `GetProjectTx`, `GetTaskTx`. Project aliases are stored in `project_aliases` table (1:N with `ON DELETE CASCADE`); new tx-aware methods: `AddProjectAliasTx`, `RemoveProjectAliasTx`, `ListAliasesForProject`. `ListClosedOlderThan(ctx, cutoff)` returns full snapshots of `done`/`cancelled` tasks whose `closed_at < cutoff`; `DeleteTaskTx(ctx, tx, id)` physically removes a task by id within the caller's transaction. Both are used by `TaskService.PurgeClosedOlderThan` so it can emit `task_deleted` events transactionally with the delete; the `idx_tasks_status_closed_at` index speeds up the list query. Columns `priority` and `source_details` (migration `016_task_priority_source.sql`) are written and read on every task path; see "Task source details and priority".
-- `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated via `projectService.invalidateProjectCache()` after any commit that changes the project set: `CreateProject`, `UpdateProject` when fields actually change, `AddProjectAlias`, `RemoveProjectAlias`). In `main.go`, `*SQLiteTaskStore` is always wrapped in `CachedTaskStore`.
+- `CachedTaskStore` — decorator that caches `ListProjects` in memory (invalidated via `projectService.invalidateProjectCache()` after committed project creation/deletion, actual project updates, and alias changes). It embeds the tx-aware deletion method. In `main.go`, pipeline, ProjectService and agent use the cached wrapper; only `api.Config.TaskStore` receives the raw `*SQLiteTaskStore`, sharing the Events database.
 - `SQLiteHistory` — message history. Table `messages`. Column `message_id TEXT` (UUID v4, generated by the application on insert) with a UNIQUE index; added by migration `013_messages_message_id.sql`. `AddTx(ctx, tx, source, entry) (messageID string, err error)` inserts within a caller-supplied transaction and returns the UUID; `Add` wraps it in its own transaction. Client chat metadata (migration `017_chat_message_metadata.sql`): `role` (`user` | `agent` | `system`; `''` for channel rows; existing `client:%` rows were backfilled from `author_name`), `kind` (`text` | `voice` | `error`, default `text`), `audio_job_id`, `audio_duration_ms`, `task_ids` (JSON array of task UUIDs). Only the client chat and voice paths fill them. For `client:` sources `AddTx` also deletes the oldest rows beyond `storage.ClientHistoryCap` (1000) in the same transaction. `SetTaskIDs(ctx, messageID, ids)` merges ids into a row without duplicates (unknown message → error wrapping `sql.ErrNoRows`). `Recent` and `RecentActivity` skip `role = 'system'` rows, so voice failures never reach the agent prompt. `ListClient(ctx, source, before, limit)` returns one page for `GET /v1/chat/history`: the newest `limit` rows older than the `before` message (system rows included), oldest first, plus the next cursor; an unknown `before` wraps `model.ErrHistoryCursorNotFound`.
 - `devices.SQLiteDeviceStore` — devices and bearer tokens. `Get` returns revoked devices too; `nil, nil` if not found. `ListInactive` returns active devices whose `COALESCE(last_seen_at, created_at)` is older than cutoff; `DeleteRevokedOlderThan` physically removes rows whose `revoked_at` is older than cutoff.
 - `events.SQLiteEventStore` — domain events. Table `events`, monotonic `seq` AUTOINCREMENT.
@@ -412,9 +433,13 @@ Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be
 
 **Idempotency**: `Idempotency-Key: <uuid>` on POST/PATCH. In-memory LRU cache `(device_id, key) → response`, TTL 1 hour.
 
-**SSE** (`/v1/events`): `Last-Event-ID: <seq>` for replay. Heartbeat `:keepalive` every 15s. Format: `id: <seq>\nevent: <kind>\ndata: <json>\n\n`.
+**SSE** (`/v1/events`): HTTP payloads come only from durable SQL `SinceSeq` in ascending seq order; Broker payloads are wakeups, never arrival-order frames. Subscribe and establish initial `MaxSeq` before 200/first Flush. Valid nonnegative decimal int64 `Last-Event-ID`, including explicit `0`, requests replay; absent, malformed, negative or overflowing headers select new-events-only from that initial mark. Format: `id: <seq>\nevent: <kind>\ndata: <json>\n\n`.
 
-**Cold-sync** (`/v1/sync/snapshot`): all projects + open tasks + `last_seq`. Use on first connection or after missing the retention window.
+Each Broker wakeup or heartbeat captures a fixed `MaxSeq` target. `drainThrough` materializes each SQL page, then rereads MinSeq/MaxSeq against its starting cursor before writing any frame. Cursor above MaxSeq or MinSeq greater than cursor+1 sends `event: reset`, `id: MaxSeq`, `data: {"last_seq":MaxSeq}` and closes for cold resync. Numeric gaps alone are not loss. Only events at or below the fixed target are written; cursor advances after successful writes, never to above-target rows. Empty pages before target recheck bounds and otherwise close without advancement; reaching target returns to waiting rather than chasing new commits. DB/write errors, cancellation and closed/overflowed Broker end the stream without fallback or false acknowledgement. The default 15s heartbeat (`:keepalive <mark>`) discovers commits without Notify but is not an acknowledgement. Broker interfaces, voice payload consumers and buffer64 remain unchanged.
+
+**Cold-sync** (`/v1/sync/snapshot`): requires `api.Config.Events`, `Tasks` and raw uncached `TaskStore` on the same database, not `Projects`; `newSyncHandler` receives `cfg.TaskStore.ListProjects`. Reads S=`MaxSeq` → uncached projects → open tasks and returns `lastSeq: S`; SQL errors return 500 without cache fallback. This is not transactional: collections can reflect different moments after S, and a later targeted task GET can be newer still. Clients retain original S for replay; replay can temporarily regress then restore state or stop at an unapplicable intermediate event. S is not an exact snapshot instant, and the response does not promise all closed history.
+
+**Event retention limits**: the default TTL remains 168h and `DeleteOlderThan(created_at)` is unchanged. Source-supplied timestamps can produce non-prefix deletions invisible to MinSeq. Ordered HTTP delivery guarantees retained durable seq order and detectable page boundaries, not absolute completeness under arbitrary non-prefix retention. Reset requires resync, not acknowledgement of its id.
 
 **Retention**: runs hourly via `events.Runner.Tick`. Sequence: `PairingStore.DeleteExpired` → device sweep (`ListInactive` → `Revoke` + `RelayClient.DeleteRegistration` → `DeleteRevokedOlderThan`) → orphan voice-upload sweep (`filepath.WalkDir(uploadsDir)`: files older than 24 h with no matching row in `voice_queue` are removed) → `PushQueue.DeleteDelivered` → `EventStore.DeleteOlderThan(now - events_retention)`. Errors in one subsystem do not skip the others.
 
@@ -437,7 +462,7 @@ Base path `/v1`. Source of truth is `api/openapi.yaml`. Any API change **must be
 
 Pairing sentinel errors: `ErrPairingNotFound`, `ErrPairingExpired`, `ErrNonceMismatch`, `ErrCSRFMismatch`, `ErrAlreadyConfirmed`, `ErrSenderFailed`.
 
-Project sentinel errors (`internal/usecase/projects.go`): `ErrProjectNotFound` → 404; `ErrAliasInvalid` → 400; `ErrAliasTaken` → 409; `ErrAliasConflictsWithName` → 409; `ErrAliasLimitReached` → 409; `ErrAliasForbiddenForInbox` → 403; `ErrAliasNotFound` → 404.
+Project sentinel errors (`internal/usecase/projects.go`): `ErrProjectNotFound` → 404; `ErrColorInvalid` → 422 `color_invalid`; `ErrInboxProtected` → 403 `inbox_protected`; `ErrAliasInvalid` → 400; `ErrAliasTaken` → 409; `ErrAliasConflictsWithName` → 409; `ErrAliasLimitReached` → 409; `ErrAliasForbiddenForInbox` → 403; `ErrAliasNotFound` → 404.
 
 ## Push relay
 

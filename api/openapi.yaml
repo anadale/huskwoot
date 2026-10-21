@@ -139,7 +139,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "422":
-          $ref: "#/components/responses/Unprocessable"
+          description: Invalid input, including color_invalid for an unsupported palette slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /v1/projects/{id}:
     parameters:
       - $ref: "#/components/parameters/ProjectID"
@@ -184,7 +188,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           description: |
-            Forbidden. Alias-specific codes: `alias_forbidden_for_inbox` (aliases are not allowed for the Inbox project).
+            Forbidden. `inbox_protected` rejects any supplied Inbox name or slug, even unchanged values.
+            Inbox color and description remain editable. Alias-specific codes: `alias_forbidden_for_inbox` (aliases are not allowed for the Inbox project).
           content:
             application/json:
               schema:
@@ -201,7 +206,37 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "422":
-          $ref: "#/components/responses/Unprocessable"
+          description: Invalid input, including color_invalid for an unsupported palette slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags: [projects]
+      summary: Delete a project and move all its tasks to Inbox
+      description: |
+        Atomically moves every open, done, and cancelled task to Inbox, allocating
+        new Inbox numbers in ascending old task-number order. Automatic candidates
+        are reassigned and channel bindings removed. The response preserves that
+        order and contains full REST Task DTOs, not event payloads.
+        Durable task_moved events precede project_deleted, which produces no push notification.
+      responses:
+        "200":
+          description: Project deleted; movedTasks is an empty array for an empty project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteProjectResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Inbox cannot be deleted; error code is inbox_protected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/tasks:
     get:
       tags: [tasks]
@@ -250,6 +285,10 @@ paths:
     post:
       tags: [tasks]
       summary: Create a task
+      description: |
+        A missing destination returns 404 not_found both when absent before the
+        preliminary project read and when project deletion commits before the
+        transaction write. Invalid task input returns 422, not a deletion signal.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -303,6 +342,10 @@ paths:
     get:
       tags: [tasks]
       summary: Get task by ID
+      description: |
+        Returns the full task for any status (open, done, or cancelled).
+        Soft task DELETE leaves a cancelled task available with 200; physical
+        closed-task purge removes it and subsequent GET returns 404.
       responses:
         "200":
           description: Task.
@@ -639,20 +682,50 @@ paths:
       tags: [events]
       summary: SSE domain event stream
       description: |
-        text/event-stream connection. The server first replays events with
-        seq > Last-Event-ID (if provided), then streams live events and sends
-        periodic keepalive comments. If the client has fallen behind the retention
-        window, the server sends a `reset` event with the current last_seq and
-        closes the channel — the client must perform a cold re-sync via /v1/sync/snapshot.
+        Durable SQL events are the sole payload source, delivered in ascending seq
+        order independently of broker notification arrival order. A valid
+        nonnegative int64 Last-Event-ID, including explicit 0, replays seq greater
+        than that cursor. Missing, malformed, negative, or overflowing values mean
+        new-events-only from the initial MaxSeq mark. The server subscribes before
+        establishing that mark, both before sending 200 or the first response flush.
 
-        Event kinds: `task_created`, `task_completed`, `task_updated`, `task_moved`,
-        `task_reopened`, `project_updated`, `chat_message_created`, `voice_failed`.
+        Each broker wakeup or keepalive captures a fixed MaxSeq target and drains
+        SQL pages only through that target, then returns to waiting. Above-target
+        rows are not acknowledged and are reread on a later wakeup. Each page is
+        loaded before checking MinSeq and MaxSeq against its starting cursor and
+        before writing any frame. Numeric seq gaps alone do not prove event loss.
+        The cursor advances only after a successful event write. Empty pages before
+        the target recheck bounds and otherwise close without advancement.
+        Late notifications are empty wakeups; keepalive also discovers commits
+        without a notification and is not itself an acknowledgement.
+
+        When cursor > MaxSeq or MinSeq > 0 and MinSeq > cursor + 1, the server sends
+        `event: reset`, `id: MaxSeq`, `data: {"last_seq":MaxSeq}` and closes.
+        This requires a cold re-sync via /v1/sync/snapshot, not acknowledgement of
+        database events. Broker closure/overflow, cancellation, SQL failure, or
+        response write failure ends the stream without false cursor advancement
+        or arrival-order payload fallback.
+
+        Default retention is 168h, deleting by created_at rather than seq.
+        Source timestamp inversions can create non-prefix holes invisible to
+        MinSeq. The guarantee is ordered retained durable events and detectable
+        retention boundaries checked on every page, not absolute completeness
+        under arbitrary non-prefix retention.
+
+        Event kinds include `task_created`, `task_completed`, `task_updated`,
+        `task_moved`, `task_reopened`, `task_deleted`, `project_updated`,
+        `project_deleted`, `chat_message_created`, and `voice_failed`.
+        project_deleted data follows ProjectDeletedEvent (top-level id);
+        task_deleted data follows TaskDeletedEvent (wrapped task).
       parameters:
         - in: header
           name: Last-Event-ID
           schema:
             type: string
-          description: Monotonic seq of the last successfully received event.
+          description: |
+            Last successfully applied event seq as a nonnegative int64. Explicit
+            "0" requests replay from the beginning of retained history; invalid
+            or absent values select new-events-only behavior.
       responses:
         "200":
           description: text/event-stream event stream.
@@ -831,15 +904,29 @@ paths:
     get:
       tags: [sync]
       summary: Cold re-sync state snapshot
+      description: |
+        Reads S = MaxSeq first, then projects directly from the uncached SQL task
+        store, then open tasks. Any read error returns 500; there is no cached
+        fallback. These reads are not transactional: collections may describe
+        different moments after S, and lastSeq is not an exact snapshot instant.
+        Closed task history is not included. A targeted task GET may be newer than
+        S; clients retain the original S for ordered replay, which can temporarily
+        regress then restore state or stop at an unapplicable intermediate event.
       responses:
         "200":
-          description: All projects, open tasks, and the current last_seq to resume SSE.
+          description: Uncached projects, open tasks, and the initial event mark lastSeq.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/SyncSnapshot"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: A snapshot SQL or task read failed; no cached fallback is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 components:
   securitySchemes:
     bearerAuth:
@@ -1025,6 +1112,10 @@ components:
           type: string
         description:
           type: string
+        color:
+          type: string
+          enum: ["", blue, purple, teal, orange, pink]
+          description: Theme palette slot. Empty string selects Auto. Always emitted by this server; optional for older-server compatibility.
         aliases:
           type: array
           items:
@@ -1044,9 +1135,14 @@ components:
           type: string
         slug:
           type: string
-          description: Optional slug; auto-generated if omitted.
+          description: Optional slug; omitted or empty infers Slugify(name), choosing the first free base, base-2, base-3, and so on in the create transaction. Explicit occupied slugs return 409.
         description:
           type: string
+        color:
+          type: string
+          enum: ["", blue, purple, teal, orange, pink]
+          default: ""
+          description: Theme palette slot; absent or empty selects Auto. Invalid values return 422 color_invalid.
         aliases:
           type: array
           items:
@@ -1055,7 +1151,7 @@ components:
           description: Optional alias keywords. Each is validated and normalized (lowercased, trimmed) by the server.
     UpdateProjectRequest:
       type: object
-      description: Absent field — no change; empty string — clear the value.
+      description: Absent field — no change; empty string — clear the value. Renaming never changes the slug. Any supplied Inbox name or slug returns 403 inbox_protected; color and description remain editable.
       properties:
         name:
           type: string
@@ -1063,6 +1159,10 @@ components:
           type: string
         description:
           type: string
+        color:
+          type: string
+          enum: ["", blue, purple, teal, orange, pink]
+          description: Theme palette slot; absent preserves the current value, empty resets to Auto. Color-only updates are accepted. Invalid values return 422 color_invalid.
         aliases:
           type: array
           items:
@@ -1488,6 +1588,39 @@ components:
           type: string
           format: date-time
           description: Server-side timestamp when the job was enqueued.
+    DeleteProjectResponse:
+      type: object
+      required: [movedTasks]
+      properties:
+        movedTasks:
+          type: array
+          description: Full task DTOs in ascending old project task-number order; empty array when no tasks moved.
+          items:
+            $ref: "#/components/schemas/Task"
+    ProjectDeletedEvent:
+      type: object
+      required: [id]
+      description: SSE project_deleted data; unlike task_deleted, the id is top-level.
+      properties:
+        id:
+          type: string
+          format: uuid
+    TaskDeletedEvent:
+      type: object
+      required: [task]
+      description: |
+        SSE task_deleted data emitted by physical closed-task purge, not by soft
+        task DELETE. The deleted task snapshot is wrapped in task; its id is not
+        top-level. Domain event snapshots use snake_case, unlike REST Task DTOs.
+      properties:
+        task:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+              format: uuid
+          additionalProperties: true
     ChatMessageCreatedEvent:
       type: object
       required: [messageId, source, role, text, createdAt]
@@ -1581,4 +1714,4 @@ components:
         lastSeq:
           type: integer
           format: int64
-          description: Current max event seq; pass as Last-Event-ID when connecting to /v1/events.
+          description: Initial MaxSeq S read before the nontransactional collections; retain S for SSE replay, not an exact snapshot instant.

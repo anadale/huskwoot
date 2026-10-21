@@ -164,6 +164,9 @@ func (m *mockProjectService) CreateProject(_ context.Context, _ model.CreateProj
 func (m *mockProjectService) UpdateProject(_ context.Context, _ string, _ model.ProjectUpdate) (*model.Project, error) {
 	return nil, nil
 }
+func (m *mockProjectService) DeleteProject(_ context.Context, _ string) ([]model.Task, error) {
+	return nil, nil
+}
 func (m *mockProjectService) ListProjects(_ context.Context) ([]model.Project, error) {
 	return nil, nil
 }
